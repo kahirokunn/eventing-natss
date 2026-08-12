@@ -1,0 +1,88 @@
+name: Publish development images to GHCR
+
+run-name: Publish ${{ github.ref_name }} (${{ github.sha }}) to GHCR
+
+on:
+  push:
+    branches:
+    - 'chore/publish-ghcr'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-ghcr-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    if: ${{ github.repository == 'kahirokunn/eventing-natss' }}
+    runs-on: ubuntu-latest
+    env:
+      GOFLAGS: -ldflags=-s -ldflags=-w
+      KO_DOCKER_REPO: ghcr.io/${{ github.repository_owner }}
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: knative/actions/setup-go@main
+
+    - name: Install ko
+      uses: ko-build/setup-ko@v0.7
+
+    - name: Test
+      run: go test ./...
+
+    - name: Log in to GHCR
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Choose image tags
+      shell: bash
+      run: |
+        short_sha="${GITHUB_SHA:0:12}"
+        ref_tag="${GITHUB_REF_NAME//\//-}"
+        echo "KO_TAGS=sha-${short_sha},${ref_tag}" >> "${GITHUB_ENV}"
+
+    - name: Build and push images
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p dist
+
+        common_args=(
+          -j 1
+          --preserve-import-paths
+          --platform=all
+          --tags "${KO_TAGS}"
+          --image-label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}"
+          --image-label "org.opencontainers.image.revision=${GITHUB_SHA}"
+        )
+
+        ko resolve "${common_args[@]}" \
+          --image-refs dist/eventing-images.txt \
+          -f ./config/jetstream > dist/eventing-jsm.yaml
+        ko resolve "${common_args[@]}" \
+          --image-refs dist/broker-images.txt \
+          -f ./config/broker > dist/broker-jsm.yaml
+        ko resolve "${common_args[@]}" \
+          --image-refs dist/webhook-images.txt \
+          -f ./config/webhook > dist/webhook-jsm.yaml
+
+        sort -u dist/*-images.txt > dist/images.txt
+        cat dist/images.txt
+
+    - name: Upload resolved manifests
+      uses: actions/upload-artifact@v4
+      with:
+        name: ghcr-manifests-${{ github.sha }}
+        path: dist/
+        if-no-files-found: error
+        retention-days: 14

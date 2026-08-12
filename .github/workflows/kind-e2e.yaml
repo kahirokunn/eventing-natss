@@ -31,6 +31,7 @@ jobs:
       KO_DOCKER_REPO: kind.local
       SYSTEM_NAMESPACE: knative-eventing
       KIND_CLUSTER_NAME: kind
+      KEDA_VERSION: 2.20.1
 
     steps:
     - name: Defaults
@@ -120,6 +121,13 @@ jobs:
         kubectl apply --filename https://github.com/knative/eventing/releases/download/${{ matrix.eventing-version }}/eventing-core.yaml
         kubectl apply --filename https://github.com/knative/eventing/releases/download/${{ matrix.eventing-version }}/mt-channel-broker.yaml
 
+    - name: Install KEDA
+      run: |
+        set -x
+        kubectl apply --server-side --filename https://github.com/kedacore/keda/releases/download/v${KEDA_VERSION}/keda-${KEDA_VERSION}.yaml
+        kubectl rollout status --namespace keda deployment/keda-operator --timeout=5m
+        kubectl rollout status --namespace keda deployment/keda-operator-metrics-apiserver --timeout=5m
+
     - name: Install
       run: |
         set -x
@@ -160,6 +168,12 @@ jobs:
         echo "===================== Triggers ============================="
         kubectl get trigger --all-namespaces=true -oyaml
 
+        echo "===================== KEDA ScaledObjects ==================="
+        kubectl get scaledobjects.keda.sh --all-namespaces=true -oyaml
+
+        echo "===================== HorizontalPodAutoscalers ============="
+        kubectl get horizontalpodautoscalers.autoscaling --all-namespaces=true -oyaml
+
         echo "===================== K8s Events ==========================="
         kubectl get events --all-namespaces=true -oyaml
 
@@ -189,4 +203,3 @@ jobs:
         SLACK_TITLE: Periodic e2e for Nats on kind on (${{ matrix.k8s-version }}, ${{ matrix.eventing-version }}) failed.
         SLACK_MESSAGE: |
           For detailed logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-

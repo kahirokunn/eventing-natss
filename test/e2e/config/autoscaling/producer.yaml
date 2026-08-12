@@ -12,23 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-apiVersion: v1
-kind: ConfigMap
+apiVersion: batch/v1
+kind: Job
 metadata:
-  name: config-nats-broker
-  namespace: knative-eventing
-  labels:
-    nats.eventing.knative.dev/release: devel
-data:
-  eventing-nats: |
-    url: nats://nats.nats-io.svc.cluster.local:4222
-    connOpts:
-      retryOnFailedConnect: true
-      maxReconnects: 5
-      reconnectWaitMilliseconds: 2000
-      reconnectJitterMilliseconds: 100
-      reconnectJitterTLSMilliseconds: 1000
-    autoscaler:
-      monitoringEndpoint: nats.nats-io.svc.cluster.local:8222
-      account: "$G"
-      useHttps: false
+  name: autoscale-producer
+  namespace: {{ .namespace }}
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: producer
+          image: ko://knative.dev/eventing-natss/test/e2e/cmd/producer
+          env:
+            - name: COUNT
+              value: "{{ .producerCount }}"
+            - name: K_SINK
+              value: http://nats-broker-ingress.knative-eventing.svc.cluster.local/{{ .namespace }}/autoscale-broker-a

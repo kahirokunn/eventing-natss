@@ -193,6 +193,12 @@ func makeFilterEnv(args *FilterArgs) []corev1.EnvVar {
 			Value: system.Namespace(),
 		},
 		{
+			// sharedmain uses NAMESPACE to scope the Broker and Trigger informers
+			// used by this per-Broker filter process.
+			Name:  "NAMESPACE",
+			Value: args.Broker.Namespace,
+		},
+		{
 			Name:  "BROKER_NAME",
 			Value: args.Broker.Name,
 		},

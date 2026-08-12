@@ -89,6 +89,16 @@ rules:
       - create
       - update
       - delete
+  # Manage optional KEDA autoscaling for per-Broker filter deployments.
+  - apiGroups:
+      - keda.sh
+    resources:
+      - scaledobjects
+    verbs:
+      - get
+      - create
+      - update
+      - delete
   # Manage services for ingress and filter
   - apiGroups:
       - "serving.knative.dev"

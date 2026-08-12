@@ -27,6 +27,7 @@ import (
 	kubeclient "knative.dev/pkg/client/injection/kube/client"
 	"knative.dev/pkg/configmap"
 	"knative.dev/pkg/controller"
+	dynamicclient "knative.dev/pkg/injection/clients/dynamicclient"
 	"knative.dev/pkg/logging"
 	pkgreconciler "knative.dev/pkg/reconciler"
 	"knative.dev/pkg/resolver"
@@ -128,6 +129,7 @@ func NewController(
 	// Create reconciler
 	r := &Reconciler{
 		kubeClientSet: kubeclient.Get(ctx),
+		dynamicClient: dynamicclient.Get(ctx),
 
 		deploymentLister: deploymentInformer.Lister(),
 		serviceLister:    serviceInformer.Lister(),
@@ -137,7 +139,8 @@ func NewController(
 
 		js: js,
 
-		natsURL: natsConfig.URL,
+		natsURL:          natsConfig.URL,
+		autoscalerConfig: natsConfig.Autoscaler,
 
 		filterImage:          env.FilterImage,
 		filterServiceAccount: env.FilterServiceAccount,

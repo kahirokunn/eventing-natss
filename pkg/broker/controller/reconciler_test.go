@@ -36,6 +36,7 @@ import (
 	clienttesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/ptr"
 
 	"go.uber.org/zap"
 	"knative.dev/pkg/controller"
@@ -296,13 +297,32 @@ func TestPropagateIngressAvailability(t *testing.T) {
 func TestPropagateFilterAvailability(t *testing.T) {
 	filterName := resources.FilterName(testBrokerName)
 	tests := []struct {
-		name      string
-		dep       *appsv1.Deployment
-		wantReady bool
+		name       string
+		dep        *appsv1.Deployment
+		mode       filterAvailabilityMode
+		wantReady  bool
+		wantReason string
 	}{
 		{name: "ready", dep: deploymentWithReady(testNamespace, filterName, 1), wantReady: true},
 		{name: "no ready replicas", dep: deploymentWithReady(testNamespace, filterName, 0), wantReady: false},
 		{name: "missing", dep: nil, wantReady: false},
+		{
+			name: "autoscaled to zero is ready",
+			dep: &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: filterName},
+				Spec:       appsv1.DeploymentSpec{Replicas: ptr.To[int32](0)},
+			},
+			mode:       filterAvailabilityAutoscaled,
+			wantReady:  true,
+			wantReason: "ScaledToZero",
+		},
+		{
+			name:       "fallback replica is ready with reason",
+			dep:        deploymentWithReady(testNamespace, filterName, 1),
+			mode:       filterAvailabilityFallback,
+			wantReady:  true,
+			wantReason: ReasonAutoscalerFallback,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -312,12 +332,15 @@ func TestPropagateFilterAvailability(t *testing.T) {
 			}
 			r := &Reconciler{deploymentLister: newDeploymentLister(deps...)}
 			b := testBroker(testNamespace, testBrokerName)
-			if err := r.propagateFilterAvailability(testContext(), b, nil); err != nil {
+			if err := r.propagateFilterAvailability(testContext(), b, nil, tc.mode); err != nil {
 				t.Fatalf("propagateFilterAvailability() error: %v", err)
 			}
 			cond := b.Status.GetCondition(eventingv1.BrokerConditionFilter)
 			if tc.wantReady != (cond != nil && cond.IsTrue()) {
 				t.Errorf("filter condition = %v, wantReady %v", cond, tc.wantReady)
+			}
+			if tc.wantReason != "" && (cond == nil || cond.Reason != tc.wantReason) {
+				t.Errorf("filter condition reason = %v, want %q", cond, tc.wantReason)
 			}
 		})
 	}
@@ -400,6 +423,45 @@ func TestReconcileFilterDeploymentUpdate(t *testing.T) {
 	}
 	if len(got.Spec.Template.Spec.Containers) == 0 {
 		t.Error("deployment spec was not updated to the expected spec")
+	}
+}
+
+func TestReconcileFilterDeploymentReplicaPolicy(t *testing.T) {
+	name := resources.FilterName(testBrokerName)
+	for _, tc := range []struct {
+		name         string
+		policy       filterReplicaPolicy
+		existing     int32
+		wantReplicas int32
+	}{
+		{name: "autoscaled preserves KEDA zero", policy: filterReplicaAutoscaled, existing: 0, wantReplicas: 0},
+		{name: "fallback forces one", policy: filterReplicaFallback, existing: 0, wantReplicas: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			existing := &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: name},
+				Spec:       appsv1.DeploymentSpec{Replicas: ptr.To(tc.existing)},
+			}
+			kube := kubefake.NewSimpleClientset(existing)
+			r := &Reconciler{
+				kubeClientSet:        kube,
+				deploymentLister:     newDeploymentLister(existing),
+				filterImage:          "filter:latest",
+				filterServiceAccount: "dp-sa",
+				natsURL:              "nats://localhost:4222",
+			}
+
+			if err := r.reconcileFilterDeployment(testContext(), testBroker(testNamespace, testBrokerName), "TEST_STREAM", brokerconfig.DefaultBrokerConfig(), tc.policy); err != nil {
+				t.Fatal(err)
+			}
+			got, err := kube.AppsV1().Deployments(testNamespace).Get(context.Background(), name, metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Spec.Replicas == nil || *got.Spec.Replicas != tc.wantReplicas {
+				t.Fatalf("replicas = %v, want %d", got.Spec.Replicas, tc.wantReplicas)
+			}
+		})
 	}
 }
 

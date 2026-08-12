@@ -24,7 +24,7 @@ import (
 	"knative.dev/eventing-natss/pkg/broker/constants"
 )
 
-func TestFilterTriggersByBrokerClass(t *testing.T) {
+func TestFilterTriggersForBroker(t *testing.T) {
 	tests := []struct {
 		name         string
 		broker       *eventingv1.Broker
@@ -50,10 +50,22 @@ func TestFilterTriggersByBrokerClass(t *testing.T) {
 			wantFiltered: false,
 		},
 		{
-			name:         "trigger referencing non-existent broker passes to reconciler",
+			name:         "target trigger referencing non-existent broker passes to reconciler",
 			broker:       nil,
-			trigger:      newTestTrigger(testNamespace, testTriggerName, "non-existent-broker"),
+			trigger:      newTestTrigger(testNamespace, testTriggerName, testBrokerName),
 			wantFiltered: true,
+		},
+		{
+			name:         "trigger referencing another broker",
+			broker:       newTestBroker(testNamespace, "other-broker", constants.BrokerClassName),
+			trigger:      newTestTrigger(testNamespace, testTriggerName, "other-broker"),
+			wantFiltered: false,
+		},
+		{
+			name:         "trigger in another namespace",
+			broker:       newTestBroker("other-namespace", testBrokerName, constants.BrokerClassName),
+			trigger:      newTestTrigger("other-namespace", testTriggerName, testBrokerName),
+			wantFiltered: false,
 		},
 		{
 			name:         "non-trigger object",
@@ -70,7 +82,7 @@ func TestFilterTriggersByBrokerClass(t *testing.T) {
 				brokerLister.addBroker(tc.broker)
 			}
 
-			filterFunc := filterTriggersByBrokerClass(brokerLister)
+			filterFunc := filterTriggersForBroker(brokerLister, testNamespace, testBrokerName)
 
 			var obj interface{}
 			if tc.trigger != nil {
@@ -81,7 +93,7 @@ func TestFilterTriggersByBrokerClass(t *testing.T) {
 
 			got := filterFunc(obj)
 			if got != tc.wantFiltered {
-				t.Errorf("filterTriggersByBrokerClass() = %v, want %v", got, tc.wantFiltered)
+				t.Errorf("filterTriggersForBroker() = %v, want %v", got, tc.wantFiltered)
 			}
 		})
 	}

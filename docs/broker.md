@@ -1,6 +1,7 @@
 # NATS JetStream Broker
 
-This document describes the NATS JetStream Broker implementation for Knative Eventing.
+Use the NATS JetStream Broker when producers need durable event storage and
+Trigger subscribers should consume events from NATS JetStream.
 
 ## Overview
 
@@ -18,12 +19,16 @@ The broker consists of two main components:
 
 ### Broker Controller (`natsjs-broker-controller`)
 
-Reconciles `Broker` resources with the `NatsJetStreamBroker` class annotation. Creates:
-- JetStream streams for event storage
+Reconciles `Broker` resources with the `NatsJetStreamBroker` class annotation. It creates:
+
+- One JetStream stream per Broker for event storage
+- One filter Deployment per Broker when that Broker has at least one Trigger
+- An optional KEDA ScaledObject for the filter Deployment
 
 ### Filter (`natsjs-broker-filter`)
 
 Handles event delivery to trigger subscribers:
+
 - Consumes events from JetStream streams
 - Applies trigger filters to events
 - Dispatches matching events to subscriber endpoints
@@ -161,6 +166,106 @@ spec:
 
 ## Configuration
 
+### Scale a Broker Filter to Zero with KEDA
+
+Cluster operators can install KEDA to stop filter Pods while every Trigger on a
+Broker is idle. The scale target is the Broker's shared filter Deployment, not
+an individual Trigger. For example, `shop/orders` owns the Deployment and
+ScaledObject named `orders-broker-filter`. Every Trigger on `shop/orders` has a
+separate JetStream Consumer, and the ScaledObject checks all of those Consumers.
+
+| Who configures it | Resource | Example | Required condition |
+|---|---|---|---|
+| Cluster operator | `config-nats-broker` in `knative-eventing` | `nats.nats-io.svc.cluster.local:8222` | KEDA can reach the NATS monitoring port |
+| Broker owner | Broker annotation | `autoscaling.eventing.knative.dev/class: keda.autoscaling.knative.dev` | KEDA CRDs and operator are installed |
+| Trigger owner | Optional Trigger lag annotations | `lag-threshold: "10"` | Trigger references the autoscaled Broker |
+
+KEDA is optional and is not installed by the eventing-natss release manifests.
+Install a supported KEDA release first, then expose the NATS monitoring port to
+the KEDA operator. The generated trigger metadata follows the
+[KEDA NATS JetStream scaler](https://keda.sh/docs/2.20/scalers/nats-jetstream/).
+Configure that endpoint in `config-nats-broker`:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: config-nats-broker
+  namespace: knative-eventing
+data:
+  eventing-nats: |
+    url: nats://nats.nats-io.svc.cluster.local:4222
+    autoscaler:
+      monitoringEndpoint: nats.nats-io.svc.cluster.local:8222
+      account: "$G"
+      useHttps: false
+```
+
+`monitoringEndpoint` is `host:port` without `http://` or `https://`. Restart the
+Broker controller after changing this ConfigMap, as with the NATS connection
+settings.
+
+Opt one Broker in explicitly:
+
+```yaml
+apiVersion: eventing.knative.dev/v1
+kind: Broker
+metadata:
+  name: orders
+  namespace: shop
+  annotations:
+    eventing.knative.dev/broker.class: NatsJetStreamBroker
+    autoscaling.eventing.knative.dev/class: keda.autoscaling.knative.dev
+    autoscaling.eventing.knative.dev/min-scale: "0"
+    autoscaling.eventing.knative.dev/max-scale: "20"
+    autoscaling.eventing.knative.dev/polling-interval: "10"
+    autoscaling.eventing.knative.dev/cooldown-period: "30"
+    autoscaling.eventing.knative.dev/lag-threshold: "100"
+```
+
+| Annotation | Where to set it | Default | Decision it controls |
+|---|---|---:|---|
+| `autoscaling.eventing.knative.dev/class` | Broker | unset | The exact value `keda.autoscaling.knative.dev` enables KEDA |
+| `autoscaling.eventing.knative.dev/min-scale` | Broker | `0` | Minimum filter replicas |
+| `autoscaling.eventing.knative.dev/max-scale` | Broker | `50` | Maximum filter replicas |
+| `autoscaling.eventing.knative.dev/polling-interval` | Broker | `10` | Seconds between KEDA lag checks |
+| `autoscaling.eventing.knative.dev/cooldown-period` | Broker | `30` | Idle seconds before scaling to zero |
+| `autoscaling.eventing.knative.dev/lag-threshold` | Broker or Trigger | `100` | Pending messages per desired replica |
+| `autoscaling.eventing.knative.dev/activation-lag-threshold` | Broker or Trigger | `0` | Pending messages required to wake from zero |
+
+For the two lag annotations, a value on the Trigger overrides the Broker value.
+The other annotations are Broker-wide because all of its Triggers share the
+same Deployment. When several Consumers have backlog, KEDA uses the largest
+replica request rather than adding the requests together.
+
+The annotation names and defaults match the Kafka Broker autoscaler, but the
+resource mapping does not:
+
+| Question | Kafka Broker | NATS JetStream Broker |
+|---|---|---|
+| What opts in? | Cluster-wide feature flag, with per-resource overrides | Exact KEDA class annotation on each Broker |
+| What does KEDA scale? | A Trigger's internal ConsumerGroup scale target | The Broker's `<broker>-broker-filter` Deployment |
+| How many ScaledObjects? | One for each autoscaled ConsumerGroup | One for each opted-in Broker |
+| Where is lag configured? | On the Trigger or other Kafka resource | Broker default, optionally overridden by each Trigger |
+
+While idle, this is expected:
+
+```shell
+kubectl -n shop get deployment orders-broker-filter
+# READY   UP-TO-DATE   AVAILABLE
+# 0/0     0            0
+
+kubectl -n shop get scaledobject orders-broker-filter
+kubectl -n shop get broker orders
+# The Broker remains Ready; its Filter condition reason is ScaledToZero.
+```
+
+If the annotation requests KEDA but the CRD, endpoint, or permissions are not
+available, the controller emits an `AutoscalerUnavailableFallback` warning and
+runs one static filter replica so Trigger delivery continues. Removing the
+class annotation deletes the ScaledObject and restores the configured static
+`filter.replicas` value.
+
 ### Filter Environment Variables
 
 These variables set the **broker-wide defaults** for the filter deployment. All triggers in the same broker share these defaults unless they override them with per-trigger annotations (see below).
@@ -170,6 +275,9 @@ These variables set the **broker-wide defaults** for the filter deployment. All 
 | `NATS_URL` | NATS server URL | Required |
 | `POD_NAME` | Pod name for identification | Required |
 | `CONTAINER_NAME` | Container name for identification | Required |
+| `BROKER_NAME` | Broker served by this filter process | Required |
+| `BROKER_NAMESPACE` | Namespace containing that Broker and its Triggers | Required |
+| `STREAM_NAME` | JetStream stream owned by that Broker | Required |
 | `CONSUMER_FETCH_BATCH_SIZE` | Number of messages to fetch per batch | `10` |
 | `CONSUMER_FETCH_TIMEOUT` | How long a fetch waits for messages before returning empty | `200ms` |
 | `CONSUMER_MAX_CONCURRENCY` | Maximum concurrent in-flight HTTP dispatches per trigger | `20` |

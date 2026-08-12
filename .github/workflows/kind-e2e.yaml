@@ -126,7 +126,8 @@ jobs:
         set -x
         kubectl apply --server-side --filename https://github.com/kedacore/keda/releases/download/v${KEDA_VERSION}/keda-${KEDA_VERSION}.yaml
         kubectl rollout status --namespace keda deployment/keda-operator --timeout=5m
-        kubectl rollout status --namespace keda deployment/keda-operator-metrics-apiserver --timeout=5m
+        kubectl rollout status --namespace keda deployment/keda-metrics-apiserver --timeout=5m
+        kubectl rollout status --namespace keda deployment/keda-admission --timeout=5m
 
     - name: Install
       run: |

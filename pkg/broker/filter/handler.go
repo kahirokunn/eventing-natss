@@ -22,6 +22,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	cejs "github.com/cloudevents/sdk-go/protocol/nats_jetstream/v2"
@@ -87,25 +88,11 @@ type TriggerHandler struct {
 	logger *zap.SugaredLogger
 	ctx    context.Context
 
-	// Trigger configuration
-	trigger    *eventingv1.Trigger
-	subscriber duckv1.Addressable
-	filter     eventfilter.Filter
-
-	// Broker ingress URL for reply events
-	brokerIngressURL *duckv1.Addressable
-
 	// Dispatcher for sending events
 	dispatcher *kncloudevents.Dispatcher
 
-	// Retry configuration
-	retryConfig   *kncloudevents.RetryConfig
-	noRetryConfig *kncloudevents.RetryConfig
-
-	// Dead letter sink
-	deadLetterSink *duckv1.Addressable
-
-	subscription *nats.Subscription
+	configMu sync.RWMutex
+	config   *handlerConfig
 
 	// Observability. tracer is used to wrap each dispatch in a span;
 	// dispatchDuration records the per-dispatch HTTP wall time; processDuration
@@ -113,6 +100,16 @@ type TriggerHandler struct {
 	tracer           trace.Tracer
 	dispatchDuration metric.Float64Histogram
 	processDuration  metric.Float64Histogram
+}
+
+type handlerConfig struct {
+	trigger          *eventingv1.Trigger
+	subscriber       duckv1.Addressable
+	filter           eventfilter.Filter
+	brokerIngressURL *duckv1.Addressable
+	retryConfig      *kncloudevents.RetryConfig
+	noRetryConfig    *kncloudevents.RetryConfig
+	deadLetterSink   *duckv1.Addressable
 }
 
 // NewTriggerHandler creates a new handler for a trigger
@@ -141,21 +138,86 @@ func NewTriggerHandler(
 		tracer = otel.GetTracerProvider().Tracer("knative.dev/eventing-natss/pkg/broker/filter")
 	}
 
-	return &TriggerHandler{
+	handler := &TriggerHandler{
 		logger:           logger,
 		ctx:              ctx,
-		trigger:          trigger,
-		subscriber:       subscriber,
-		filter:           buildTriggerFilter(logger, trigger),
-		brokerIngressURL: brokerIngressURL,
 		dispatcher:       dispatcher,
-		retryConfig:      retryConfig,
-		noRetryConfig:    noRetryConfig,
-		deadLetterSink:   deadLetterSink,
 		tracer:           tracer,
 		dispatchDuration: dispatchDuration,
 		processDuration:  processDuration,
-	}, nil
+	}
+	handler.config = newHandlerConfig(logger, trigger, subscriber, brokerIngressURL, deadLetterSink, retryConfig, noRetryConfig)
+	return handler, nil
+}
+
+func newHandlerConfig(
+	logger *zap.SugaredLogger,
+	trigger *eventingv1.Trigger,
+	subscriber duckv1.Addressable,
+	brokerIngressURL *duckv1.Addressable,
+	deadLetterSink *duckv1.Addressable,
+	retryConfig *kncloudevents.RetryConfig,
+	noRetryConfig *kncloudevents.RetryConfig,
+) *handlerConfig {
+	trigger = trigger.DeepCopy()
+	return &handlerConfig{
+		trigger:          trigger,
+		subscriber:       *subscriber.DeepCopy(),
+		filter:           buildTriggerFilter(logger, trigger),
+		brokerIngressURL: deepCopyAddressable(brokerIngressURL),
+		deadLetterSink:   deepCopyAddressable(deadLetterSink),
+		retryConfig:      copyRetryConfig(retryConfig),
+		noRetryConfig:    copyRetryConfig(noRetryConfig),
+	}
+}
+
+func deepCopyAddressable(address *duckv1.Addressable) *duckv1.Addressable {
+	if address == nil {
+		return nil
+	}
+	return address.DeepCopy()
+}
+
+func copyRetryConfig(config *kncloudevents.RetryConfig) *kncloudevents.RetryConfig {
+	if config == nil {
+		return nil
+	}
+	copy := *config
+	if config.BackoffDelay != nil {
+		value := *config.BackoffDelay
+		copy.BackoffDelay = &value
+	}
+	if config.BackoffPolicy != nil {
+		value := *config.BackoffPolicy
+		copy.BackoffPolicy = &value
+	}
+	if config.RetryAfterMaxDuration != nil {
+		value := *config.RetryAfterMaxDuration
+		copy.RetryAfterMaxDuration = &value
+	}
+	return &copy
+}
+
+// Update replaces all mutable trigger configuration as one snapshot. The old
+// filter is cleaned up only after evaluations using it have completed.
+func (h *TriggerHandler) Update(
+	trigger *eventingv1.Trigger,
+	subscriber duckv1.Addressable,
+	brokerIngressURL *duckv1.Addressable,
+	deadLetterSink *duckv1.Addressable,
+	retryConfig *kncloudevents.RetryConfig,
+	noRetryConfig *kncloudevents.RetryConfig,
+) {
+	next := newHandlerConfig(h.logger, trigger, subscriber, brokerIngressURL, deadLetterSink, retryConfig, noRetryConfig)
+
+	h.configMu.Lock()
+	previous := h.config
+	h.config = next
+	h.configMu.Unlock()
+
+	if previous != nil && previous.filter != nil {
+		previous.filter.Cleanup()
+	}
 }
 
 // HandleMessage processes a NATS message, applies filter, and dispatches to subscriber.
@@ -171,6 +233,19 @@ func (h *TriggerHandler) HandleMessage(ctx context.Context, msg *nats.Msg) {
 // doHandle processes the message synchronously
 func (h *TriggerHandler) doHandle(ctx context.Context, msg *nats.Msg) {
 	logger := logging.FromContext(ctx)
+	h.configMu.RLock()
+	config := h.config
+	configLocked := true
+	unlockConfig := func() {
+		if configLocked {
+			h.configMu.RUnlock()
+			configLocked = false
+		}
+	}
+	defer unlockConfig()
+	if config == nil {
+		return
+	}
 
 	// Record the pre-dispatch processing time (message decode + filter eval).
 	// recordProcess is idempotent: it is called explicitly just before dispatch
@@ -187,8 +262,8 @@ func (h *TriggerHandler) doHandle(ctx context.Context, msg *nats.Msg) {
 		processRecorded = true
 		h.processDuration.Record(ctx, time.Since(processStart).Seconds(),
 			metric.WithAttributes(
-				attribute.String("kn.trigger.name", h.trigger.Name),
-				attribute.String("kn.trigger.namespace", h.trigger.Namespace),
+				attribute.String("kn.trigger.name", config.trigger.Name),
+				attribute.String("kn.trigger.namespace", config.trigger.Namespace),
 			))
 	}
 	defer recordProcess()
@@ -197,6 +272,7 @@ func (h *TriggerHandler) doHandle(ctx context.Context, msg *nats.Msg) {
 	message := cejs.NewMessage(msg)
 	if message.ReadEncoding() == binding.EncodingUnknown {
 		logger.Errorw("received a message with unknown encoding")
+		unlockConfig()
 		if err := msg.Term(); err != nil {
 			logger.Errorw("failed to terminate message", zap.Error(err))
 		}
@@ -207,6 +283,7 @@ func (h *TriggerHandler) doHandle(ctx context.Context, msg *nats.Msg) {
 	event, err := binding.ToEvent(ctx, message)
 	if err != nil {
 		logger.Errorw("failed to convert message to CloudEvent", zap.Error(err))
+		unlockConfig()
 		if err := msg.Term(); err != nil {
 			logger.Errorw("failed to terminate message", zap.Error(err))
 		}
@@ -221,18 +298,18 @@ func (h *TriggerHandler) doHandle(ctx context.Context, msg *nats.Msg) {
 	ctx, span := h.tracer.Start(ctx, "broker.filter.dispatch")
 	defer span.End()
 	span.SetAttributes(
-		attribute.String("kn.trigger.name", h.trigger.Name),
-		attribute.String("kn.trigger.namespace", h.trigger.Namespace),
-		attribute.String("kn.trigger.uid", string(h.trigger.UID)),
-		attribute.String("messaging.destination.name", h.subscriber.URL.String()),
+		attribute.String("kn.trigger.name", config.trigger.Name),
+		attribute.String("kn.trigger.namespace", config.trigger.Namespace),
+		attribute.String("kn.trigger.uid", string(config.trigger.UID)),
+		attribute.String("messaging.destination.name", config.subscriber.URL.String()),
 		attribute.String("cloudevents.event.id", event.ID()),
 		attribute.String("cloudevents.event.type", event.Type()),
 		attribute.String("cloudevents.event.source", event.Source()),
 	)
 
 	// Apply filter
-	if h.filter != nil {
-		filterResult := h.filter.Filter(ctx, *event)
+	if config.filter != nil {
+		filterResult := config.filter.Filter(ctx, *event)
 		if filterResult == eventfilter.FailFilter {
 			span.SetAttributes(attribute.String("filter.outcome", "fail"))
 			logger.Debugw("event filtered out",
@@ -240,6 +317,7 @@ func (h *TriggerHandler) doHandle(ctx context.Context, msg *nats.Msg) {
 				zap.String("source", event.Source()),
 			)
 			// Ack the message since it was intentionally filtered
+			unlockConfig()
 			if err := msg.Ack(); err != nil {
 				logger.Errorw("failed to ack filtered message", zap.Error(err))
 			}
@@ -247,10 +325,14 @@ func (h *TriggerHandler) doHandle(ctx context.Context, msg *nats.Msg) {
 		}
 		span.SetAttributes(attribute.String("filter.outcome", "pass"))
 	}
+	// The immutable config remains valid after the lock is released. Update
+	// waits only for filter evaluation before swapping and cleaning the old
+	// filter, not for outbound HTTP or NATS acknowledgement latency.
+	unlockConfig()
 
 	// Dispatch to subscriber
 	logger.Debugw("dispatching event to subscriber",
-		zap.String("subscriber", h.subscriber.URL.String()),
+		zap.String("subscriber", config.subscriber.URL.String()),
 		zap.String("type", event.Type()),
 		zap.String("source", event.Source()),
 		zap.String("id", event.ID()),
@@ -260,7 +342,7 @@ func (h *TriggerHandler) doHandle(ctx context.Context, msg *nats.Msg) {
 	// time (tracked separately by dispatchDuration) is excluded.
 	recordProcess()
 
-	dispatchInfo, err := h.dispatchEvent(ctx, event, msg)
+	dispatchInfo, err := h.dispatchEvent(ctx, event, msg, config)
 	if dispatchInfo != nil && dispatchInfo.ResponseCode != 0 {
 		span.SetAttributes(attribute.Int("http.response.status_code", dispatchInfo.ResponseCode))
 	}
@@ -284,7 +366,7 @@ func (h *TriggerHandler) doHandle(ctx context.Context, msg *nats.Msg) {
 }
 
 // dispatchEvent sends the event to the subscriber and handles ack/nack
-func (h *TriggerHandler) dispatchEvent(ctx context.Context, event *cloudevents.Event, msg *nats.Msg) (*kncloudevents.DispatchInfo, error) {
+func (h *TriggerHandler) dispatchEvent(ctx context.Context, event *cloudevents.Event, msg *nats.Msg, config *handlerConfig) (*kncloudevents.DispatchInfo, error) {
 	logger := logging.FromContext(ctx)
 
 	additionalHeaders := tracing.ConvertEventToHttpHeader(event)
@@ -298,16 +380,16 @@ func (h *TriggerHandler) dispatchEvent(ctx context.Context, event *cloudevents.E
 
 	// Determine if this is the last try
 	maxRetries := 0
-	if h.retryConfig != nil {
-		maxRetries = h.retryConfig.RetryMax
+	if config.retryConfig != nil {
+		maxRetries = config.retryConfig.RetryMax
 	}
 	lastTry := retryNumber > maxRetries
 
 	// Dispatch the message to trigger's destination
-	dispatchInfo, err := h.dispatcher.SendEvent(ctx, *event, h.subscriber,
+	dispatchInfo, err := h.dispatcher.SendEvent(ctx, *event, config.subscriber,
 		kncloudevents.WithHeader(additionalHeaders),
 		kncloudevents.WithTransformers(&te),
-		kncloudevents.WithRetryConfig(h.noRetryConfig),
+		kncloudevents.WithRetryConfig(config.noRetryConfig),
 	)
 
 	// Record HTTP wall time with low-cardinality labels. Duration is left at
@@ -316,8 +398,8 @@ func (h *TriggerHandler) dispatchEvent(ctx context.Context, event *cloudevents.E
 	if h.dispatchDuration != nil && dispatchInfo != nil && dispatchInfo.Duration >= 0 {
 		h.dispatchDuration.Record(ctx, dispatchInfo.Duration.Seconds(),
 			metric.WithAttributes(
-				attribute.String("kn.trigger.name", h.trigger.Name),
-				attribute.String("kn.trigger.namespace", h.trigger.Namespace),
+				attribute.String("kn.trigger.name", config.trigger.Name),
+				attribute.String("kn.trigger.namespace", config.trigger.Namespace),
 			))
 	}
 
@@ -346,12 +428,12 @@ func (h *TriggerHandler) dispatchEvent(ctx context.Context, event *cloudevents.E
 	case protocol.IsACK(result):
 		span.SetAttributes(attribute.String("nats.result", "ack"))
 		// If the subscriber returned a CloudEvent response, forward it to broker ingress for re-routing.
-		if h.brokerIngressURL != nil {
+		if config.brokerIngressURL != nil {
 			responseEvent, parseErr := responseToEvent(ctx, dispatchInfo)
 			if parseErr != nil {
 				logger.Warnw("failed to parse response event from subscriber", zap.Error(parseErr))
 			} else if responseEvent != nil {
-				replyDispatchInfo, replyErr := h.dispatcher.SendEvent(ctx, *responseEvent, *h.brokerIngressURL,
+				replyDispatchInfo, replyErr := h.dispatcher.SendEvent(ctx, *responseEvent, *config.brokerIngressURL,
 					kncloudevents.WithRetryConfig(&defaultRetry),
 					kncloudevents.WithHeader(responseHeaders),
 					kncloudevents.WithTransformers(&te),
@@ -369,9 +451,9 @@ func (h *TriggerHandler) dispatchEvent(ctx context.Context, event *cloudevents.E
 		}
 	case protocol.IsNACK(result):
 		if lastTry {
-			if h.deadLetterSink != nil {
+			if config.deadLetterSink != nil {
 				// Send to dead letter sink
-				dlsDispatchInfo, dlsErr := h.dispatcher.SendEvent(ctx, *event, *h.deadLetterSink,
+				dlsDispatchInfo, dlsErr := h.dispatcher.SendEvent(ctx, *event, *config.deadLetterSink,
 					kncloudevents.WithRetryConfig(&defaultRetry),
 					kncloudevents.WithHeader(additionalHeaders),
 					kncloudevents.WithTransformers(&te),
@@ -394,16 +476,16 @@ func (h *TriggerHandler) dispatchEvent(ctx context.Context, event *cloudevents.E
 		} else {
 			span.SetAttributes(attribute.String("nats.result", "nak"))
 			// Nack for retry
-			nakDelay := jsutils.CalculateNakDelayForRetryNumber(retryNumber, h.retryConfig)
+			nakDelay := jsutils.CalculateNakDelayForRetryNumber(retryNumber, config.retryConfig)
 			if err := msg.NakWithDelay(nakDelay, nats.Context(ctx)); err != nil {
 				logger.Errorw("failed to nack message", zap.Error(err))
 			}
 		}
 	default:
 		// Terminate - non-retriable error
-		if lastTry && h.deadLetterSink != nil {
+		if lastTry && config.deadLetterSink != nil {
 			// Send to dead letter sink
-			dlsDispatchInfo, dlsErr := h.dispatcher.SendEvent(ctx, *event, *h.deadLetterSink,
+			dlsDispatchInfo, dlsErr := h.dispatcher.SendEvent(ctx, *event, *config.deadLetterSink,
 				kncloudevents.WithRetryConfig(&defaultRetry),
 				kncloudevents.WithHeader(additionalHeaders),
 				kncloudevents.WithTransformers(&te),
@@ -452,8 +534,12 @@ func responseToEvent(ctx context.Context, di *kncloudevents.DispatchInfo) (*clou
 
 // Cleanup releases resources
 func (h *TriggerHandler) Cleanup() {
-	if h.filter != nil {
-		h.filter.Cleanup()
+	h.configMu.Lock()
+	config := h.config
+	h.config = nil
+	h.configMu.Unlock()
+	if config != nil && config.filter != nil {
+		config.filter.Cleanup()
 	}
 }
 

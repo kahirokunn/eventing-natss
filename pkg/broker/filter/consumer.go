@@ -326,13 +326,7 @@ func (m *ConsumerManager) SubscribeTrigger(
 	// however, captures its parameters at start, so a change to any of the
 	// three fetch-related annotations requires restarting it.
 	if existing, ok := m.subscriptions[triggerUID]; ok {
-		existing.handler.subscriber = subscriber
-		existing.handler.brokerIngressURL = brokerIngressURL
-		existing.handler.noRetryConfig = noRetryConfig
-		existing.handler.retryConfig = retryConfig
-		existing.handler.filter = buildTriggerFilter(logger, trigger)
-		existing.handler.deadLetterSink = deadLetterSink
-		existing.handler.trigger = trigger
+		existing.handler.Update(trigger, subscriber, brokerIngressURL, deadLetterSink, retryConfig, noRetryConfig)
 
 		newBatch := parseTriggerAnnotationInt(trigger.Annotations, TriggerFetchBatchSizeAnnotation, m.fetchBatchSize, logger)
 		newTimeout := parseTriggerAnnotationDuration(trigger.Annotations, TriggerFetchTimeoutAnnotation, m.fetchTimeout, logger)
@@ -438,9 +432,6 @@ func (m *ConsumerManager) SubscribeTrigger(
 		handler.Cleanup()
 		return fmt.Errorf("failed to create pull subscription: %w", err)
 	}
-
-	// Set subscription and consumer info on handler
-	handler.subscription = sub
 
 	// Two cancellable contexts: dispatchCtx survives fetch-loop restart and
 	// parents per-message msgCtx; fetchCtx controls the current fetch loop only.

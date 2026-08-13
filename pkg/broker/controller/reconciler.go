@@ -29,6 +29,7 @@ import (
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	appsv1listers "k8s.io/client-go/listers/apps/v1"
@@ -52,6 +53,7 @@ import (
 	brokerconfig "knative.dev/eventing-natss/pkg/broker/config"
 	"knative.dev/eventing-natss/pkg/broker/contract"
 	"knative.dev/eventing-natss/pkg/broker/controller/resources"
+	brokeroidc "knative.dev/eventing-natss/pkg/broker/oidc"
 	brokerutils "knative.dev/eventing-natss/pkg/broker/utils"
 	commonconfig "knative.dev/eventing-natss/pkg/common/config"
 )
@@ -78,6 +80,9 @@ const (
 	// FilterReaderClusterRoleName is the namespace-scoped reader role bound to
 	// each per-Broker filter ServiceAccount.
 	FilterReaderClusterRoleName = "natsjetstream-broker-filter-reader"
+	// OIDCTokenCreatorClusterRoleName permits a filter to request tokens only
+	// for the reserved, permissionless delivery identity in its own namespace.
+	OIDCTokenCreatorClusterRoleName = brokeroidc.TokenCreatorClusterRoleName
 )
 
 var (
@@ -173,6 +178,21 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, b *eventingv1.Broker) pk
 		return err
 	}
 
+	// Refresh the Broker dead letter sink before validating the aggregate
+	// filter audience set. Triggers inherit this status; resolving it after the
+	// audience gate would make an invalid referenced audience impossible to
+	// correct because every reconcile would return on the stale inherited value.
+	if b.Spec.Delivery == nil || b.Spec.Delivery.DeadLetterSink == nil {
+		b.Status.MarkDeadLetterSinkNotConfigured()
+	} else {
+		dlsAddr, err := r.resolveDeadLetterSink(ctx, b)
+		if err != nil {
+			b.Status.MarkDeadLetterSinkResolvedFailed("DeadLetterSinkResolveFailed", "Failed to resolve dead letter sink: %v", err)
+			return fmt.Errorf("failed to resolve dead letter sink: %w", err)
+		}
+		b.Status.MarkDeadLetterSinkResolvedSucceeded(eventingduckv1.NewDeliveryStatusFromAddressable(dlsAddr))
+	}
+
 	// Steps 5-7: The per-broker filter only dispatches events to trigger
 	// subscribers, so it is needed only when triggers exist. Ingress and the
 	// JetStream stream (steps 2-4) are always reconciled, so events are still
@@ -194,9 +214,17 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, b *eventingv1.Broker) pk
 	autoscalerConfigured := false
 	var autoscalerCleanupErr error
 	if len(triggers) > 0 {
+		oidcAudiences, err := brokeroidc.AudiencesFromTriggers(triggers)
+		if err != nil {
+			b.Status.MarkFilterFailed("OIDCAudienceInvalid", "Cannot configure destination identities: %v", err)
+			return fmt.Errorf("invalid filter OIDC audiences: %w", err)
+		}
 		// Grant the filter only the namespaced and exact-secret access it needs.
 		// Complete RBAC before creating or updating a Pod that uses the account.
-		if err := r.reconcileDataplaneRBAC(ctx, b); err != nil {
+		oidcIdentityUID, err := r.reconcileDataplaneRBACWithOIDCIdentity(ctx, b, len(oidcAudiences) > 0)
+		if err != nil {
+			b.Status.MarkFilterFailed("FilterRBACFailed", "Failed to configure filter identity and permissions: %v", err)
+			controller.GetEventRecorder(ctx).Event(b, corev1.EventTypeWarning, "FilterRBACFailed", err.Error())
 			return err
 		}
 
@@ -206,7 +234,7 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, b *eventingv1.Broker) pk
 
 		switch {
 		case !autoscalingRequested:
-			cleanupErr, err := r.reconcileAutoscalerDisabled(ctx, b, streamName, brokerCfg)
+			cleanupErr, err := r.reconcileAutoscalerDisabled(ctx, b, streamName, brokerCfg, oidcIdentityUID)
 			if err != nil {
 				b.Status.MarkFilterFailed(ReasonAutoscalerFailed, "Failed to disable autoscaler: %v", err)
 				return err
@@ -216,7 +244,7 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, b *eventingv1.Broker) pk
 		case settingsErr != nil:
 			autoscalerFallback = true
 			filterMode = filterAvailabilityFallback
-			cleanupErr, err := r.reconcileAutoscalerFallback(ctx, b, streamName, brokerCfg, int32(autoscaler.FallbackReplicaCountFromAnnotations(b.Annotations)), settingsErr)
+			cleanupErr, err := r.reconcileAutoscalerFallback(ctx, b, streamName, brokerCfg, int32(autoscaler.FallbackReplicaCountFromAnnotations(b.Annotations)), settingsErr, oidcIdentityUID)
 			if err != nil {
 				b.Status.MarkFilterFailed(ReasonAutoscalerFailed, "Failed to activate autoscaler fallback: %v", err)
 				return err
@@ -228,7 +256,7 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, b *eventingv1.Broker) pk
 			if err != nil {
 				autoscalerFallback = true
 				filterMode = filterAvailabilityFallback
-				cleanupErr, fallbackErr := r.reconcileAutoscalerFallback(ctx, b, streamName, brokerCfg, int32(autoscaler.FallbackReplicaCount(settings.MinScale)), err)
+				cleanupErr, fallbackErr := r.reconcileAutoscalerFallback(ctx, b, streamName, brokerCfg, int32(autoscaler.FallbackReplicaCount(settings.MinScale)), err, oidcIdentityUID)
 				if fallbackErr != nil {
 					b.Status.MarkFilterFailed(ReasonAutoscalerFailed, "Failed to activate autoscaler fallback: %v", fallbackErr)
 					return fallbackErr
@@ -239,7 +267,9 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, b *eventingv1.Broker) pk
 
 			// Create the target at the safety floor on first use, then preserve
 			// the scale subresource value managed by KEDA.
-			if err := r.reconcileFilterDeployment(ctx, b, streamName, brokerCfg, autoscaledReplicaPolicy(settings)); err != nil {
+			policy := autoscaledReplicaPolicy(settings)
+			policy.oidcServiceAccountUID = oidcIdentityUID
+			if err := r.reconcileFilterDeployment(ctx, b, streamName, brokerCfg, policy); err != nil {
 				return err
 			}
 			expected, err := autoscaler.MakeScaledObject(b, triggers, resources.FilterName(b.Name), settings, monitoring)
@@ -254,7 +284,7 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, b *eventingv1.Broker) pk
 				}
 				autoscalerFallback = true
 				filterMode = filterAvailabilityFallback
-				cleanupErr, fallbackErr := r.reconcileAutoscalerFallback(ctx, b, streamName, brokerCfg, int32(autoscaler.FallbackReplicaCount(settings.MinScale)), err)
+				cleanupErr, fallbackErr := r.reconcileAutoscalerFallback(ctx, b, streamName, brokerCfg, int32(autoscaler.FallbackReplicaCount(settings.MinScale)), err, oidcIdentityUID)
 				if fallbackErr != nil {
 					b.Status.MarkFilterFailed(ReasonAutoscalerFailed, "Failed to activate autoscaler fallback: %v", fallbackErr)
 					return fallbackErr
@@ -303,21 +333,9 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, b *eventingv1.Broker) pk
 	// Step 9: Mark TriggerChannel as ready (we use JetStream instead of a channel)
 	b.Status.GetConditionSet().Manage(&b.Status).MarkTrue(eventingv1.BrokerConditionTriggerChannel)
 
-	// Step 10: Resolve the dead letter sink. Triggers without their own
-	// delivery inherit this resolved address (see trigger reconciler).
-	if b.Spec.Delivery == nil || b.Spec.Delivery.DeadLetterSink == nil {
-		b.Status.MarkDeadLetterSinkNotConfigured()
-	} else {
-		dlsAddr, err := r.resolveDeadLetterSink(ctx, b)
-		if err != nil {
-			b.Status.MarkDeadLetterSinkResolvedFailed("DeadLetterSinkResolveFailed", "Failed to resolve dead letter sink: %v", err)
-			return fmt.Errorf("failed to resolve dead letter sink: %w", err)
-		}
-		b.Status.MarkDeadLetterSinkResolvedSucceeded(eventingduckv1.NewDeliveryStatusFromAddressable(dlsAddr))
-	}
-
-	// Step 11: Mark EventPolicies as ready (not using OIDC authentication)
-	b.Status.MarkEventPoliciesTrueWithReason("EventPoliciesSkipped", "Feature %q is disabled", "OIDC")
+	// Step 10: This Broker authenticates outbound destinations independently,
+	// but it does not implement Knative EventPolicy subject selection.
+	b.Status.MarkEventPoliciesTrueWithReason("EventPoliciesSkipped", "Feature %q is disabled", "EventPolicy")
 
 	if autoscalerCleanupErr != nil {
 		return autoscalerCleanupErr
@@ -366,19 +384,13 @@ func (r *Reconciler) reconcileStream(ctx context.Context, b *eventingv1.Broker, 
 // resolveDeadLetterSink resolves the broker's dead letter sink to an Addressable.
 // A Ref without a namespace defaults to the broker's namespace.
 func (r *Reconciler) resolveDeadLetterSink(ctx context.Context, b *eventingv1.Broker) (*duckv1.Addressable, error) {
-	dest := b.Spec.Delivery.DeadLetterSink
-	destination := duckv1.Destination{URI: dest.URI}
-	if dest.Ref != nil {
-		namespace := dest.Ref.Namespace
+	destination := *b.Spec.Delivery.DeadLetterSink.DeepCopy()
+	if destination.Ref != nil {
+		namespace := destination.Ref.Namespace
 		if namespace == "" {
 			namespace = b.Namespace
 		}
-		destination.Ref = &duckv1.KReference{
-			Kind:       dest.Ref.Kind,
-			Namespace:  namespace,
-			Name:       dest.Ref.Name,
-			APIVersion: dest.Ref.APIVersion,
-		}
+		destination.Ref.Namespace = namespace
 	}
 	return r.uriResolver.AddressableFromDestinationV1(ctx, destination, b)
 }
@@ -449,8 +461,9 @@ const (
 )
 
 type filterReplicaPolicy struct {
-	desiredReplicas  *int32
-	preserveExisting bool
+	desiredReplicas       *int32
+	preserveExisting      bool
+	oidcServiceAccountUID types.UID
 }
 
 var filterReplicaStatic = filterReplicaPolicy{}
@@ -486,12 +499,10 @@ func (r *Reconciler) propagateFilterAvailability(ctx context.Context, b *eventin
 		b.Status.MarkFilterFailed("DeploymentGetFailed", "Failed to get filter deployment: %v", err)
 		return fmt.Errorf("failed to get filter deployment: %w", err)
 	}
-
 	if mode == filterAvailabilityAutoscaled && deployment.Spec.Replicas != nil && *deployment.Spec.Replicas == 0 {
 		b.Status.GetConditionSet().Manage(&b.Status).MarkTrueWithReason(eventingv1.BrokerConditionFilter, "ScaledToZero", "KEDA scaled the filter deployment to zero")
 		return nil
 	}
-
 	if deployment.Status.ReadyReplicas == 0 {
 		b.Status.MarkFilterFailed("DeploymentNotReady", "Filter deployment has no ready replicas")
 		return nil // Don't return error, let controller requeue
@@ -520,13 +531,14 @@ func (r *Reconciler) reconcileFilterDeployment(ctx context.Context, b *eventingv
 	}
 
 	expected := resources.MakeFilterDeployment(&resources.FilterArgs{
-		Broker:             b,
-		Image:              r.filterImage,
-		ServiceAccountName: r.dataplaneIdentity(b),
-		StreamName:         streamName,
-		NatsURL:            r.natsURL,
-		NatsConfigJSON:     r.natsConfigJSON,
-		Template:           filterTemplate,
+		Broker:                b,
+		Image:                 r.filterImage,
+		ServiceAccountName:    r.dataplaneIdentity(b),
+		StreamName:            streamName,
+		NatsURL:               r.natsURL,
+		NatsConfigJSON:        r.natsConfigJSON,
+		OIDCServiceAccountUID: string(policy.oidcServiceAccountUID),
+		Template:              filterTemplate,
 	})
 	if policy.desiredReplicas != nil {
 		expected.Spec.Replicas = ptr.To(*policy.desiredReplicas)
@@ -681,12 +693,16 @@ func (r *Reconciler) monitoringConfig() (autoscaler.MonitoringConfig, error) {
 	)
 }
 
-func (r *Reconciler) reconcileAutoscalerDisabled(ctx context.Context, b *eventingv1.Broker, streamName string, brokerCfg *brokerconfig.NatsJetStreamBrokerConfig) (cleanupErr, reconcileErr error) {
+func (r *Reconciler) reconcileAutoscalerDisabled(ctx context.Context, b *eventingv1.Broker, streamName string, brokerCfg *brokerconfig.NatsJetStreamBrokerConfig, oidcUIDs ...types.UID) (cleanupErr, reconcileErr error) {
 	targetName := resources.FilterName(b.Name)
 	if err := r.rejectForeignScaledObject(ctx, b, targetName); err != nil {
 		return nil, err
 	}
-	if err := r.reconcileFilterDeployment(ctx, b, streamName, brokerCfg, filterReplicaStatic); err != nil {
+	policy := filterReplicaStatic
+	if len(oidcUIDs) > 0 {
+		policy.oidcServiceAccountUID = oidcUIDs[0]
+	}
+	if err := r.reconcileFilterDeployment(ctx, b, streamName, brokerCfg, policy); err != nil {
 		return nil, err
 	}
 	return r.deleteScaledObject(ctx, b, targetName), nil
@@ -709,12 +725,16 @@ func (r *Reconciler) activateAutoscalerFallback(ctx context.Context, b *eventing
 // of an existing ScaledObject fails. Returning the cleanup error afterwards
 // keeps reconciliation retrying and reasserting the replica until KEDA and its
 // generated HPA no longer race the static fallback.
-func (r *Reconciler) reconcileAutoscalerFallback(ctx context.Context, b *eventingv1.Broker, streamName string, brokerCfg *brokerconfig.NatsJetStreamBrokerConfig, replicas int32, cause error) (cleanupErr, reconcileErr error) {
+func (r *Reconciler) reconcileAutoscalerFallback(ctx context.Context, b *eventingv1.Broker, streamName string, brokerCfg *brokerconfig.NatsJetStreamBrokerConfig, replicas int32, cause error, oidcUIDs ...types.UID) (cleanupErr, reconcileErr error) {
 	targetName := resources.FilterName(b.Name)
 	if err := r.rejectForeignScaledObject(ctx, b, targetName); err != nil {
 		return nil, err
 	}
-	if err := r.reconcileFilterDeployment(ctx, b, streamName, brokerCfg, fallbackReplicaPolicy(replicas)); err != nil {
+	policy := fallbackReplicaPolicy(replicas)
+	if len(oidcUIDs) > 0 {
+		policy.oidcServiceAccountUID = oidcUIDs[0]
+	}
+	if err := r.reconcileFilterDeployment(ctx, b, streamName, brokerCfg, policy); err != nil {
 		return nil, err
 	}
 	return r.activateAutoscalerFallback(ctx, b, replicas, cause), nil

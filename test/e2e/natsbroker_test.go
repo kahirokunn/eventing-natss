@@ -31,6 +31,7 @@ import (
 	// For our e2e testing, we want this linked first so that our
 	// system namespace environment variable is defaulted prior to
 	// logstream initialization.
+	authorizationv1 "k8s.io/api/authorization/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
@@ -56,12 +57,15 @@ import (
 	"knative.dev/reconciler-test/pkg/knative"
 
 	brokerautoscaler "knative.dev/eventing-natss/pkg/broker/autoscaler"
+	brokeroidc "knative.dev/eventing-natss/pkg/broker/oidc"
 	brokerutils "knative.dev/eventing-natss/pkg/broker/utils"
 	"knative.dev/eventing-natss/test/e2e/config/autoscaling"
 	"knative.dev/eventing-natss/test/e2e/config/deadletter"
 	"knative.dev/eventing-natss/test/e2e/config/filtering"
 	"knative.dev/eventing-natss/test/e2e/config/natsbroker"
 )
+
+const e2eOIDCAudience = "https://eventing-natss-e2e.example"
 
 // hasEventType returns an EventInfoMatcher that matches CloudEvents of the given type.
 func hasEventType(eventType string) eventshub.EventInfoMatcher {
@@ -110,8 +114,8 @@ func TestNatsBrokerKEDAAutoscaling(t *testing.T) {
 		knative.WithObservabilityConfig,
 		k8s.WithEventListener,
 	)
-	env.Test(ctx, t, namedRecorderFeature("autoscale-recorder-a", eventshub.ResponseWaitTime(time.Second)))
-	env.Test(ctx, t, namedRecorderFeature("autoscale-recorder-b"))
+	env.Test(ctx, t, namedRecorderFeature("autoscale-recorder-a", eventshub.ResponseWaitTime(time.Second), eventshub.OIDCReceiverAudience(e2eOIDCAudience)))
+	env.Test(ctx, t, namedRecorderFeature("autoscale-recorder-b", eventshub.OIDCReceiverAudience(e2eOIDCAudience)))
 	env.Test(ctx, t, NatsBrokerKEDAAutoscalingFeature())
 }
 
@@ -133,6 +137,7 @@ func NatsBrokerKEDAAutoscalingFeature() *feature.Feature {
 
 	f.Alpha("NATS Broker filters scale safely from zero").Must("scale, fall back, recover, and preserve readiness", func(ctx context.Context, t feature.T) {
 		waitForDeployment(ctx, t, "autoscale-broker-a-broker-filter", func(replicas int32) bool { return replicas >= 2 })
+		assertFilterTokenRequestAuthority(ctx, t, "autoscale-broker-a", true)
 		assertFilterReplicas(ctx, t, "autoscale-broker-b-broker-filter", 0)
 		store := eventshub.StoreFromContext(ctx, "autoscale-recorder-a")
 		assertLogicalEventBatch(ctx, t, store, initialEventType, eventCount)
@@ -224,11 +229,14 @@ func verifyMultiTriggerScaledObject(ctx context.Context, t feature.T) {
 		},
 		Spec: eventingv1.TriggerSpec{
 			Broker: brokerName,
-			Subscriber: duckv1.Destination{Ref: &duckv1.KReference{
-				APIVersion: "v1",
-				Kind:       "Service",
-				Name:       recorderName,
-			}},
+			Subscriber: duckv1.Destination{
+				Audience: ptr.To(e2eOIDCAudience),
+				Ref: &duckv1.KReference{
+					APIVersion: "v1",
+					Kind:       "Service",
+					Name:       recorderName,
+				},
+			},
 		},
 	}, metav1.CreateOptions{})
 	if err != nil {
@@ -255,7 +263,6 @@ func verifyMultiTriggerScaledObject(ctx context.Context, t feature.T) {
 	}, reconcileTimeout); err != nil {
 		t.Fatal(err)
 	}
-
 	if err := deleteTriggerAndWait(ctx, namespace, additionalName, additional.UID); err != nil {
 		t.Fatal(err)
 	}
@@ -1345,6 +1352,43 @@ func assertFilterReplicas(ctx context.Context, t feature.T, name string, expecte
 	}
 }
 
+func assertFilterTokenRequestAuthority(ctx context.Context, t feature.T, brokerName string, wantExact bool) {
+	namespace := environment.FromContext(ctx).Namespace()
+	broker, err := eventingclient.Get(ctx).EventingV1().Brokers(namespace).Get(ctx, brokerName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	filterServiceAccount := brokerutils.FilterServiceAccountName(broker)
+	canCreateToken := func(subject, target string) bool {
+		review, err := kubeclient.Get(ctx).AuthorizationV1().SubjectAccessReviews().Create(ctx, &authorizationv1.SubjectAccessReview{
+			Spec: authorizationv1.SubjectAccessReviewSpec{
+				User: fmt.Sprintf("system:serviceaccount:%s:%s", namespace, subject),
+				ResourceAttributes: &authorizationv1.ResourceAttributes{
+					Namespace:   namespace,
+					Verb:        "create",
+					Group:       "",
+					Resource:    "serviceaccounts",
+					Subresource: "token",
+					Name:        target,
+				},
+			},
+		}, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return review.Status.Allowed
+	}
+	if got := canCreateToken(filterServiceAccount, brokeroidc.DeliveryServiceAccountName); got != wantExact {
+		t.Fatalf("filter ServiceAccount %s/%s exact outbound token permission = %v, want %v", namespace, filterServiceAccount, got, wantExact)
+	}
+	if canCreateToken(filterServiceAccount, filterServiceAccount) {
+		t.Fatalf("filter ServiceAccount %s/%s can mint its own token", namespace, filterServiceAccount)
+	}
+	if canCreateToken(brokeroidc.DeliveryServiceAccountName, brokeroidc.DeliveryServiceAccountName) {
+		t.Fatalf("outbound ServiceAccount %s/%s can mint its own token", namespace, brokeroidc.DeliveryServiceAccountName)
+	}
+}
+
 // namedRecorderFeature creates a feature that installs an eventshub receiver with the given name.
 func namedRecorderFeature(name string, options ...eventshub.EventsHubOption) *feature.Feature {
 	svc := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "services"}
@@ -1383,6 +1427,9 @@ func NatsBrokerDirectFeature() *feature.Feature {
 	f.Setup("install producer", natsbroker.InstallProducer(5))
 
 	f.Alpha("NatsJetStream broker goes ready").Must("goes ready", AllGoReady)
+	f.Alpha("NatsJetStream filter without OIDC has no token authority").Must("cannot mint the outbound service account token", func(ctx context.Context, t feature.T) {
+		assertFilterTokenRequestAuthority(ctx, t, "test-nats-broker", false)
+	})
 	f.Alpha("NatsJetStream broker delivers events").
 		Must("the recorder received all sent events within the time",
 			func(ctx context.Context, t feature.T) {
@@ -1402,7 +1449,7 @@ func TestNatsBrokerDeadLetter(t *testing.T) {
 		knative.WithObservabilityConfig,
 		k8s.WithEventListener,
 	)
-	env.Test(ctx, t, namedRecorderFeature("dls-recorder"))
+	env.Test(ctx, t, namedRecorderFeature("dls-recorder", eventshub.OIDCReceiverAudience(e2eOIDCAudience)))
 	env.Test(ctx, t, NatsBrokerDeadLetterFeature())
 }
 

@@ -18,8 +18,11 @@ package filter
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -38,7 +41,14 @@ import (
 	"knative.dev/eventing/pkg/eventfilter"
 	"knative.dev/eventing/pkg/eventingtls"
 	"knative.dev/eventing/pkg/kncloudevents"
+
+	natsTesting "knative.dev/eventing-natss/pkg/channel/jetstream/dispatcher/testing"
 )
+
+func installAudienceTokenSource(t *testing.T, handler *TriggerHandler, source func(context.Context, string) (string, error)) {
+	t.Helper()
+	handler.setAudienceTokenSource(source)
+}
 
 type cleanupTrackingFilter struct {
 	filtered chan string
@@ -112,6 +122,351 @@ func newTestHandler(t *testing.T, ctx context.Context, subscriberURL string, fil
 		t.Fatalf("NewTriggerHandler: %v", err)
 	}
 	return h
+}
+
+func TestTriggerHandlerOIDCAuthorization(t *testing.T) {
+	t.Run("subscriber exact bearer and CloudEvent headers", func(t *testing.T) {
+		requests := make(chan http.Header, 1)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests <- r.Header.Clone()
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		defer srv.Close()
+
+		ctx := logCtx()
+		audience := "https://subscriber.example"
+		u, err := apis.ParseURL(srv.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		handler, err := NewTriggerHandler(
+			ctx,
+			makeTrigger("default", "test-trigger", ""),
+			duckv1.Addressable{URL: u, Audience: &audience},
+			nil, nil, nil, nil, newTestDispatcher(ctx), nil, nil, nil,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		installAudienceTokenSource(t, handler, func(_ context.Context, gotAudience string) (string, error) {
+			if gotAudience != audience {
+				t.Errorf("token audience = %q, want %q", gotAudience, audience)
+			}
+			return "subscriber-token", nil
+		})
+
+		handler.HandleMessage(ctx, makeStructuredCEMsg("test.type", "test/source", "oidc-subscriber"))
+		select {
+		case headers := <-requests:
+			if got := headers.Get("Authorization"); got != "Bearer subscriber-token" {
+				t.Errorf("Authorization = %q, want exact bearer token", got)
+			}
+			if got := headers.Get("Ce-Id"); got != "oidc-subscriber" {
+				t.Errorf("Ce-Id = %q, want CloudEvent headers preserved", got)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("subscriber request not received")
+		}
+	})
+
+	t.Run("no audience does not read token or send authorization", func(t *testing.T) {
+		requests := make(chan http.Header, 1)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests <- r.Header.Clone()
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		defer srv.Close()
+
+		ctx := logCtx()
+		handler := newTestHandler(t, ctx, srv.URL, "")
+		installAudienceTokenSource(t, handler, func(context.Context, string) (string, error) {
+			t.Error("token source called for destination without audience")
+			return "unexpected", nil
+		})
+		handler.HandleMessage(ctx, makeStructuredCEMsg("test.type", "test/source", "no-oidc"))
+
+		select {
+		case headers := <-requests:
+			if got := headers.Get("Authorization"); got != "" {
+				t.Errorf("Authorization = %q, want absent", got)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("subscriber request not received")
+		}
+	})
+
+	t.Run("dead letter sink uses its own audience", func(t *testing.T) {
+		subscriber := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}))
+		defer subscriber.Close()
+		dlsHeaders := make(chan http.Header, 1)
+		dls := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			dlsHeaders <- r.Header.Clone()
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		defer dls.Close()
+
+		ctx := logCtx()
+		subscriberURL, _ := apis.ParseURL(subscriber.URL)
+		dlsURL, _ := apis.ParseURL(dls.URL)
+		dlsAudience := "https://dead-letter.example"
+		handler, err := NewTriggerHandler(
+			ctx,
+			makeTrigger("default", "test-trigger", ""),
+			duckv1.Addressable{URL: subscriberURL}, nil,
+			&duckv1.Addressable{URL: dlsURL, Audience: &dlsAudience},
+			nil, nil, newTestDispatcher(ctx), nil, nil, nil,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		installAudienceTokenSource(t, handler, func(_ context.Context, gotAudience string) (string, error) {
+			if gotAudience != dlsAudience {
+				t.Errorf("DLS token audience = %q, want %q", gotAudience, dlsAudience)
+			}
+			return "dls-token", nil
+		})
+
+		handler.HandleMessage(ctx, makeStructuredCEMsg("test.type", "test/source", "oidc-dls"))
+		select {
+		case headers := <-dlsHeaders:
+			if got := headers.Get("Authorization"); got != "Bearer dls-token" {
+				t.Errorf("DLS Authorization = %q, want exact bearer token", got)
+			}
+			if got := headers.Get("Ce-Id"); got != "oidc-dls" {
+				t.Errorf("DLS Ce-Id = %q, want CloudEvent headers preserved", got)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("dead letter sink request not received")
+		}
+	})
+
+	t.Run("token failure does not call subscriber", func(t *testing.T) {
+		var called atomic.Bool
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			called.Store(true)
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		defer srv.Close()
+
+		ctx := logCtx()
+		audience := "https://subscriber.example"
+		u, _ := apis.ParseURL(srv.URL)
+		handler, err := NewTriggerHandler(
+			ctx, makeTrigger("default", "test-trigger", ""),
+			duckv1.Addressable{URL: u, Audience: &audience},
+			nil, nil, nil, nil, newTestDispatcher(ctx), nil, nil, nil,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		installAudienceTokenSource(t, handler, func(context.Context, string) (string, error) {
+			return "", errors.New("token file temporarily unavailable")
+		})
+		handler.HandleMessage(ctx, makeStructuredCEMsg("test.type", "test/source", "token-error"))
+		if called.Load() {
+			t.Error("subscriber was called after token acquisition failed")
+		}
+	})
+
+	t.Run("token is re-read for rotation on every dispatch", func(t *testing.T) {
+		authorizations := make(chan string, 2)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			authorizations <- r.Header.Get("Authorization")
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		defer srv.Close()
+
+		tokenPath := t.TempDir() + "/token"
+		if err := os.WriteFile(tokenPath, []byte("first-token\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		ctx := logCtx()
+		audience := "https://subscriber.example"
+		u, _ := apis.ParseURL(srv.URL)
+		handler, err := NewTriggerHandler(
+			ctx, makeTrigger("default", "test-trigger", ""),
+			duckv1.Addressable{URL: u, Audience: &audience},
+			nil, nil, nil, nil, newTestDispatcher(ctx), nil, nil, nil,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		installAudienceTokenSource(t, handler, func(context.Context, string) (string, error) {
+			contents, err := os.ReadFile(tokenPath)
+			return strings.TrimSpace(string(contents)), err
+		})
+
+		handler.HandleMessage(ctx, makeStructuredCEMsg("test.type", "test/source", "before-rotation"))
+		if err := os.WriteFile(tokenPath, []byte("second-token\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		handler.HandleMessage(ctx, makeStructuredCEMsg("test.type", "test/source", "after-rotation"))
+
+		for _, want := range []string{"Bearer first-token", "Bearer second-token"} {
+			select {
+			case got := <-authorizations:
+				if got != want {
+					t.Errorf("Authorization = %q, want %q", got, want)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("request with %q not received", want)
+			}
+		}
+	})
+}
+
+func TestTriggerHandlerOIDCFailureLeavesNATSDispositionPending(t *testing.T) {
+	t.Run("subscriber token failure", func(t *testing.T) {
+		msg, dispositions := connectedMessageWithDispositionSpy(t, "subscriber-token-error")
+		var called atomic.Bool
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			called.Store(true)
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		defer srv.Close()
+
+		ctx := logCtx()
+		audience := "https://subscriber.example"
+		u, _ := apis.ParseURL(srv.URL)
+		handler, err := NewTriggerHandler(ctx, makeTrigger("default", "test-trigger", ""),
+			duckv1.Addressable{URL: u, Audience: &audience}, nil, nil, nil, nil,
+			newTestDispatcher(ctx), nil, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		installAudienceTokenSource(t, handler, func(context.Context, string) (string, error) {
+			return "", errors.New("token request unavailable")
+		})
+		handler.HandleMessage(ctx, msg)
+
+		if called.Load() {
+			t.Error("subscriber HTTP was called after token acquisition failed")
+		}
+		assertNoNATSDisposition(t, dispositions)
+	})
+
+	t.Run("dead letter token failure", func(t *testing.T) {
+		msg, dispositions := connectedMessageWithDispositionSpy(t, "dls-token-error")
+		subscriber := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}))
+		defer subscriber.Close()
+		var dlsCalled atomic.Bool
+		dls := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			dlsCalled.Store(true)
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		defer dls.Close()
+
+		ctx := logCtx()
+		subscriberURL, _ := apis.ParseURL(subscriber.URL)
+		dlsURL, _ := apis.ParseURL(dls.URL)
+		dlsAudience := "https://dead-letter.example"
+		handler, err := NewTriggerHandler(ctx, makeTrigger("default", "test-trigger", ""),
+			duckv1.Addressable{URL: subscriberURL}, nil,
+			&duckv1.Addressable{URL: dlsURL, Audience: &dlsAudience},
+			nil, nil, newTestDispatcher(ctx), nil, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		installAudienceTokenSource(t, handler, func(_ context.Context, audience string) (string, error) {
+			if audience != dlsAudience {
+				t.Errorf("token audience = %q, want DLS %q", audience, dlsAudience)
+			}
+			return "", errors.New("DLS token request unavailable")
+		})
+		handler.HandleMessage(ctx, msg)
+
+		if dlsCalled.Load() {
+			t.Error("dead letter HTTP was called after its token acquisition failed")
+		}
+		assertNoNATSDisposition(t, dispositions)
+	})
+}
+
+func TestTriggerHandlerDoesNotForwardAuthorizationToReplyIngress(t *testing.T) {
+	replyAuthorization := make(chan string, 1)
+	ingress := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		replyAuthorization <- r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer ingress.Close()
+
+	subscriber := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/cloudevents+json")
+		w.Header().Set("Authorization", "Bearer subscriber-response-secret")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"specversion":"1.0","type":"reply.type","source":"reply/source","id":"reply-id"}`))
+	}))
+	defer subscriber.Close()
+
+	ctx := logCtx()
+	subscriberURL, _ := apis.ParseURL(subscriber.URL)
+	ingressURL, _ := apis.ParseURL(ingress.URL)
+	subscriberAudience := "https://subscriber.example"
+	handler, err := NewTriggerHandler(ctx, makeTrigger("default", "test-trigger", ""),
+		duckv1.Addressable{URL: subscriberURL, Audience: &subscriberAudience},
+		&duckv1.Addressable{URL: ingressURL}, nil, nil, nil,
+		newTestDispatcher(ctx), nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	installAudienceTokenSource(t, handler, func(context.Context, string) (string, error) {
+		return "subscriber-request-token", nil
+	})
+	handler.HandleMessage(ctx, makeStructuredCEMsg("test.type", "test/source", "request-id"))
+
+	select {
+	case got := <-replyAuthorization:
+		if got != "" {
+			t.Errorf("reply ingress Authorization = %q, want absent", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reply event was not dispatched to broker ingress")
+	}
+}
+
+func connectedMessageWithDispositionSpy(t *testing.T, eventID string) (*nats.Msg, *nats.Subscription) {
+	t.Helper()
+	server := natsTesting.RunBasicJetstreamServer()
+	t.Cleanup(func() { natsTesting.ShutdownJSServerAndRemoveStorage(t, server) })
+	conn, _ := natsTesting.JsClient(t, server)
+	t.Cleanup(conn.Close)
+	deliverySubject := nats.NewInbox()
+	dispositionSubject := nats.NewInbox()
+	delivery, err := conn.SubscribeSync(deliverySubject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispositions, err := conn.SubscribeSync(dispositionSubject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	msg := makeStructuredCEMsg("test.type", "test/source", eventID)
+	msg.Subject = deliverySubject
+	msg.Reply = dispositionSubject
+	if err := conn.PublishMsg(msg); err != nil {
+		t.Fatal(err)
+	}
+	connected, err := delivery.NextMsg(5 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return connected, dispositions
+}
+
+func assertNoNATSDisposition(t *testing.T, subscription *nats.Subscription) {
+	t.Helper()
+	if msg, err := subscription.NextMsg(100 * time.Millisecond); err == nil {
+		t.Fatalf("unexpected NATS disposition %q", string(msg.Data))
+	} else if !errors.Is(err, nats.ErrTimeout) {
+		t.Fatalf("waiting for NATS disposition: %v", err)
+	}
 }
 
 // logCtx returns a context carrying a no-op zap logger.

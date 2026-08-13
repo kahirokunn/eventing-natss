@@ -24,6 +24,8 @@ import (
 	"github.com/kelseyhightower/envconfig"
 	"github.com/nats-io/nats.go"
 	"go.uber.org/zap"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
 
 	kubeclient "knative.dev/pkg/client/injection/kube/client"
@@ -43,16 +45,18 @@ import (
 )
 
 type envConfig struct {
-	PodName         string        `envconfig:"POD_NAME" required:"true"`
-	ContainerName   string        `envconfig:"CONTAINER_NAME" required:"true"`
-	BrokerName      string        `envconfig:"BROKER_NAME" required:"true"`
-	BrokerNamespace string        `envconfig:"BROKER_NAMESPACE" required:"true"`
-	StreamName      string        `envconfig:"STREAM_NAME" required:"true"`
-	NatsURL         string        `envconfig:"NATS_URL"`
-	NatsConfig      string        `envconfig:"NATS_CONFIG"`
-	FetchBatchSize  int           `envconfig:"CONSUMER_FETCH_BATCH_SIZE" default:"0"`
-	FetchTimeout    time.Duration `envconfig:"CONSUMER_FETCH_TIMEOUT" default:"0"`
-	MaxConcurrency  int           `envconfig:"CONSUMER_MAX_CONCURRENCY" default:"0"`
+	PodName               string        `envconfig:"POD_NAME" required:"true"`
+	ContainerName         string        `envconfig:"CONTAINER_NAME" required:"true"`
+	BrokerName            string        `envconfig:"BROKER_NAME" required:"true"`
+	BrokerNamespace       string        `envconfig:"BROKER_NAMESPACE" required:"true"`
+	StreamName            string        `envconfig:"STREAM_NAME" required:"true"`
+	NatsURL               string        `envconfig:"NATS_URL"`
+	NatsConfig            string        `envconfig:"NATS_CONFIG"`
+	OIDCServiceAccount    string        `envconfig:"OIDC_SERVICE_ACCOUNT"`
+	OIDCServiceAccountUID string        `envconfig:"OIDC_SERVICE_ACCOUNT_UID"`
+	FetchBatchSize        int           `envconfig:"CONSUMER_FETCH_BATCH_SIZE" default:"0"`
+	FetchTimeout          time.Duration `envconfig:"CONSUMER_FETCH_TIMEOUT" default:"0"`
+	MaxConcurrency        int           `envconfig:"CONSUMER_MAX_CONCURRENCY" default:"0"`
 }
 
 // NewController creates a new filter controller
@@ -90,20 +94,29 @@ func newController(ctx context.Context, _ configmap.Watcher, runtime *Runtime) *
 	brokerInformer := brokerinformer.Get(ctx)
 
 	// Create consumer manager with optional configuration from environment
+	var tokenSource audienceTokenSource
+	if env.OIDCServiceAccount != "" {
+		if env.OIDCServiceAccountUID == "" {
+			logger.Fatal("OIDC_SERVICE_ACCOUNT_UID is required when OIDC_SERVICE_ACCOUNT is configured")
+		}
+		tokenSource = newTokenRequestAudienceSource(
+			kubeclient.Get(ctx).CoreV1().ServiceAccounts(env.BrokerNamespace),
+			env.OIDCServiceAccount,
+			types.UID(env.OIDCServiceAccountUID),
+		)
+	}
 	consumerConfig := &ConsumerManagerConfig{
-		FetchBatchSize: env.FetchBatchSize,
-		FetchTimeout:   env.FetchTimeout,
-		MaxConcurrency: env.MaxConcurrency,
-		StreamName:     env.StreamName,
+		FetchBatchSize:      env.FetchBatchSize,
+		FetchTimeout:        env.FetchTimeout,
+		MaxConcurrency:      env.MaxConcurrency,
+		StreamName:          env.StreamName,
+		AudienceTokenSource: tokenSource,
 	}
 	consumerCtx := ctx
 	if runtime != nil {
 		consumerCtx = context.WithoutCancel(ctx)
 	}
 	consumerManager := NewConsumerManager(consumerCtx, natsConn, js, consumerConfig)
-	if runtime != nil {
-		runtime.Attach(consumerManager, natsConn)
-	}
 
 	// Create filter reconciler
 	reconciler := NewFilterReconciler(
@@ -114,6 +127,34 @@ func newController(ctx context.Context, _ configmap.Watcher, runtime *Runtime) *
 		env.BrokerNamespace,
 		env.BrokerName,
 	)
+	consumerManager.setTokenReadinessRequirements(func() ([]tokenReadinessRequirement, bool) {
+		if !triggerInformer.Informer().HasSynced() {
+			return nil, false
+		}
+		triggers, err := triggerInformer.Lister().Triggers(env.BrokerNamespace).List(labels.Everything())
+		if err != nil {
+			return nil, false
+		}
+		requirements := make([]tokenReadinessRequirement, 0, len(triggers))
+		for _, trigger := range triggers {
+			if trigger.Spec.Broker != env.BrokerName {
+				continue
+			}
+			subscriber, deadLetterSink, resolved := resolvedTriggerDestinations(trigger)
+			authenticated := resolved && (nonEmptyAudience(subscriber.Audience) ||
+				(deadLetterSink != nil && nonEmptyAudience(deadLetterSink.Audience)))
+			requirements = append(requirements, tokenReadinessRequirement{
+				triggerUID:    string(trigger.UID),
+				generation:    trigger.Generation,
+				resolved:      resolved,
+				authenticated: authenticated,
+			})
+		}
+		return requirements, true
+	})
+	if runtime != nil {
+		runtime.Attach(consumerManager, natsConn)
+	}
 
 	// Create controller using the filter reconciler which implements
 	// reconciler.Interface via its Reconcile(ctx, key) method.
@@ -121,6 +162,7 @@ func newController(ctx context.Context, _ configmap.Watcher, runtime *Runtime) *
 		WorkQueueName: "NatsJetStreamBrokerFilter",
 		Logger:        logger,
 	})
+	reconciler.enqueue = impl.Enqueue
 
 	// Set up event handlers for Trigger resources.
 	// Events are enqueued into the work queue and reconciled via
@@ -129,6 +171,26 @@ func newController(ctx context.Context, _ configmap.Watcher, runtime *Runtime) *
 	triggerInformer.Informer().AddEventHandler(cache.FilteringResourceEventHandler{
 		FilterFunc: filterTriggersForBroker(brokerInformer.Lister(), env.BrokerNamespace, env.BrokerName),
 		Handler:    controller.HandleAll(impl.Enqueue),
+	})
+	brokerInformer.Informer().AddEventHandler(cache.FilteringResourceEventHandler{
+		FilterFunc: func(obj interface{}) bool {
+			if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+				obj = tombstone.Obj
+			}
+			broker, ok := obj.(*eventingv1.Broker)
+			return ok && broker.Namespace == env.BrokerNamespace && broker.Name == env.BrokerName
+		},
+		Handler: controller.HandleAll(func(interface{}) {
+			triggers, err := triggerInformer.Lister().Triggers(env.BrokerNamespace).List(labels.Everything())
+			if err != nil {
+				return
+			}
+			for _, trigger := range triggers {
+				if trigger.Spec.Broker == env.BrokerName {
+					impl.Enqueue(trigger)
+				}
+			}
+		}),
 	})
 
 	logger.Info("Filter controller initialized")

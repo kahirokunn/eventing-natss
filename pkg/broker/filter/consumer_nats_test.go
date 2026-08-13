@@ -118,6 +118,12 @@ func makeTriggerWithUID(namespace, name, brokerName, uid string) *eventingv1.Tri
 // histogram, in-flight observable gauge) so tests exercise the same code path.
 func newConsumerManagerForTest(t *testing.T, ctx context.Context, conn *nats.Conn, js nats.JetStreamContext, cfg *ConsumerManagerConfig) *ConsumerManager {
 	t.Helper()
+	runCtx, runCancel := context.WithCancel(ctx)
+	recoveryCtx, recoveryCancel := context.WithCancel(runCtx)
+	t.Cleanup(func() {
+		recoveryCancel()
+		runCancel()
+	})
 	dispatcher := kncloudevents.NewDispatcher(eventingtls.ClientConfig{}, nil)
 
 	fetchBatchSize := DefaultFetchBatchSize
@@ -156,20 +162,28 @@ func newConsumerManagerForTest(t *testing.T, ctx context.Context, conn *nats.Con
 	}
 
 	cm := &ConsumerManager{
-		logger:                logging.FromContext(ctx),
-		ctx:                   ctx,
-		js:                    js,
-		conn:                  conn,
-		fetchBatchSize:        fetchBatchSize,
-		fetchTimeout:          fetchTimeout,
-		defaultMaxConcurrency: maxConcurrency,
-		dispatcher:            dispatcher,
-		tracer:                tracer,
-		dispatchDuration:      dispatchDuration,
-		processDuration:       processDuration,
-		subscriptions:         make(map[string]*TriggerSubscription),
+		logger:                     logging.FromContext(ctx),
+		ctx:                        runCtx,
+		cancel:                     runCancel,
+		recoveryCtx:                recoveryCtx,
+		recoveryCancel:             recoveryCancel,
+		js:                         js,
+		conn:                       conn,
+		fetchBatchSize:             fetchBatchSize,
+		fetchTimeout:               fetchTimeout,
+		defaultMaxConcurrency:      maxConcurrency,
+		dispatcher:                 dispatcher,
+		tracer:                     tracer,
+		dispatchDuration:           dispatchDuration,
+		processDuration:            processDuration,
+		tokenFailures:              make(map[string]map[string]struct{}),
+		tokenValidationGenerations: make(map[string]int64),
+		subscriptions:              make(map[string]*TriggerSubscription),
 	}
-
+	if cfg != nil {
+		cm.tokenSource = cfg.AudienceTokenSource
+	}
+	startTokenRecoveryForTest(t, cm)
 	if _, err := meter.Int64ObservableGauge(
 		"kn.eventing.broker.filter.dispatches.inflight",
 		otelmetric.WithInt64Callback(func(_ context.Context, obs otelmetric.Int64Observer) error {
@@ -380,6 +394,115 @@ func TestFetchLoop_DispatchesMessages(t *testing.T) {
 	if n := atomic.LoadInt64(&receivedCount); n != 3 {
 		t.Errorf("subscriber received %d requests, want 3", n)
 	}
+}
+
+func TestTokenFailurePausesFetchAndRecoversSameSubscription(t *testing.T) {
+	s := natsTesting.RunBasicJetstreamServer()
+	defer natsTesting.ShutdownJSServerAndRemoveStorage(t, s)
+	conn, js := natsTesting.JsClient(t, s)
+	defer conn.Close()
+
+	ctx, cancel := context.WithCancel(logging.WithLogger(context.Background(), zap.NewNop().Sugar()))
+	defer cancel()
+	const (
+		namespace  = "default"
+		brokerName = "oidc-recovery-broker"
+		triggerUID = "oidc-recovery-trigger-uid"
+		audience   = "https://subscriber.example"
+	)
+	streamName, consumerName := setupStreamAndConsumer(t, js, namespace, brokerName, triggerUID)
+	info, err := js.ConsumerInfo(streamName, consumerName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info.Config.AckWait = 1500 * time.Millisecond
+	if _, err := js.UpdateConsumer(streamName, &info.Config); err != nil {
+		t.Fatal(err)
+	}
+
+	httpRequests := make(chan string, 2)
+	subscriberServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		httpRequests <- r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer subscriberServer.Close()
+
+	manager := newConsumerManagerForTest(t, ctx, conn, js, &ConsumerManagerConfig{
+		FetchBatchSize: 1, FetchTimeout: 50 * time.Millisecond, MaxConcurrency: 1,
+	})
+	manager.tokenFailures = make(map[string]map[string]struct{})
+	var tokenAvailable atomic.Bool
+	manager.tokenSource = func(context.Context, string) (string, error) {
+		if !tokenAvailable.Load() {
+			return "", ErrOIDCTokenUnavailable
+		}
+		return "recovered-token", nil
+	}
+	broker := makeTestBrokerForNats(namespace, brokerName)
+	trigger := makeTriggerWithUID(namespace, "oidc-recovery-trigger", brokerName, triggerUID)
+	subscriberURL, _ := apis.ParseURL(subscriberServer.URL)
+	if err := manager.SubscribeTrigger(trigger, broker, duckv1.Addressable{URL: subscriberURL, Audience: ptrTo(audience)}, nil, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	defer manager.UnsubscribeTrigger(triggerUID) //nolint:errcheck
+	publishStructuredCE(t, js, brokerutils.BrokerPublishSubjectName(namespace, brokerName), "oidc-recovery-event")
+
+	waitForCondition(t, 5*time.Second, func() bool {
+		manager.mu.RLock()
+		sub := manager.subscriptions[triggerUID]
+		paused := sub != nil && sub.tokenPaused
+		manager.mu.RUnlock()
+		return paused && !manager.Ready()
+	}, "token failure did not pause fetch/readiness")
+	select {
+	case auth := <-httpRequests:
+		t.Fatalf("HTTP request was sent while token unavailable: Authorization=%q", auth)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// An unacknowledged delivery remains AckPending. Ack, Nak, or Term would
+	// clear this state; pause must leave disposition to JetStream's AckWait.
+	info, err = js.ConsumerInfo(streamName, consumerName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.NumAckPending != 1 {
+		t.Fatalf("NumAckPending after token failure = %d, want 1 (no Ack/Nak/Term)", info.NumAckPending)
+	}
+
+	tokenAvailable.Store(true)
+	waitForCondition(t, 3*time.Second, manager.Ready, "readiness did not recover after token became available")
+	select {
+	case got := <-httpRequests:
+		if got != "Bearer recovered-token" {
+			t.Errorf("recovered Authorization = %q, want exact bearer token", got)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("same subscription did not resume delivery after token recovery")
+	}
+	if manager.GetSubscriptionCount() != 1 || !manager.HasSubscription(triggerUID) {
+		t.Error("token recovery replaced or removed the existing subscription")
+	}
+	if err := manager.UnsubscribeTrigger(triggerUID); err != nil {
+		t.Fatal(err)
+	}
+	if manager.GetSubscriptionCount() != 0 {
+		t.Errorf("subscription count after cleanup = %d, want 0", manager.GetSubscriptionCount())
+	}
+}
+
+func ptrTo[T any](value T) *T { return &value }
+
+func waitForCondition(t *testing.T, timeout time.Duration, condition func() bool, message string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal(message)
 }
 
 // TestFetchLoop_ContextCancellation verifies that UnsubscribeTrigger stops the fetch loop.

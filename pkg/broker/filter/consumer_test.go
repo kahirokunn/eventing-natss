@@ -28,6 +28,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"go.uber.org/zap"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	duckv1 "knative.dev/pkg/apis/duck/v1"
 	"knative.dev/pkg/logging"
 
@@ -89,6 +90,41 @@ type shutdownPullSubscription struct {
 	once         sync.Once
 }
 
+type recordingPullSubscription struct {
+	fetches      chan int
+	release      chan struct{}
+	unsubscribed chan struct{}
+}
+
+func startTokenRecoveryForTest(t *testing.T, manager *ConsumerManager) {
+	t.Helper()
+	if manager.recoveryCtx == nil {
+		manager.recoveryCtx, manager.recoveryCancel = context.WithCancel(manager.ctx)
+	}
+	if manager.recoveryCancel == nil {
+		manager.recoveryCtx, manager.recoveryCancel = context.WithCancel(manager.recoveryCtx)
+	}
+	manager.recoverySignal = make(chan struct{}, 1)
+	manager.recoveryDone = make(chan struct{})
+	go manager.runTokenRecovery()
+	t.Cleanup(func() {
+		manager.recoveryCancel()
+		<-manager.recoveryDone
+		manager.recoveryWorkers.Wait()
+	})
+}
+
+func (s *recordingPullSubscription) Fetch(_ context.Context, batch int) ([]*nats.Msg, error) {
+	s.fetches <- batch
+	<-s.release
+	return nil, nats.ErrConnectionClosed
+}
+
+func (s *recordingPullSubscription) Unsubscribe() error {
+	close(s.unsubscribed)
+	return nil
+}
+
 func (*shutdownPullSubscription) Fetch(context.Context, int) ([]*nats.Msg, error) {
 	return nil, nats.ErrTimeout
 }
@@ -116,6 +152,343 @@ func TestConsumerManagerConfigDefaults(t *testing.T) {
 
 	if DefaultFetchTimeout != 200*time.Millisecond {
 		t.Errorf("DefaultFetchTimeout = %v, want 200ms", DefaultFetchTimeout)
+	}
+}
+
+func TestPausedTokenAnnotationUpdateRestartsOnceWithNewParametersAfterRecovery(t *testing.T) {
+	ctx, cancel := context.WithCancel(logging.WithLogger(context.Background(), zap.NewNop().Sugar()))
+	defer cancel()
+	const triggerUID = "paused-trigger-uid"
+	oldTrigger := &eventingv1.Trigger{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "default", Name: "paused-trigger", UID: triggerUID,
+	}}
+	newTrigger := oldTrigger.DeepCopy()
+	newTrigger.Annotations = map[string]string{
+		TriggerFetchBatchSizeAnnotation: "7",
+		TriggerFetchTimeoutAnnotation:   "25ms",
+		TriggerMaxConcurrencyAnnotation: "3",
+	}
+	handler, err := NewTriggerHandler(ctx, oldTrigger, duckv1.Addressable{}, nil, nil, nil, nil, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseFetch := make(chan struct{})
+	pull := &recordingPullSubscription{fetches: make(chan int, 3), release: releaseFetch, unsubscribed: make(chan struct{})}
+	defer func() {
+		select {
+		case <-releaseFetch:
+		default:
+			close(releaseFetch)
+		}
+	}()
+	pausedDone := make(chan struct{})
+	close(pausedDone)
+	sub := &TriggerSubscription{
+		trigger: oldTrigger, subscription: pull, handler: handler,
+		fetchBatchSize: 1, fetchTimeout: time.Second, maxConcurrency: 1,
+		sem: make(chan struct{}, 1), done: pausedDone, cancel: func() {},
+		dispatchCtx: ctx, dispatchCancel: func() {}, tokenPaused: true,
+	}
+	manager := &ConsumerManager{
+		logger: logging.FromContext(ctx), ctx: ctx, recoveryCtx: ctx,
+		fetchBatchSize: 1, fetchTimeout: time.Second, defaultMaxConcurrency: 1,
+		tokenSource:   func(context.Context, string) (string, error) { return "recovered-token", nil },
+		subscriptions: map[string]*TriggerSubscription{triggerUID: sub},
+		tokenFailures: map[string]map[string]struct{}{triggerUID: {"https://subscriber.example": {}}},
+	}
+	startTokenRecoveryForTest(t, manager)
+
+	if err := manager.SubscribeTrigger(newTrigger, nil, duckv1.Addressable{}, nil, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case batch := <-pull.fetches:
+		cancel()
+		t.Fatalf("paused subscription restarted before token recovery with batch %d", batch)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if !sub.tokenPaused {
+		t.Fatal("annotation update cleared tokenPaused before recovery")
+	}
+	if sub.fetchBatchSize != 7 || sub.fetchTimeout != 25*time.Millisecond || sub.maxConcurrency != 3 || cap(sub.sem) != 3 {
+		t.Fatalf("paused parameters = batch %d timeout %v concurrency %d sem %d, want 7/25ms/3/3",
+			sub.fetchBatchSize, sub.fetchTimeout, sub.maxConcurrency, cap(sub.sem))
+	}
+
+	manager.resumeTriggerAfterToken(triggerUID, "https://subscriber.example", sub, sub.done)
+	select {
+	case batch := <-pull.fetches:
+		if batch != 3 { // fetch is capped to the three newly configured free slots.
+			t.Errorf("recovered fetch batch = %d, want 3", batch)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("fetch producer did not resume after token recovery")
+	}
+	select {
+	case batch := <-pull.fetches:
+		t.Fatalf("a second fetch producer started after recovery (batch %d)", batch)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if sub.tokenPaused {
+		t.Error("tokenPaused remained true after recovery")
+	}
+	if !manager.Ready() {
+		t.Error("manager readiness remained false after recovery")
+	}
+	cancel()
+	close(releaseFetch)
+	select {
+	case <-sub.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("recovered fetch producer did not stop")
+	}
+}
+
+func TestPausedTriggerWaitsForEveryDestinationTokenBeforeRecovery(t *testing.T) {
+	ctx, cancel := context.WithCancel(logging.WithLogger(context.Background(), zap.NewNop().Sugar()))
+	defer cancel()
+	const (
+		triggerUID         = "two-audience-trigger-uid"
+		subscriberAudience = "https://subscriber.example"
+		deadLetterAudience = "https://dead-letter.example"
+	)
+
+	trigger := &eventingv1.Trigger{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "default", Name: "two-audience-trigger", UID: types.UID(triggerUID),
+	}}
+	handler, err := NewTriggerHandler(ctx, trigger, duckv1.Addressable{}, nil, nil, nil, nil, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseFetch := make(chan struct{})
+	pull := &recordingPullSubscription{fetches: make(chan int, 2), release: releaseFetch, unsubscribed: make(chan struct{})}
+	pausedDone := make(chan struct{})
+	close(pausedDone)
+	sub := &TriggerSubscription{
+		trigger: trigger, subscription: pull, handler: handler,
+		fetchBatchSize: 1, fetchTimeout: time.Second, maxConcurrency: 1,
+		sem: make(chan struct{}, 1), done: pausedDone, cancel: func() {},
+		dispatchCtx: ctx, dispatchCancel: func() {}, tokenPaused: true,
+	}
+	manager := &ConsumerManager{
+		logger: logging.FromContext(ctx), ctx: ctx, recoveryCtx: ctx,
+		fetchBatchSize: 1, fetchTimeout: time.Second, defaultMaxConcurrency: 1,
+		tokenSource: func(_ context.Context, audience string) (string, error) {
+			return "token-for-" + audience, nil
+		},
+		subscriptions: map[string]*TriggerSubscription{triggerUID: sub},
+		tokenFailures: map[string]map[string]struct{}{
+			triggerUID: {subscriberAudience: {}, deadLetterAudience: {}},
+		},
+	}
+	startTokenRecoveryForTest(t, manager)
+
+	manager.resumeTriggerAfterToken(triggerUID, subscriberAudience, sub, sub.done)
+	if manager.Ready() {
+		t.Fatal("manager became ready after only the subscriber token recovered")
+	}
+	if !sub.tokenPaused {
+		t.Fatal("fetch producer resumed before the dead-letter token recovered")
+	}
+	select {
+	case batch := <-pull.fetches:
+		t.Fatalf("fetch producer restarted after partial token recovery with batch %d", batch)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	manager.resumeTriggerAfterToken(triggerUID, deadLetterAudience, sub, sub.done)
+	select {
+	case batch := <-pull.fetches:
+		if batch != 1 {
+			t.Errorf("recovered fetch batch = %d, want 1", batch)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("fetch producer did not restart after every destination token recovered")
+	}
+	if !manager.Ready() {
+		t.Error("manager remained unready after every destination token recovered")
+	}
+	if sub.tokenPaused {
+		t.Error("tokenPaused remained true after every destination token recovered")
+	}
+
+	cancel()
+	close(releaseFetch)
+	select {
+	case <-sub.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("recovered fetch producer did not stop")
+	}
+}
+
+func TestConsumerManagerReadinessRequiresSyncedCurrentTokenValidation(t *testing.T) {
+	manager := &ConsumerManager{
+		tokenFailures:              make(map[string]map[string]struct{}),
+		tokenValidationGenerations: make(map[string]int64),
+		subscriptions:              make(map[string]*TriggerSubscription),
+	}
+	synced := false
+	requirement := tokenReadinessRequirement{triggerUID: "trigger-uid", generation: 1, resolved: true, authenticated: true}
+	manager.setTokenReadinessRequirements(func() ([]tokenReadinessRequirement, bool) {
+		return []tokenReadinessRequirement{requirement}, synced
+	})
+	if manager.Ready() {
+		t.Fatal("manager is ready before the Trigger informer has synced")
+	}
+	synced = true
+	if manager.Ready() {
+		t.Fatal("manager is ready before the current authenticated generation was preflighted")
+	}
+	manager.markDestinationTokensValidated(requirement.triggerUID, requirement.generation)
+	if !manager.Ready() {
+		t.Fatal("manager is not ready after current resolved token validation")
+	}
+	requirement.generation++
+	if manager.Ready() {
+		t.Fatal("manager stayed ready after the Trigger generation changed")
+	}
+	manager.markDestinationTokensValidated(requirement.triggerUID, requirement.generation)
+	requirement.resolved = false
+	if !manager.Ready() {
+		t.Fatal("unresolved Trigger blocked readiness and reintroduced the Broker/filter bootstrap cycle")
+	}
+	requirement.resolved = true
+	requirement.authenticated = false
+	manager.clearDestinationTokenValidation(requirement.triggerUID)
+	if !manager.Ready() {
+		t.Fatal("non-OIDC current resolved Trigger unnecessarily requires token preflight")
+	}
+}
+
+func TestValidateDestinationTokensCancellationDoesNotCreateReadinessFailure(t *testing.T) {
+	manager := &ConsumerManager{
+		tokenSource: func(ctx context.Context, _ string) (string, error) {
+			return "", ctx.Err()
+		},
+		tokenFailures: make(map[string]map[string]struct{}),
+	}
+	audience := "https://subscriber.example"
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := manager.validateDestinationTokens(ctx, "trigger-uid", duckv1.Addressable{Audience: &audience}, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("validateDestinationTokens() error = %v, want context.Canceled", err)
+	}
+	if !manager.Ready() {
+		t.Error("caller cancellation was recorded as a destination credential failure")
+	}
+}
+
+func TestConsumerManagerShutdownJoinsTokenRecoveryWorker(t *testing.T) {
+	ctx := logging.WithLogger(context.Background(), zap.NewNop().Sugar())
+	trigger := &eventingv1.Trigger{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "default", Name: "shutdown-recovery", UID: types.UID("shutdown-recovery-uid"),
+	}}
+	handler, err := NewTriggerHandler(ctx, trigger, duckv1.Addressable{}, nil, nil, nil, nil, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	close(done)
+	entered := make(chan struct{})
+	returned := make(chan struct{})
+	var once sync.Once
+	pull := &reassignmentPullSubscription{}
+	manager := &ConsumerManager{
+		logger: logging.FromContext(ctx), ctx: ctx,
+		tokenSource: func(ctx context.Context, _ string) (string, error) {
+			once.Do(func() { close(entered) })
+			<-ctx.Done()
+			close(returned)
+			return "", ctx.Err()
+		},
+		subscriptions: map[string]*TriggerSubscription{
+			string(trigger.UID): {
+				trigger: trigger, subscription: pull, handler: handler,
+				done: done, cancel: func() {}, dispatchCancel: func() {},
+			},
+		},
+		tokenFailures:              make(map[string]map[string]struct{}),
+		tokenValidationGenerations: make(map[string]int64),
+	}
+	startTokenRecoveryForTest(t, manager)
+	manager.reportDestinationTokenFailure(string(trigger.UID), "https://subscriber.example")
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("token recovery worker did not start")
+	}
+	if err := manager.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-returned:
+	default:
+		t.Fatal("Close returned before the token recovery worker exited")
+	}
+	if !pull.unsubscribed {
+		t.Error("Close did not finish subscription teardown after joining recovery")
+	}
+}
+
+func TestTokenRecoveryExitsWhenAudienceIsNoLongerRequired(t *testing.T) {
+	ctx := logging.WithLogger(context.Background(), zap.NewNop().Sugar())
+	trigger := &eventingv1.Trigger{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "default", Name: "changed-audience", UID: types.UID("changed-audience-uid"),
+	}}
+	handler, err := NewTriggerHandler(ctx, trigger, duckv1.Addressable{}, nil, nil, nil, nil, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	close(done)
+	oldAudience := "https://old.example"
+	newAudience := "https://new.example"
+	oldAttempted := make(chan struct{})
+	var once sync.Once
+	manager := &ConsumerManager{
+		logger: logging.FromContext(ctx), ctx: ctx,
+		tokenSource: func(_ context.Context, audience string) (string, error) {
+			if audience == oldAudience {
+				once.Do(func() { close(oldAttempted) })
+				return "", errors.New("old audience remains unavailable")
+			}
+			return "new-token", nil
+		},
+		subscriptions: map[string]*TriggerSubscription{
+			string(trigger.UID): {
+				trigger: trigger, subscription: &reassignmentPullSubscription{}, handler: handler,
+				done: done, cancel: func() {}, dispatchCancel: func() {}, tokenPaused: true,
+				fetchBatchSize: 1, fetchTimeout: time.Second, maxConcurrency: 1, sem: make(chan struct{}, 1),
+				dispatchCtx: ctx,
+			},
+		},
+		tokenFailures:              make(map[string]map[string]struct{}),
+		tokenValidationGenerations: make(map[string]int64),
+	}
+	startTokenRecoveryForTest(t, manager)
+	manager.reportDestinationTokenFailure(string(trigger.UID), oldAudience)
+	select {
+	case <-oldAttempted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("old audience recovery did not start")
+	}
+	if err := manager.validateDestinationTokens(ctx, string(trigger.UID), duckv1.Addressable{Audience: &newAudience}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	doneWaiting := make(chan struct{})
+	go func() {
+		manager.recoveryWorkers.Wait()
+		close(doneWaiting)
+	}()
+	select {
+	case <-doneWaiting:
+	case <-time.After(3 * time.Second):
+		t.Fatal("old audience recovery worker did not exit after requirements changed")
+	}
+	if manager.hasDestinationTokenFailure(string(trigger.UID)) {
+		t.Error("old audience failure remained after current requirements changed")
 	}
 }
 

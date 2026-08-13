@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -30,6 +31,7 @@ import (
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -45,9 +47,15 @@ import (
 	"k8s.io/utils/ptr"
 
 	"go.uber.org/zap"
+	duckv1 "knative.dev/pkg/apis/duck/v1"
+	addressableinjection "knative.dev/pkg/client/injection/ducks/duck/v1/addressable"
 	"knative.dev/pkg/controller"
+	dynamicclientfake "knative.dev/pkg/injection/clients/dynamicclient/fake"
 	"knative.dev/pkg/logging"
+	"knative.dev/pkg/resolver"
+	"knative.dev/pkg/tracker"
 
+	eventingduckv1 "knative.dev/eventing/pkg/apis/duck/v1"
 	eventingv1 "knative.dev/eventing/pkg/apis/eventing/v1"
 	eventingfake "knative.dev/eventing/pkg/client/clientset/versioned/fake"
 	eventinglisters "knative.dev/eventing/pkg/client/listers/eventing/v1"
@@ -56,6 +64,7 @@ import (
 	brokerconfig "knative.dev/eventing-natss/pkg/broker/config"
 	"knative.dev/eventing-natss/pkg/broker/contract"
 	"knative.dev/eventing-natss/pkg/broker/controller/resources"
+	brokeroidc "knative.dev/eventing-natss/pkg/broker/oidc"
 	brokerutils "knative.dev/eventing-natss/pkg/broker/utils"
 	natsTesting "knative.dev/eventing-natss/pkg/channel/jetstream/dispatcher/testing"
 )
@@ -953,6 +962,92 @@ func TestReconcileFilterDeploymentUpdate(t *testing.T) {
 	if got, want := envValues["NATS_CONFIG"], r.natsConfigJSON; got != want {
 		t.Errorf("NATS_CONFIG = %q, want controller snapshot %q", got, want)
 	}
+}
+
+func TestMergeFilterDeploymentRepairsOIDCIdentityAndPreservesAdmissionExtras(t *testing.T) {
+	b := testBroker(testNamespace, testBrokerName)
+	args := &resources.FilterArgs{
+		Broker: b, Image: "filter:latest", ServiceAccountName: "dp-sa",
+		StreamName: "TEST_STREAM", NatsURL: "nats://localhost:4222",
+		OIDCServiceAccountUID: "delivery-sa-uid",
+	}
+
+	expected := resources.MakeFilterDeployment(args)
+	existing := expected.DeepCopy()
+	filterIndex, err := namedContainerIndex(existing.Spec.Template.Spec.Containers, resources.FilterContainerName)
+	if err != nil || filterIndex < 0 {
+		t.Fatalf("find filter container: index=%d err=%v", filterIndex, err)
+	}
+	for i := range existing.Spec.Template.Spec.Containers[filterIndex].Env {
+		variable := &existing.Spec.Template.Spec.Containers[filterIndex].Env[i]
+		if variable.Name == "OIDC_SERVICE_ACCOUNT" || variable.Name == "OIDC_SERVICE_ACCOUNT_UID" {
+			variable.Value = "drifted"
+		}
+	}
+
+	admissionVolume := corev1.Volume{
+		Name: "admission-extra",
+		VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+			LocalObjectReference: corev1.LocalObjectReference{Name: "injected-config"},
+		}},
+	}
+	existing.Spec.Template.Spec.Volumes = append(existing.Spec.Template.Spec.Volumes, admissionVolume)
+	admissionMount := corev1.VolumeMount{Name: admissionVolume.Name, MountPath: "/var/run/admission", ReadOnly: true}
+	existing.Spec.Template.Spec.Containers[filterIndex].VolumeMounts = append(
+		existing.Spec.Template.Spec.Containers[filterIndex].VolumeMounts,
+		admissionMount,
+	)
+
+	merged, err := mergeFilterDeployment(existing, expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsVolume(merged.Spec.Template.Spec.Volumes, admissionVolume) {
+		t.Errorf("admission-added volume was not preserved: %#v", merged.Spec.Template.Spec.Volumes)
+	}
+	mergedFilter, err := namedContainer(merged.Spec.Template.Spec.Containers, resources.FilterContainerName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsVolumeMount(mergedFilter.VolumeMounts, admissionMount) {
+		t.Errorf("admission-added mount was not preserved: %#v", mergedFilter.VolumeMounts)
+	}
+	env := make(map[string]string)
+	for _, variable := range mergedFilter.Env {
+		env[variable.Name] = variable.Value
+	}
+	if got := env["OIDC_SERVICE_ACCOUNT"]; got != brokeroidc.DeliveryServiceAccountName {
+		t.Errorf("OIDC_SERVICE_ACCOUNT = %q, want %q", got, brokeroidc.DeliveryServiceAccountName)
+	}
+	if got := env["OIDC_SERVICE_ACCOUNT_UID"]; got != args.OIDCServiceAccountUID {
+		t.Errorf("OIDC_SERVICE_ACCOUNT_UID = %q, want %q", got, args.OIDCServiceAccountUID)
+	}
+
+	steady, err := mergeFilterDeployment(merged, expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !apiequality.Semantic.DeepEqual(steady, merged) {
+		t.Error("second OIDC identity merge is not a steady-state no-op")
+	}
+}
+
+func containsVolume(volumes []corev1.Volume, want corev1.Volume) bool {
+	for _, volume := range volumes {
+		if apiequality.Semantic.DeepEqual(volume, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsVolumeMount(mounts []corev1.VolumeMount, want corev1.VolumeMount) bool {
+	for _, mount := range mounts {
+		if apiequality.Semantic.DeepEqual(mount, want) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestReconcileFilterDeploymentRepairsRequiredLabelsAndPreservesCustomLabels(t *testing.T) {
@@ -2145,6 +2240,178 @@ func TestReconcileKind(t *testing.T) {
 		}
 		if got, want := deployment.Spec.Template.Spec.ServiceAccountName, r.dataplaneIdentity(b); got != want {
 			t.Errorf("filter ServiceAccount = %q, want per-Broker identity %q", got, want)
+		}
+	})
+
+	t.Run("Broker DLS correction precedes inherited audience cap validation", func(t *testing.T) {
+		const triggerCount = brokeroidc.MaxAudiences
+		staleDLSAudience := "https://stale-inherited-dls.example"
+		correctedDLSAudience := "https://subscriber-00.example"
+		addressableGVK := schema.GroupVersionKind{Group: "testing.eventing.knative.dev", Version: "v1", Kind: "OIDCSink"}
+		addressableGVR := schema.GroupVersionResource{Group: addressableGVK.Group, Version: addressableGVK.Version, Resource: "oidcsinks"}
+		addressableName := "broker-dls"
+		triggers := make([]*eventingv1.Trigger, 0, triggerCount)
+		for i := 0; i < triggerCount; i++ {
+			trigger := testTrigger(testNamespace, fmt.Sprintf("trigger-%02d", i), testBrokerName)
+			trigger.Generation = 1
+			trigger.Status.ObservedGeneration = 1
+			subscriberAudience := fmt.Sprintf("https://subscriber-%02d.example", i)
+			trigger.Status.SubscriberAudience = &subscriberAudience
+			trigger.Status.DeadLetterSinkAudience = &staleDLSAudience
+			trigger.Status.MarkSubscriberResolvedSucceeded()
+			trigger.Status.MarkDeadLetterSinkResolvedSucceeded()
+			triggers = append(triggers, trigger)
+		}
+
+		r, kube := setup(t, triggers...)
+		addressable := &unstructured.Unstructured{Object: map[string]interface{}{
+			"apiVersion": addressableGVK.GroupVersion().String(),
+			"kind":       addressableGVK.Kind,
+			"metadata": map[string]interface{}{
+				"name":      addressableName,
+				"namespace": testNamespace,
+			},
+			"status": map[string]interface{}{
+				"address": map[string]interface{}{
+					"url":      "http://stale-dls.example",
+					"audience": staleDLSAudience,
+				},
+			},
+		}}
+		resolverCtx, cancelResolver := context.WithCancel(testContext())
+		t.Cleanup(cancelResolver)
+		resolverCtx, dynamicClient := dynamicclientfake.With(resolverCtx, runtime.NewScheme(), addressable)
+		resolverCtx = addressableinjection.WithDuck(resolverCtx)
+		r.uriResolver = resolver.NewURIResolverFromTracker(resolverCtx, tracker.New(func(types.NamespacedName) {}, time.Hour))
+		assignServiceAccountUIDsOnCreate(t, kube)
+		if err := kube.Tracker().Add(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: testNamespace, UID: "namespace-uid"}}); err != nil {
+			t.Fatal(err)
+		}
+		b := testBroker(testNamespace, testBrokerName)
+		b.Generation = 7
+		brokerGeneration := b.Generation
+		b.Spec.Delivery = &eventingduckv1.DeliverySpec{DeadLetterSink: &duckv1.Destination{
+			Ref: &duckv1.KReference{
+				APIVersion: addressableGVK.GroupVersion().String(),
+				Kind:       addressableGVK.Kind,
+				Name:       addressableName,
+			},
+		}}
+
+		err := r.ReconcileKind(resolverCtx, b)
+		if err == nil || !strings.Contains(err.Error(), "invalid filter OIDC audiences") {
+			t.Fatalf("first ReconcileKind() error = %v, want stale inherited audience cap failure", err)
+		}
+		if b.Status.DeadLetterSinkAudience == nil || *b.Status.DeadLetterSinkAudience != staleDLSAudience {
+			t.Fatalf("Broker DLS audience after first resolution = %v, want referenced status %q", b.Status.DeadLetterSinkAudience, staleDLSAudience)
+		}
+
+		current, err := dynamicClient.Resource(addressableGVR).Namespace(testNamespace).Get(resolverCtx, addressableName, metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := unstructured.SetNestedField(current.Object, "http://corrected-dls.example", "status", "address", "url"); err != nil {
+			t.Fatal(err)
+		}
+		if err := unstructured.SetNestedField(current.Object, correctedDLSAudience, "status", "address", "audience"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := dynamicClient.Resource(addressableGVR).Namespace(testNamespace).Update(resolverCtx, current, metav1.UpdateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		deadline := time.Now().Add(time.Second)
+		for {
+			resolved, resolveErr := r.resolveDeadLetterSink(resolverCtx, b)
+			if resolveErr == nil && resolved.Audience != nil && *resolved.Audience == correctedDLSAudience {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("referenced DLS audience did not update through the resolver: address=%#v error=%v", resolved, resolveErr)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		err = r.ReconcileKind(resolverCtx, b)
+		if err == nil || !strings.Contains(err.Error(), "invalid filter OIDC audiences") {
+			t.Fatalf("second ReconcileKind() error = %v, want stale inherited Trigger status to remain over the cap", err)
+		}
+		if b.Generation != brokerGeneration {
+			t.Fatalf("Broker generation changed during referenced status correction: got %d, want %d", b.Generation, brokerGeneration)
+		}
+		if b.Status.DeadLetterSinkAudience == nil || *b.Status.DeadLetterSinkAudience != correctedDLSAudience {
+			t.Fatalf("Broker DLS audience after cap failure = %v, want freshly resolved %q", b.Status.DeadLetterSinkAudience, correctedDLSAudience)
+		}
+		condition := b.Status.GetCondition(eventingv1.BrokerConditionDeadLetterSinkResolved)
+		if condition == nil || !condition.IsTrue() {
+			t.Fatalf("DeadLetterSinkResolved = %#v, want true before audience validation", condition)
+		}
+
+		// Model the Trigger controller inheriting the freshly resolved Broker DLS.
+		// The corrected audience de-duplicates with subscriber-00, reducing the
+		// aggregate from 33 to the accepted limit of 32 on the next Broker pass.
+		for _, trigger := range triggers {
+			trigger.Status.DeadLetterSinkAudience = &correctedDLSAudience
+		}
+		if err := r.ReconcileKind(resolverCtx, b); err != nil {
+			t.Fatalf("third ReconcileKind() after inherited DLS correction = %v", err)
+		}
+		if _, err := kube.AppsV1().Deployments(testNamespace).Get(context.Background(), resources.FilterName(testBrokerName), metav1.GetOptions{}); err != nil {
+			t.Errorf("filter Deployment was not created after audience cap recovery: %v", err)
+		}
+	})
+
+	t.Run("foreign OIDC RBAC clears stale Broker readiness", func(t *testing.T) {
+		audience := "https://subscriber.example"
+		trigger := testTrigger(testNamespace, "oidc-trigger", testBrokerName)
+		trigger.Generation = 1
+		trigger.Status.ObservedGeneration = 1
+		trigger.Status.SubscriberAudience = &audience
+		trigger.Status.MarkSubscriberResolvedSucceeded()
+		trigger.Status.MarkDeadLetterSinkNotConfigured()
+		r, kube := setup(t, trigger)
+		namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: testNamespace, UID: "namespace-uid"}}
+		foreign := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{
+			Name: brokeroidc.DeliveryServiceAccountName, Namespace: testNamespace,
+			Labels: map[string]string{brokeroidc.ManagedServiceAccountLabelKey: "foreign-manager"},
+		}}
+		if err := kube.Tracker().Add(namespace); err != nil {
+			t.Fatal(err)
+		}
+		if err := kube.Tracker().Add(foreign); err != nil {
+			t.Fatal(err)
+		}
+
+		b := testBroker(testNamespace, testBrokerName)
+		b.Generation = 1
+		b.Status = *eventingv1.TestHelper.ReadyBrokerStatusWithoutDLS()
+		b.Status.ObservedGeneration = b.Generation
+		if !b.IsReady() {
+			t.Fatal("Broker fixture is not stale-ready before the RBAC failure")
+		}
+		recorder := record.NewFakeRecorder(10)
+		ctx := controller.WithEventRecorder(logging.WithLogger(context.Background(), zap.NewNop().Sugar()), recorder)
+		err := r.ReconcileKind(ctx, b)
+		if err == nil || !strings.Contains(err.Error(), "not owned by Namespace") {
+			t.Fatalf("ReconcileKind() error = %v, want foreign OIDC identity rejection", err)
+		}
+		condition := b.Status.GetCondition(eventingv1.BrokerConditionFilter)
+		if condition == nil || condition.Status != corev1.ConditionFalse || condition.Reason != "FilterRBACFailed" {
+			t.Fatalf("Filter condition = %#v, want False/FilterRBACFailed", condition)
+		}
+		if b.IsReady() {
+			t.Error("Broker retained stale Ready=True after filter RBAC failed")
+		}
+		deadline := time.After(time.Second)
+		for {
+			select {
+			case event := <-recorder.Events:
+				if strings.Contains(event, "Warning FilterRBACFailed") {
+					return
+				}
+			case <-deadline:
+				t.Error("FilterRBACFailed Warning event was not emitted")
+				return
+			}
 		}
 	})
 }

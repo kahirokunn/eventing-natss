@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nats-io/nats.go"
 	corev1 "k8s.io/api/core/v1"
@@ -40,6 +41,7 @@ import (
 	eventinglisters "knative.dev/eventing/pkg/client/listers/eventing/v1"
 
 	"knative.dev/eventing-natss/pkg/broker/constants"
+	brokeroidc "knative.dev/eventing-natss/pkg/broker/oidc"
 	natsTesting "knative.dev/eventing-natss/pkg/channel/jetstream/dispatcher/testing"
 )
 
@@ -100,9 +102,23 @@ func newTestTrigger(namespace, name, brokerName string) *eventingv1.Trigger {
 // newTestTriggerWithSubscriber creates a trigger with a resolved subscriber URI.
 func newTestTriggerWithSubscriber(namespace, name, brokerName, subscriberURL string) *eventingv1.Trigger {
 	t := newTestTrigger(namespace, name, brokerName)
+	t.Generation = 1
 	u, _ := apis.ParseURL(subscriberURL)
 	t.Status.SubscriberURI = u
+	t.Status.InitializeConditions()
+	t.Status.ObservedGeneration = t.Generation
+	t.Status.PropagateBrokerCondition(&apis.Condition{Type: apis.ConditionReady, Status: corev1.ConditionTrue})
+	t.Status.MarkSubscriberResolvedSucceeded()
+	t.Status.MarkDeadLetterSinkNotConfigured()
+	t.Status.PropagateSubscriptionCondition(&apis.Condition{Type: apis.ConditionReady, Status: corev1.ConditionTrue})
+	t.Status.MarkDependencySucceeded()
 	return t
+}
+
+func setTestTriggerOIDCIdentity(trigger *eventingv1.Trigger, _ *eventingv1.Broker) {
+	identity := brokeroidc.DeliveryServiceAccountName
+	trigger.Status.Auth = &duckv1.AuthStatus{ServiceAccountName: &identity}
+	trigger.Status.MarkOIDCIdentityCreatedSucceeded()
 }
 
 // --- Fake listers ---
@@ -205,6 +221,7 @@ func TestReconcileTrigger(t *testing.T) {
 
 			r := &FilterReconciler{
 				logger:          logging.FromContext(ctx),
+				triggerLister:   newFakeTriggerLister(),
 				brokerLister:    brokerLister,
 				brokerNamespace: testNamespace,
 				brokerName:      testBrokerName,
@@ -231,6 +248,7 @@ func TestReconcileTrigger_BrokerLookupError(t *testing.T) {
 
 	r := &FilterReconciler{
 		logger:          logging.FromContext(ctx),
+		triggerLister:   newFakeTriggerLister(),
 		brokerLister:    brokerLister,
 		brokerNamespace: testNamespace,
 		brokerName:      testBrokerName,
@@ -338,6 +356,7 @@ func TestReconcileTrigger_SkipReasons(t *testing.T) {
 
 	r := &FilterReconciler{
 		logger:          logging.FromContext(ctx),
+		triggerLister:   newFakeTriggerLister(),
 		brokerLister:    brokerLister,
 		brokerNamespace: testNamespace,
 		brokerName:      testBrokerName,
@@ -446,6 +465,7 @@ func TestReconcileTrigger_FullPath(t *testing.T) {
 			if tc.deadLetterURI != "" {
 				u, _ := apis.ParseURL(tc.deadLetterURI)
 				trigger.Status.DeadLetterSinkURI = u
+				trigger.Status.MarkDeadLetterSinkResolvedSucceeded()
 			}
 			if tc.deliveryRetry != nil {
 				trigger.Spec.Delivery = &eventingduckv1.DeliverySpec{
@@ -457,15 +477,18 @@ func TestReconcileTrigger_FullPath(t *testing.T) {
 			brokerLister.addBroker(broker)
 
 			cm := &ConsumerManager{
-				logger:        logging.FromContext(ctx),
-				ctx:           ctx,
-				js:            &fakeJetStream{consumerInfoErr: tc.jsErr},
-				streamName:    tc.streamName,
-				subscriptions: make(map[string]*TriggerSubscription),
+				logger:                     logging.FromContext(ctx),
+				ctx:                        ctx,
+				js:                         &fakeJetStream{consumerInfoErr: tc.jsErr},
+				streamName:                 tc.streamName,
+				subscriptions:              make(map[string]*TriggerSubscription),
+				tokenFailures:              make(map[string]map[string]struct{}),
+				tokenValidationGenerations: make(map[string]int64),
 			}
 
 			r := &FilterReconciler{
 				logger:          logging.FromContext(ctx),
+				triggerLister:   newFakeTriggerLister(),
 				brokerLister:    brokerLister,
 				consumerManager: cm,
 				brokerNamespace: testNamespace,
@@ -501,6 +524,16 @@ func TestReconcileTrigger_ExistingSubscription(t *testing.T) {
 	}
 	newDLSURL, _ := apis.ParseURL("http://new-dls.example.com")
 	trigger.Status.DeadLetterSinkURI = newDLSURL
+	subscriberCACerts := "subscriber-ca"
+	subscriberAudience := "subscriber-audience"
+	deadLetterCACerts := "dead-letter-ca"
+	deadLetterAudience := "dead-letter-audience"
+	trigger.Status.SubscriberCACerts = &subscriberCACerts
+	trigger.Status.SubscriberAudience = &subscriberAudience
+	trigger.Status.DeadLetterSinkCACerts = &deadLetterCACerts
+	trigger.Status.DeadLetterSinkAudience = &deadLetterAudience
+	trigger.Status.MarkDeadLetterSinkResolvedSucceeded()
+	setTestTriggerOIDCIdentity(trigger, broker)
 	triggerUID := string(trigger.UID)
 
 	brokerLister := newFakeBrokerLister()
@@ -526,9 +559,21 @@ func TestReconcileTrigger_ExistingSubscription(t *testing.T) {
 	}
 
 	cm := &ConsumerManager{
-		logger: logging.FromContext(ctx),
-		ctx:    ctx,
-		js:     &fakeJetStream{consumerInfoErr: fmt.Errorf("should not be called")},
+		logger:                     logging.FromContext(ctx),
+		ctx:                        ctx,
+		js:                         &fakeJetStream{consumerInfoErr: fmt.Errorf("should not be called")},
+		tokenFailures:              make(map[string]map[string]struct{}),
+		tokenValidationGenerations: make(map[string]int64),
+		tokenSource: func(_ context.Context, audience string) (string, error) {
+			switch audience {
+			case subscriberAudience:
+				return "subscriber-token", nil
+			case deadLetterAudience:
+				return "dead-letter-token", nil
+			default:
+				return "", fmt.Errorf("unexpected audience %q", audience)
+			}
+		},
 		subscriptions: map[string]*TriggerSubscription{
 			triggerUID: {
 				trigger: trigger,
@@ -539,6 +584,7 @@ func TestReconcileTrigger_ExistingSubscription(t *testing.T) {
 
 	r := &FilterReconciler{
 		logger:          logging.FromContext(ctx),
+		triggerLister:   newFakeTriggerLister(),
 		brokerLister:    brokerLister,
 		consumerManager: cm,
 		brokerNamespace: testNamespace,
@@ -557,6 +603,12 @@ func TestReconcileTrigger_ExistingSubscription(t *testing.T) {
 	if got := config.subscriber.URL.String(); got != newSubscriberURL {
 		t.Errorf("handler subscriber URL = %q, want %q", got, newSubscriberURL)
 	}
+	if config.subscriber.CACerts == nil || *config.subscriber.CACerts != subscriberCACerts {
+		t.Errorf("handler subscriber CA certs = %v, want %q", config.subscriber.CACerts, subscriberCACerts)
+	}
+	if config.subscriber.Audience == nil || *config.subscriber.Audience != subscriberAudience {
+		t.Errorf("handler subscriber audience = %v, want %q", config.subscriber.Audience, subscriberAudience)
+	}
 	if config.brokerIngressURL == nil {
 		t.Error("handler brokerIngressURL should not be nil")
 	}
@@ -566,8 +618,257 @@ func TestReconcileTrigger_ExistingSubscription(t *testing.T) {
 	if config.deadLetterSink == nil || config.deadLetterSink.URL.String() != newDLSURL.String() {
 		t.Errorf("handler deadLetterSink URL = %v, want %v", config.deadLetterSink, newDLSURL)
 	}
+	if config.deadLetterSink == nil || config.deadLetterSink.CACerts == nil || *config.deadLetterSink.CACerts != deadLetterCACerts {
+		t.Errorf("handler deadLetterSink CA certs = %v, want %q", config.deadLetterSink, deadLetterCACerts)
+	}
+	if config.deadLetterSink == nil || config.deadLetterSink.Audience == nil || *config.deadLetterSink.Audience != deadLetterAudience {
+		t.Errorf("handler deadLetterSink audience = %v, want %q", config.deadLetterSink, deadLetterAudience)
+	}
 	if config.trigger == trigger || config.trigger.Name != trigger.Name || config.trigger.Namespace != trigger.Namespace {
 		t.Error("handler trigger should be updated to an equivalent defensive copy")
+	}
+}
+
+func TestReconcileTrigger_BrokerNotReadyRetainsAndRecoversTokenFailure(t *testing.T) {
+	ctx := logging.WithLogger(context.Background(), logging.FromContext(context.TODO()))
+	broker := newReadyTestBroker(testNamespace, testBrokerName, constants.BrokerClassName)
+	trigger := newTestTriggerWithSubscriber(testNamespace, testTriggerName, testBrokerName, "http://subscriber.example.com")
+	audience := "https://subscriber.example"
+	trigger.Status.SubscriberAudience = &audience
+	setTestTriggerOIDCIdentity(trigger, broker)
+
+	brokerLister := newFakeBrokerLister()
+	brokerLister.addBroker(broker)
+	handler, err := NewTriggerHandler(ctx, trigger, duckv1.Addressable{}, nil, nil, nil, nil, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	close(done)
+	pull := &reassignmentPullSubscription{}
+	tokenAvailable := false
+	manager := &ConsumerManager{
+		logger: logging.FromContext(ctx),
+		ctx:    ctx,
+		tokenSource: func(context.Context, string) (string, error) {
+			if !tokenAvailable {
+				return "", fmt.Errorf("token request not ready")
+			}
+			return "recovered-token", nil
+		},
+		subscriptions: map[string]*TriggerSubscription{
+			testTriggerUID: {
+				trigger: trigger, subscription: pull, handler: handler,
+				done: done, cancel: func() {}, dispatchCancel: func() {},
+			},
+		},
+		tokenFailures: map[string]map[string]struct{}{
+			testTriggerUID: {audience: {}},
+		},
+		tokenValidationGenerations: make(map[string]int64),
+	}
+	reconciler := &FilterReconciler{
+		logger: logging.FromContext(ctx), triggerLister: newFakeTriggerLister(), brokerLister: brokerLister, consumerManager: manager,
+		brokerNamespace: testNamespace, brokerName: testBrokerName,
+	}
+
+	// The first token preflight happens while the Broker is ready. It must
+	// retire the subscription but retain the failure that made the filter Pod
+	// (and consequently the Broker) unready.
+	err = reconciler.ReconcileTrigger(ctx, trigger)
+	if err == nil || !strings.Contains(err.Error(), ErrOIDCTokenUnavailable.Error()) {
+		t.Fatalf("ReconcileTrigger() error = %v, want token unavailable", err)
+	}
+	if _, found := manager.subscriptions[testTriggerUID]; found {
+		t.Error("Broker NotReady retained the paused subscription")
+	}
+	if !pull.unsubscribed {
+		t.Error("Broker NotReady did not unsubscribe the paused subscription")
+	}
+	if manager.Ready() {
+		t.Error("token failure was cleared while the current TokenRequest was unavailable")
+	}
+
+	brokerLister.addBroker(newTestBroker(testNamespace, testBrokerName, constants.BrokerClassName))
+	tokenAvailable = true
+	if err := reconciler.ReconcileTrigger(ctx, trigger); err != nil {
+		t.Fatalf("ReconcileTrigger() after token recovery = %v", err)
+	}
+	if !manager.Ready() {
+		t.Error("current resolved token recovery did not clear readiness failure")
+	}
+	if len(manager.subscriptions) != 0 {
+		t.Error("unready Broker recreated a subscription during credential preflight")
+	}
+}
+
+func TestReconcileTrigger_UnresolvedCurrentStatusClearsTokenFailure(t *testing.T) {
+	ctx := logging.WithLogger(context.Background(), logging.FromContext(context.TODO()))
+	broker := newTestBroker(testNamespace, testBrokerName, constants.BrokerClassName)
+	brokerLister := newFakeBrokerLister()
+	brokerLister.addBroker(broker)
+	audience := "https://stale-subscriber.example"
+
+	tests := []struct {
+		name   string
+		mutate func(*eventingv1.Trigger)
+	}{
+		{
+			name: "stale observed generation",
+			mutate: func(trigger *eventingv1.Trigger) {
+				trigger.Generation++
+			},
+		},
+		{
+			name: "subscriber unresolved",
+			mutate: func(trigger *eventingv1.Trigger) {
+				trigger.Status.MarkSubscriberResolvedFailed("NotReady", "subscriber is unresolved")
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			trigger := newTestTriggerWithSubscriber(testNamespace, testTriggerName, testBrokerName, "http://subscriber.example.com")
+			trigger.Status.SubscriberAudience = &audience
+			tc.mutate(trigger)
+			manager := &ConsumerManager{
+				logger: logging.FromContext(ctx), ctx: ctx,
+				subscriptions: make(map[string]*TriggerSubscription),
+				tokenFailures: map[string]map[string]struct{}{
+					testTriggerUID: {audience: {}},
+				},
+			}
+			reconciler := &FilterReconciler{
+				logger: logging.FromContext(ctx), triggerLister: newFakeTriggerLister(), brokerLister: brokerLister, consumerManager: manager,
+				brokerNamespace: testNamespace, brokerName: testBrokerName,
+			}
+
+			if err := reconciler.ReconcileTrigger(ctx, trigger); err != nil {
+				t.Fatalf("ReconcileTrigger() = %v", err)
+			}
+			if !manager.Ready() {
+				t.Error("stale or unresolved destination retained a token failure")
+			}
+		})
+	}
+}
+
+func TestOIDCAudienceUnionPausesAt33AndResumesOnlyAfterTriggerReconcile(t *testing.T) {
+	ctx, cancel := context.WithCancel(logging.WithLogger(context.Background(), logging.FromContext(context.TODO())))
+	defer cancel()
+	triggerLister := newFakeTriggerLister()
+	var first *eventingv1.Trigger
+	for i := 0; i < brokeroidc.MaxAudiences+1; i++ {
+		trigger := newTestTriggerWithSubscriber(testNamespace, fmt.Sprintf("trigger-%02d", i), testBrokerName, "http://subscriber.example.com")
+		trigger.UID = types.UID(fmt.Sprintf("trigger-uid-%02d", i))
+		audience := fmt.Sprintf("https://audience-%02d.example", i)
+		trigger.Status.SubscriberAudience = &audience
+		triggerLister.addTrigger(trigger)
+		if first == nil {
+			first = trigger
+		}
+	}
+
+	subscriber, _, resolved := resolvedTriggerDestinations(first)
+	if !resolved {
+		t.Fatal("first Trigger fixture is not resolved")
+	}
+	handler, err := NewTriggerHandler(ctx, first, subscriber, nil, nil, nil, nil, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseFetch := make(chan struct{})
+	pull := &recordingPullSubscription{fetches: make(chan int, 2), release: releaseFetch, unsubscribed: make(chan struct{})}
+	initialDone := make(chan struct{})
+	fetchCtx, fetchCancel := context.WithCancel(ctx)
+	go func() {
+		<-fetchCtx.Done()
+		close(initialDone)
+	}()
+	sub := &TriggerSubscription{
+		trigger: first, subscription: pull, handler: handler,
+		fetchBatchSize: 1, fetchTimeout: time.Second, maxConcurrency: 1,
+		sem: make(chan struct{}, 1), done: initialDone, cancel: fetchCancel,
+		dispatchCtx: ctx, dispatchCancel: func() {},
+	}
+	manager := &ConsumerManager{
+		logger: logging.FromContext(ctx), ctx: ctx,
+		fetchBatchSize: 1, fetchTimeout: time.Second, defaultMaxConcurrency: 1,
+		tokenSource:                func(context.Context, string) (string, error) { return "recovered-token", nil },
+		subscriptions:              map[string]*TriggerSubscription{string(first.UID): sub},
+		tokenFailures:              make(map[string]map[string]struct{}),
+		tokenValidationGenerations: make(map[string]int64),
+	}
+	startTokenRecoveryForTest(t, manager)
+	enqueued := 0
+	reconciler := &FilterReconciler{
+		logger: logging.FromContext(ctx), triggerLister: triggerLister, consumerManager: manager,
+		brokerNamespace: testNamespace, brokerName: testBrokerName,
+		enqueue: func(interface{}) { enqueued++ },
+	}
+
+	if err := reconciler.refreshActiveOIDCAudienceState(); err == nil {
+		t.Fatal("33 current resolved audiences did not invalidate the filter configuration")
+	}
+	select {
+	case <-initialDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("invalid audience union did not stop the fetch producer")
+	}
+	if !sub.configurationPaused || manager.Ready() {
+		t.Fatalf("invalid union state: configurationPaused=%v Ready=%v, want true/false", sub.configurationPaused, manager.Ready())
+	}
+	// Credential recovery while the global audience union remains invalid must
+	// clear tokenPaused without starting a fetcher. The later valid transition
+	// still waits for this Trigger's own reconcile/SubscribeTrigger.
+	sub.tokenPaused = true
+	manager.markDestinationTokenFailure(string(first.UID), *first.Status.SubscriberAudience)
+	manager.resumeTriggerAfterToken(string(first.UID), *first.Status.SubscriberAudience, sub, sub.done)
+	if sub.tokenPaused {
+		t.Error("tokenPaused remained set after credential recovery")
+	}
+	select {
+	case batch := <-pull.fetches:
+		t.Fatalf("token recovery bypassed invalid audience configuration with batch %d", batch)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	delete(triggerLister.triggers[testNamespace], fmt.Sprintf("trigger-%02d", brokeroidc.MaxAudiences))
+	if err := reconciler.refreshActiveOIDCAudienceState(); err != nil {
+		t.Fatalf("32-audience union remained invalid: %v", err)
+	}
+	if enqueued != brokeroidc.MaxAudiences {
+		t.Errorf("audience recovery enqueued %d Triggers, want %d", enqueued, brokeroidc.MaxAudiences)
+	}
+	if !sub.configurationPaused || manager.Ready() {
+		t.Fatal("global validation recovery restarted or readied the old subscription before its Trigger reconcile")
+	}
+	select {
+	case batch := <-pull.fetches:
+		t.Fatalf("fetch restarted before per-Trigger SubscribeTrigger, batch %d", batch)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	if err := manager.SubscribeTrigger(first, nil, subscriber, nil, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case batch := <-pull.fetches:
+		if batch != 1 {
+			t.Errorf("revalidated fetch batch = %d, want 1", batch)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("per-Trigger SubscribeTrigger did not resume fetch after union recovery")
+	}
+	if sub.configurationPaused || !manager.Ready() {
+		t.Fatalf("reconciled union state: configurationPaused=%v Ready=%v, want false/true", sub.configurationPaused, manager.Ready())
+	}
+	cancel()
+	close(releaseFetch)
+	select {
+	case <-sub.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("resumed fetch producer did not stop")
 	}
 }
 

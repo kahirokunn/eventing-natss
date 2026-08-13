@@ -164,6 +164,66 @@ spec:
     backoffDelay: PT1S
 ```
 
+### Authenticated Subscribers and Dead Letter Sinks
+
+Trigger subscribers and dead letter sinks support the full Knative
+`Destination` contract, including `CACerts` and `audience`. When an audience is
+resolved from the referenced Addressable or set explicitly, the filter sends a
+Bearer token issued for that exact audience. Explicit destination values take
+precedence over values reported by the referenced Addressable.
+
+```yaml
+spec:
+  broker: my-broker
+  subscriber:
+    ref:
+      apiVersion: v1
+      kind: Service
+      name: protected-service
+    audience: https://protected-service.example
+  delivery:
+    deadLetterSink:
+      ref:
+        apiVersion: v1
+        kind: Service
+        name: protected-dead-letter-service
+      audience: https://dead-letter.example
+```
+
+Authenticated deliveries in one namespace share the reserved
+`natsjs-broker-oidc` ServiceAccount identity. The operator does not bind that
+identity to workload, data, RBAC, or TokenRequest permissions. Cluster-wide
+grants to `system:authenticated` or `system:serviceaccounts`, and grants added
+by a cluster administrator, still apply; namespace administrators must not add
+privileges to this reserved identity. Because the subject is namespace-wide,
+receivers cannot use it to distinguish Brokers or Triggers in the same
+namespace.
+
+Each operational filter ServiceAccount may request a token only for that exact
+reserved name in its own namespace. The filter uses context-bounded
+TokenRequests, requests a one-hour lifetime, and refreshes cached tokens before
+the API server's returned expiration. These tokens are intentionally unbound:
+a Pod-bound TokenRequest is invalid when the requested ServiceAccount differs
+from the Pod's operational ServiceAccount. Kubernetes TokenReview rejects a
+token after the delivery ServiceAccount is deleted or recreated; an external
+offline JWT verifier can continue accepting it until its expiration. Kubernetes
+1.34 or newer with the default-enabled
+`TokenRequestServiceAccountUIDValidation` feature gate is required so the UID
+supplied with each TokenRequest is enforced by the API server. Recreating the
+delivery ServiceAccount also rolls filter Pods to clear their caches. Disabling
+that feature gate is outside the supported security configuration.
+
+A Broker may resolve at most 32 distinct non-empty audiences, each at most 4096
+bytes. Exceeding either limit marks the Broker filter configuration failed and
+pauses filter fetching. If the TokenRequest API is unavailable or returns an
+empty token, the filter fails closed: it sends no
+unauthenticated request, stops fetching for the affected Trigger, reports Not
+Ready, and lets JetStream redeliver the unacknowledged event after token
+issuance recovers. If subscriber delivery has already happened when dead-letter
+authentication fails, the eventual redelivery can repeat the subscriber
+request. Authorization received from a subscriber is never forwarded to the
+Broker ingress with a reply event.
+
 ## Configuration
 
 Generated filter Pods run as non-root with a read-only root filesystem,
@@ -369,6 +429,8 @@ template uses the same key or environment variable name.
 |----------|-------------|---------|
 | `NATS_CONFIG` | Controller-owned full connection snapshot; takes precedence over `NATS_URL` | Set on generated filters |
 | `NATS_URL` | Legacy URL-only connection fallback for manually managed filters | Required when `NATS_CONFIG` is unset |
+| `OIDC_SERVICE_ACCOUNT` | Reserved namespace delivery identity; empty when no destination requests OIDC | Set on generated filters |
+| `OIDC_SERVICE_ACCOUNT_UID` | Expected UID used to reject token requests for a recreated identity and bust token caches | Set on generated filters |
 | `POD_NAME` | Pod name for identification | Required |
 | `CONTAINER_NAME` | Container name for identification | Required |
 | `BROKER_NAME` | Broker served by this filter process | Required |

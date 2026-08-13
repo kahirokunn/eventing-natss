@@ -38,6 +38,10 @@ type consumerShutdowner interface {
 	Shutdown(context.Context) error
 }
 
+type consumerReadiness interface {
+	Ready() bool
+}
+
 type natsConnection interface {
 	Status() nats.Status
 	Drain() error
@@ -108,7 +112,7 @@ func (r *Runtime) ReadinessHandler() http.HandlerFunc {
 		}
 
 		r.mu.RLock()
-		state, conn := r.state, r.conn
+		state, conn, consumer := r.state, r.conn, r.consumer
 		r.mu.RUnlock()
 		if state != runtimeRunning || conn == nil {
 			http.Error(w, "filter runtime is not running", http.StatusServiceUnavailable)
@@ -116,6 +120,10 @@ func (r *Runtime) ReadinessHandler() http.HandlerFunc {
 		}
 		if status := conn.Status(); status != nats.CONNECTED {
 			http.Error(w, fmt.Sprintf("NATS connection is %s", status), http.StatusServiceUnavailable)
+			return
+		}
+		if ready, ok := consumer.(consumerReadiness); ok && !ready.Ready() {
+			http.Error(w, "filter destination credentials are unavailable", http.StatusServiceUnavailable)
 			return
 		}
 		w.WriteHeader(http.StatusOK)

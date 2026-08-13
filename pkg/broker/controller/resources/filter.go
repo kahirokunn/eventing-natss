@@ -21,6 +21,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 	"knative.dev/pkg/kmeta"
 	"knative.dev/pkg/system"
 
@@ -32,6 +33,9 @@ import (
 const (
 	// FilterPortNumber is the port number for filter HTTP traffic
 	FilterPortNumber = 8080
+	// FilterTerminationGracePeriodSeconds gives the filter runtime time to stop
+	// fetching, finish dispatches, and drain its NATS connection.
+	FilterTerminationGracePeriodSeconds int64 = 45
 )
 
 // FilterArgs contains arguments for creating filter resources
@@ -111,9 +115,10 @@ func MakeFilterDeployment(args *FilterArgs) *appsv1.Deployment {
 					Annotations: podAnnotations,
 				},
 				Spec: corev1.PodSpec{
-					ServiceAccountName: args.ServiceAccountName,
-					NodeSelector:       nodeSelector,
-					Affinity:           affinity,
+					ServiceAccountName:            args.ServiceAccountName,
+					TerminationGracePeriodSeconds: ptr.To(FilterTerminationGracePeriodSeconds),
+					NodeSelector:                  nodeSelector,
+					Affinity:                      affinity,
 					Containers: []corev1.Container{
 						{
 							Name:      FilterContainerName,

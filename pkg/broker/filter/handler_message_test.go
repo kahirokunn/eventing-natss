@@ -25,6 +25,7 @@ import (
 	"time"
 
 	cejs "github.com/cloudevents/sdk-go/protocol/nats_jetstream/v2"
+	cloudevents "github.com/cloudevents/sdk-go/v2"
 	"github.com/nats-io/nats.go"
 	"go.uber.org/zap"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -34,9 +35,28 @@ import (
 	"knative.dev/pkg/logging"
 
 	eventingv1 "knative.dev/eventing/pkg/apis/eventing/v1"
+	"knative.dev/eventing/pkg/eventfilter"
 	"knative.dev/eventing/pkg/eventingtls"
 	"knative.dev/eventing/pkg/kncloudevents"
 )
+
+type cleanupTrackingFilter struct {
+	filtered chan string
+	release  <-chan struct{}
+	cleaned  chan struct{}
+}
+
+func (f *cleanupTrackingFilter) Filter(_ context.Context, event cloudevents.Event) eventfilter.FilterResult {
+	f.filtered <- event.ID()
+	if f.release != nil {
+		<-f.release
+	}
+	return eventfilter.PassFilter
+}
+
+func (f *cleanupTrackingFilter) Cleanup() {
+	close(f.cleaned)
+}
 
 // makeStructuredCEMsg constructs a nats.Msg carrying a structured CloudEvent.
 // The message header contains "Content-Type: application/cloudevents+json"
@@ -97,6 +117,157 @@ func newTestHandler(t *testing.T, ctx context.Context, subscriberURL string, fil
 // logCtx returns a context carrying a no-op zap logger.
 func logCtx() context.Context {
 	return logging.WithLogger(context.Background(), zap.NewNop().Sugar())
+}
+
+// TestTriggerHandlerUpdatePreservesInflightSnapshot verifies that an update is
+// an atomic handoff between immutable handler configurations. Update waits for
+// an old filter invocation before cleaning that filter, but does not wait for
+// the old HTTP dispatch; that dispatch retains the old subscriber snapshot.
+func TestTriggerHandlerUpdatePreservesInflightSnapshot(t *testing.T) {
+	ctx := logCtx()
+
+	oldRequests := make(chan string, 1)
+	releaseOldSubscriber := make(chan struct{})
+	oldSubscriber := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		oldRequests <- r.Header.Get("Ce-Id")
+		<-releaseOldSubscriber
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer oldSubscriber.Close()
+	defer func() {
+		select {
+		case <-releaseOldSubscriber:
+		default:
+			close(releaseOldSubscriber)
+		}
+	}()
+
+	newRequests := make(chan string, 1)
+	newSubscriber := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		newRequests <- r.Header.Get("Ce-Id")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer newSubscriber.Close()
+
+	handler := newTestHandler(t, ctx, oldSubscriber.URL, "")
+	defer handler.Cleanup()
+	releaseOldFilter := make(chan struct{})
+	oldFilter := &cleanupTrackingFilter{
+		filtered: make(chan string, 2),
+		release:  releaseOldFilter,
+		cleaned:  make(chan struct{}),
+	}
+	handler.configMu.Lock()
+	handler.config.filter = oldFilter
+	handler.configMu.Unlock()
+
+	dispatchDone := make(chan struct{})
+	go func() {
+		handler.HandleMessage(ctx, makeStructuredCEMsg("old.type", "test/source", "old-event"))
+		close(dispatchDone)
+	}()
+
+	select {
+	case got := <-oldFilter.filtered:
+		if got != "old-event" {
+			t.Fatalf("old filter saw event %q, want %q", got, "old-event")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("old dispatch never reached the old filter")
+	}
+
+	// The old filter is still evaluating, so Update must not be able to replace
+	// and clean its config yet.
+	if handler.configMu.TryLock() {
+		handler.configMu.Unlock()
+		t.Fatal("handler config was not protected during filter evaluation")
+	}
+
+	newURL, err := apis.ParseURL(newSubscriber.URL)
+	if err != nil {
+		t.Fatalf("ParseURL(%q): %v", newSubscriber.URL, err)
+	}
+	updateStarted := make(chan struct{})
+	updateDone := make(chan struct{})
+	go func() {
+		close(updateStarted)
+		handler.Update(
+			makeTrigger("default", "test-trigger", ""),
+			duckv1.Addressable{URL: newURL},
+			nil,
+			nil,
+			nil,
+			nil,
+		)
+		close(updateDone)
+	}()
+	<-updateStarted
+
+	// Give Update ample opportunity to reach the write lock. It must remain
+	// blocked, and the old filter must remain live, until Filter returns.
+	select {
+	case <-updateDone:
+		t.Fatal("Update returned while the old filter was still evaluating")
+	case <-oldFilter.cleaned:
+		t.Fatal("old filter was cleaned up while it was still evaluating")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	// Once filtering finishes, the old request proceeds using its immutable
+	// subscriber snapshot. The HTTP endpoint intentionally remains blocked.
+	close(releaseOldFilter)
+	select {
+	case got := <-oldRequests:
+		if got != "old-event" {
+			t.Fatalf("old subscriber saw event %q, want %q", got, "old-event")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("old dispatch never reached the old subscriber")
+	}
+	select {
+	case <-updateDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Update did not finish after old filter evaluation completed")
+	}
+	select {
+	case <-oldFilter.cleaned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("old filter was not cleaned up after its evaluation completed")
+	}
+	select {
+	case <-dispatchDone:
+		t.Fatal("old dispatch finished before its HTTP subscriber was released")
+	default:
+	}
+
+	// A subsequent request may use the new configuration while the old HTTP
+	// request is still in flight. It must not reuse the old filter or subscriber.
+	handler.HandleMessage(ctx, makeStructuredCEMsg("new.type", "test/source", "new-event"))
+	select {
+	case got := <-newRequests:
+		if got != "new-event" {
+			t.Fatalf("new subscriber saw event %q, want %q", got, "new-event")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("next dispatch did not use the new subscriber config")
+	}
+	select {
+	case got := <-oldFilter.filtered:
+		t.Fatalf("old filter was reused by the next dispatch for event %q", got)
+	default:
+	}
+	select {
+	case got := <-oldRequests:
+		t.Fatalf("old subscriber unexpectedly received another event %q", got)
+	default:
+	}
+
+	close(releaseOldSubscriber)
+	select {
+	case <-dispatchDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("old dispatch did not finish after subscriber release")
+	}
 }
 
 // TestHandleMessage_BadData verifies that a message with structured encoding

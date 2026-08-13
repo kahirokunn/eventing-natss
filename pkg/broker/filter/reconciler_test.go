@@ -491,8 +491,21 @@ func TestReconcileTrigger_ExistingSubscription(t *testing.T) {
 
 	// Pre-populate subscription with old values.
 	oldParsedURL, _ := apis.ParseURL(oldSubscriberURL)
-	existingHandler := &TriggerHandler{
-		subscriber: duckv1.Addressable{URL: oldParsedURL},
+	existingHandler, err := NewTriggerHandler(
+		ctx,
+		trigger.DeepCopy(),
+		duckv1.Addressable{URL: oldParsedURL},
+		nil,
+		nil,
+		nil,
+		nil,
+		newTestDispatcher(ctx),
+		nil,
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("NewTriggerHandler() unexpected error: %v", err)
 	}
 
 	cm := &ConsumerManager{
@@ -514,27 +527,28 @@ func TestReconcileTrigger_ExistingSubscription(t *testing.T) {
 	}
 
 	// Should return nil — all fields updated in place, no re-subscribe.
-	err := r.ReconcileTrigger(ctx, trigger)
+	err = r.ReconcileTrigger(ctx, trigger)
 	if err != nil {
 		t.Fatalf("ReconcileTrigger() unexpected error: %v", err)
 	}
 
 	// Verify all handler fields were updated in place.
 	h := cm.subscriptions[triggerUID].handler
-	if got := h.subscriber.URL.String(); got != newSubscriberURL {
-		t.Errorf("handler.subscriber.URL = %q, want %q", got, newSubscriberURL)
+	config := snapshotHandlerConfig(t, h)
+	if got := config.subscriber.URL.String(); got != newSubscriberURL {
+		t.Errorf("handler subscriber URL = %q, want %q", got, newSubscriberURL)
 	}
-	if h.brokerIngressURL == nil {
-		t.Error("handler.brokerIngressURL should not be nil")
+	if config.brokerIngressURL == nil {
+		t.Error("handler brokerIngressURL should not be nil")
 	}
-	if h.filter == nil {
-		t.Error("handler.filter should not be nil after update with filter spec")
+	if config.filter == nil {
+		t.Error("handler filter should not be nil after update with filter spec")
 	}
-	if h.deadLetterSink == nil || h.deadLetterSink.URL.String() != newDLSURL.String() {
-		t.Errorf("handler.deadLetterSink.URL = %v, want %v", h.deadLetterSink, newDLSURL)
+	if config.deadLetterSink == nil || config.deadLetterSink.URL.String() != newDLSURL.String() {
+		t.Errorf("handler deadLetterSink URL = %v, want %v", config.deadLetterSink, newDLSURL)
 	}
-	if h.trigger != trigger {
-		t.Error("handler.trigger should be updated to the new trigger object")
+	if config.trigger == trigger || config.trigger.Name != trigger.Name || config.trigger.Namespace != trigger.Namespace {
+		t.Error("handler trigger should be updated to an equivalent defensive copy")
 	}
 }
 
@@ -691,5 +705,76 @@ func TestReconcile(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+type reassignmentPullSubscription struct {
+	unsubscribed bool
+}
+
+func (*reassignmentPullSubscription) Fetch(context.Context, int) ([]*nats.Msg, error) {
+	return nil, context.Canceled
+}
+
+func (s *reassignmentPullSubscription) Unsubscribe() error {
+	s.unsubscribed = true
+	return nil
+}
+
+func TestReconcileTriggerRecreationReplacesTrackedUID(t *testing.T) {
+	const (
+		oldUID = "old-trigger-uid"
+		newUID = "new-trigger-uid"
+	)
+	ctx := logging.WithLogger(context.Background(), logging.FromContext(context.TODO()))
+	oldTrigger := newTestTrigger(testNamespace, testTriggerName, testBrokerName)
+	oldTrigger.UID = types.UID(oldUID)
+	newTrigger := oldTrigger.DeepCopy()
+	newTrigger.UID = types.UID(newUID)
+	key := testNamespace + "/" + testTriggerName
+
+	triggerLister := newFakeTriggerLister()
+	triggerLister.addTrigger(newTrigger)
+	brokerLister := newFakeBrokerLister()
+	// Keep the Broker deliberately unready. Reconcile should still retire the
+	// old UID before the new Trigger reaches subscription eligibility.
+	brokerLister.addBroker(newTestBroker(testNamespace, testBrokerName, constants.BrokerClassName))
+	pullSub := &reassignmentPullSubscription{}
+	handler, err := NewTriggerHandler(ctx, oldTrigger, duckv1.Addressable{}, nil, nil, nil, nil, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := &ConsumerManager{
+		logger: logging.FromContext(ctx),
+		subscriptions: map[string]*TriggerSubscription{
+			oldUID: {trigger: oldTrigger, subscription: pullSub, handler: handler},
+		},
+	}
+	reconciler := NewFilterReconciler(ctx, triggerLister, brokerLister, manager)
+	reconciler.triggerUIDs[key] = oldUID
+
+	if err := reconciler.Reconcile(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	if manager.HasSubscription(oldUID) {
+		t.Error("old UID subscription survived same-name Trigger recreation")
+	}
+	if manager.HasSubscription(newUID) {
+		t.Error("new UID subscription was unexpectedly created for an unready Broker")
+	}
+	if got := reconciler.triggerUIDs[key]; got != newUID {
+		t.Errorf("key-to-UID mapping = %q, want replacement UID %q", got, newUID)
+	}
+	if !pullSub.unsubscribed {
+		t.Error("old UID pull subscription was not unsubscribed")
+	}
+	handler.configMu.RLock()
+	handlerCleaned := handler.config == nil
+	handler.configMu.RUnlock()
+	if !handlerCleaned {
+		t.Error("old UID Trigger handler was not cleaned up")
+	}
+	if manager.GetSubscriptionCount() != 0 {
+		t.Errorf("subscription count = %d, want 0 after old cleanup and new Broker readiness skip", manager.GetSubscriptionCount())
 	}
 }

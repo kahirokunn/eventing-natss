@@ -27,6 +27,7 @@ import (
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
+	corev1listers "k8s.io/client-go/listers/core/v1"
 
 	"knative.dev/pkg/apis"
 	duckv1 "knative.dev/pkg/apis/duck/v1"
@@ -41,6 +42,7 @@ import (
 	eventinglisters "knative.dev/eventing/pkg/client/listers/eventing/v1"
 
 	"knative.dev/eventing-natss/pkg/broker/constants"
+	brokeroidc "knative.dev/eventing-natss/pkg/broker/oidc"
 	brokerutils "knative.dev/eventing-natss/pkg/broker/utils"
 )
 
@@ -55,7 +57,8 @@ const (
 // Reconciler implements triggerreconciler.Interface for Trigger resources.
 type Reconciler struct {
 	// Listers for Kubernetes resources
-	brokerLister eventinglisters.BrokerLister
+	brokerLister         eventinglisters.BrokerLister
+	serviceAccountLister corev1listers.ServiceAccountLister
 
 	// NATS JetStream connection
 	js nats.JetStreamContext
@@ -76,7 +79,9 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, trigger *eventingv1.Trig
 	logger := logging.FromContext(ctx)
 	logger.Infow("Reconciling trigger", zap.String("trigger", trigger.Name), zap.String("namespace", trigger.Namespace))
 
-	// Step 1: Get the broker and check it's ready
+	// Step 1: Get the broker and record its readiness. Destination resolution
+	// still proceeds while the Broker is unready: a destination audience change
+	// may be exactly what lets the Broker's filter configuration recover.
 	broker, err := r.brokerLister.Brokers(trigger.Namespace).Get(trigger.Spec.Broker)
 	if err != nil {
 		if apierrs.IsNotFound(err) {
@@ -93,22 +98,24 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, trigger *eventingv1.Trig
 		return nil
 	}
 
-	// Check if broker is ready
-	if !broker.IsReady() {
+	brokerReady := broker.IsReady()
+	if !brokerReady {
 		trigger.Status.MarkBrokerFailed("BrokerNotReady", "Broker %q is not ready", trigger.Spec.Broker)
-		return nil
+	} else {
+		trigger.Status.PropagateBrokerCondition(broker.Status.GetTopLevelCondition())
 	}
+	clearResolvedDestinations(trigger)
 
-	// Broker is ready
-	trigger.Status.PropagateBrokerCondition(broker.Status.GetTopLevelCondition())
-
-	// Step 2: Resolve the subscriber URI
-	subscriberURI, err := r.resolveSubscriberURI(ctx, trigger)
+	// Step 2: Resolve the complete subscriber address. URI-only resolution
+	// silently drops the TLS trust bundle and OIDC audience.
+	subscriber, err := r.resolveSubscriber(ctx, trigger)
 	if err != nil {
 		trigger.Status.MarkSubscriberResolvedFailed("SubscriberResolveFailed", "Failed to resolve subscriber: %v", err)
 		return fmt.Errorf("failed to resolve subscriber: %w", err)
 	}
-	trigger.Status.SubscriberURI = subscriberURI
+	trigger.Status.SubscriberURI = subscriber.URL
+	trigger.Status.SubscriberCACerts = subscriber.CACerts
+	trigger.Status.SubscriberAudience = subscriber.Audience
 	trigger.Status.MarkSubscriberResolvedSucceeded()
 
 	// Step 3: Resolve the dead letter sink following whole-spec precedence. If
@@ -144,7 +151,23 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, trigger *eventingv1.Trig
 		trigger.Status.MarkDeadLetterSinkNotConfigured()
 	}
 
-	// Step 4: Reconcile the JetStream consumer
+	if nonEmpty(trigger.Status.SubscriberAudience) || nonEmpty(trigger.Status.DeadLetterSinkAudience) {
+		serviceAccountName := brokeroidc.DeliveryServiceAccountName
+		if err := r.validateOIDCServiceAccount(broker.Namespace); err != nil {
+			trigger.Status.MarkOIDCIdentityCreatedFailed("OIDCServiceAccountUnavailable", "OIDC delivery identity is unavailable: %v", err)
+			return err
+		}
+		trigger.Status.Auth = &duckv1.AuthStatus{ServiceAccountName: &serviceAccountName}
+		trigger.Status.MarkOIDCIdentityCreatedSucceededWithReason("OIDCServiceAccountReady", "OIDC tokens use the namespace delivery service account")
+	} else {
+		trigger.Status.MarkOIDCIdentityCreatedSucceededWithReason("OIDCIdentitySkipped", "No resolved destination requests OIDC authentication")
+	}
+	if !brokerReady {
+		logger.Debugw("Broker is not ready; destination status was refreshed without reconciling the consumer")
+		return nil
+	}
+
+	// Step 4: Reconcile the JetStream consumer only after the Broker is ready.
 	if err := r.reconcileConsumer(ctx, trigger, broker); err != nil {
 		trigger.Status.MarkNotSubscribed("ConsumerFailed", "Failed to create JetStream consumer: %v", err)
 		return err
@@ -159,10 +182,21 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, trigger *eventingv1.Trig
 	// Mark dependency as succeeded (we don't have external dependencies)
 	trigger.Status.MarkDependencySucceeded()
 
-	// Mark OIDC identity as not needed (OIDC authentication is not enabled)
-	trigger.Status.MarkOIDCIdentityCreatedSucceededWithReason("OIDCIdentitySkipped", "OIDC authentication is not enabled")
-
 	logger.Infow("Trigger reconciliation completed successfully", zap.String("trigger", trigger.Name))
+	return nil
+}
+
+func (r *Reconciler) validateOIDCServiceAccount(namespace string) error {
+	if r.serviceAccountLister == nil {
+		return fmt.Errorf("service account lister is not configured")
+	}
+	serviceAccount, err := r.serviceAccountLister.ServiceAccounts(namespace).Get(brokeroidc.DeliveryServiceAccountName)
+	if err != nil {
+		return fmt.Errorf("get service account: %w", err)
+	}
+	if !brokeroidc.IsManagedDeliveryServiceAccount(serviceAccount) {
+		return fmt.Errorf("service account is not the managed OIDC delivery identity")
+	}
 	return nil
 }
 
@@ -198,54 +232,46 @@ func (r *Reconciler) FinalizeKind(ctx context.Context, trigger *eventingv1.Trigg
 	return nil
 }
 
-// resolveSubscriberURI resolves the subscriber URI from the trigger spec
-func (r *Reconciler) resolveSubscriberURI(ctx context.Context, trigger *eventingv1.Trigger) (*apis.URL, error) {
-	dest := trigger.Spec.Subscriber
-
-	// Convert to duckv1.Destination for the resolver
-	destination := duckv1.Destination{
-		URI: dest.URI,
-	}
-	if dest.Ref != nil {
-		namespace := dest.Ref.Namespace
+// resolveSubscriber resolves the subscriber URI, CA bundle, and OIDC audience.
+func (r *Reconciler) resolveSubscriber(ctx context.Context, trigger *eventingv1.Trigger) (*duckv1.Addressable, error) {
+	destination := *trigger.Spec.Subscriber.DeepCopy()
+	if destination.Ref != nil {
+		namespace := destination.Ref.Namespace
 		if namespace == "" {
 			namespace = trigger.Namespace
 		}
-		destination.Ref = &duckv1.KReference{
-			Kind:       dest.Ref.Kind,
-			Namespace:  namespace,
-			Name:       dest.Ref.Name,
-			APIVersion: dest.Ref.APIVersion,
-		}
+		destination.Ref.Namespace = namespace
 	}
-
-	return r.uriResolver.URIFromDestinationV1(ctx, destination, trigger)
+	return r.uriResolver.AddressableFromDestinationV1(ctx, destination, trigger)
 }
 
 // resolveDeadLetterSink resolves the trigger's own dead letter sink to an
 // Addressable. Resolving to a full Addressable (rather than just a URL) retains
 // the CA certs and OIDC audience needed to deliver to a TLS/OIDC-protected sink.
 func (r *Reconciler) resolveDeadLetterSink(ctx context.Context, trigger *eventingv1.Trigger) (*duckv1.Addressable, error) {
-	dest := trigger.Spec.Delivery.DeadLetterSink
-
-	// Convert to duckv1.Destination for the resolver
-	destination := duckv1.Destination{
-		URI: dest.URI,
-	}
-	if dest.Ref != nil {
-		namespace := dest.Ref.Namespace
+	destination := *trigger.Spec.Delivery.DeadLetterSink.DeepCopy()
+	if destination.Ref != nil {
+		namespace := destination.Ref.Namespace
 		if namespace == "" {
 			namespace = trigger.Namespace
 		}
-		destination.Ref = &duckv1.KReference{
-			Kind:       dest.Ref.Kind,
-			Namespace:  namespace,
-			Name:       dest.Ref.Name,
-			APIVersion: dest.Ref.APIVersion,
-		}
+		destination.Ref.Namespace = namespace
 	}
 
 	return r.uriResolver.AddressableFromDestinationV1(ctx, destination, trigger)
+}
+
+func nonEmpty(value *string) bool {
+	return value != nil && *value != ""
+}
+
+func clearResolvedDestinations(trigger *eventingv1.Trigger) {
+	trigger.Status.SubscriberURI = nil
+	trigger.Status.SubscriberCACerts = nil
+	trigger.Status.SubscriberAudience = nil
+	trigger.Status.DeliveryStatus = eventingduckv1.DeliveryStatus{}
+	trigger.Status.Auth = nil
+	trigger.Status.MarkOIDCIdentityCreatedUnknown("OIDCIdentityPending", "OIDC delivery identity has not been resolved for the current generation")
 }
 
 // reconcileConsumer creates or updates the JetStream consumer for the trigger

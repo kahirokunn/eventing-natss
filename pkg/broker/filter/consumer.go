@@ -20,7 +20,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,10 +37,10 @@ import (
 	"knative.dev/pkg/logging"
 
 	eventingv1 "knative.dev/eventing/pkg/apis/eventing/v1"
-	"knative.dev/eventing/pkg/auth"
 	"knative.dev/eventing/pkg/eventingtls"
 	"knative.dev/eventing/pkg/kncloudevents"
 
+	brokeroidc "knative.dev/eventing-natss/pkg/broker/oidc"
 	brokerutils "knative.dev/eventing-natss/pkg/broker/utils"
 )
 
@@ -108,13 +110,24 @@ type ConsumerManagerConfig struct {
 	// TriggerMaxConcurrencyAnnotation annotation.
 	// Defaults to DefaultMaxConcurrency if not set.
 	MaxConcurrency int
+
+	// AudienceTokenSource returns a token for a resolved destination audience.
+	// The production source uses the exact-name TokenRequest permission granted
+	// to this Broker's operational filter identity.
+	AudienceTokenSource func(context.Context, string) (string, error)
 }
 
 // ConsumerManager manages JetStream consumer subscriptions for triggers
 type ConsumerManager struct {
-	logger *zap.SugaredLogger
-	ctx    context.Context
-	cancel context.CancelFunc
+	logger          *zap.SugaredLogger
+	ctx             context.Context
+	cancel          context.CancelFunc
+	recoveryCtx     context.Context
+	recoveryCancel  context.CancelFunc
+	recoveryPending sync.Map
+	recoverySignal  chan struct{}
+	recoveryDone    chan struct{}
+	recoveryWorkers sync.WaitGroup
 
 	js   nats.JetStreamContext
 	conn *nats.Conn
@@ -134,13 +147,31 @@ type ConsumerManager struct {
 	tracer           trace.Tracer
 	dispatchDuration metric.Float64Histogram
 	processDuration  metric.Float64Histogram
+	tokenSource      audienceTokenSource
 
 	// Map of trigger UID to subscription
-	subscriptions map[string]*TriggerSubscription
-	mu            sync.RWMutex
-	closing       bool
-	shutdownDone  chan struct{}
-	shutdownErr   error
+	subscriptions                map[string]*TriggerSubscription
+	readinessMu                  sync.RWMutex
+	tokenFailures                map[string]map[string]struct{}
+	tokenValidationGenerations   map[string]int64
+	tokenRequirements            func() ([]tokenReadinessRequirement, bool)
+	audienceConfigurationInvalid bool
+	mu                           sync.RWMutex
+	closing                      bool
+	shutdownDone                 chan struct{}
+	shutdownErr                  error
+}
+
+type tokenReadinessRequirement struct {
+	triggerUID    string
+	generation    int64
+	resolved      bool
+	authenticated bool
+}
+
+type tokenRecoveryKey struct {
+	triggerUID string
+	audience   string
 }
 
 type pullSubscription interface {
@@ -191,23 +222,27 @@ type TriggerSubscription struct {
 	// for this subscription. unsubscribeLocked waits on it so the NATS
 	// subscription and trigger handler are not torn down while a dispatch
 	// goroutine is still using them (msg.Ack, h.filter.Filter, etc.).
-	inflight sync.WaitGroup
+	inflight            sync.WaitGroup
+	tokenPaused         bool
+	configurationPaused bool
 }
 
 // NewConsumerManager creates a new consumer manager
 func NewConsumerManager(ctx context.Context, conn *nats.Conn, js nats.JetStreamContext, config *ConsumerManagerConfig) *ConsumerManager {
 	logger := logging.FromContext(ctx)
 	runCtx, runCancel := context.WithCancel(ctx)
+	recoveryCtx, recoveryCancel := context.WithCancel(runCtx)
 
-	// Create OIDC token provider and dispatcher
-	oidcTokenProvider := auth.NewOIDCTokenProvider(ctx)
-	dispatcher := kncloudevents.NewDispatcher(eventingtls.ClientConfig{}, oidcTokenProvider)
+	// Destination tokens are attached by TriggerHandler so subscriber and DLS
+	// failures remain distinguishable from ordinary HTTP delivery failures.
+	dispatcher := kncloudevents.NewDispatcher(eventingtls.ClientConfig{}, nil)
 
 	// Apply defaults
 	fetchBatchSize := DefaultFetchBatchSize
 	fetchTimeout := DefaultFetchTimeout
 	maxConcurrency := DefaultMaxConcurrency
 	streamName := ""
+	var tokenSource audienceTokenSource
 
 	if config != nil {
 		streamName = config.StreamName
@@ -220,6 +255,7 @@ func NewConsumerManager(ctx context.Context, conn *nats.Conn, js nats.JetStreamC
 		if config.MaxConcurrency > 0 {
 			maxConcurrency = config.MaxConcurrency
 		}
+		tokenSource = config.AudienceTokenSource
 	}
 
 	// Resolve tracer + meter from the global OTel providers. When no real
@@ -250,22 +286,30 @@ func NewConsumerManager(ctx context.Context, conn *nats.Conn, js nats.JetStreamC
 	}
 
 	cm := &ConsumerManager{
-		logger:                logger,
-		ctx:                   runCtx,
-		cancel:                runCancel,
-		js:                    js,
-		conn:                  conn,
-		fetchBatchSize:        fetchBatchSize,
-		fetchTimeout:          fetchTimeout,
-		defaultMaxConcurrency: maxConcurrency,
-		streamName:            streamName,
-		dispatcher:            dispatcher,
-		tracer:                tracer,
-		dispatchDuration:      dispatchDuration,
-		processDuration:       processDuration,
-		subscriptions:         make(map[string]*TriggerSubscription),
-		shutdownDone:          make(chan struct{}),
+		logger:                     logger,
+		ctx:                        runCtx,
+		cancel:                     runCancel,
+		recoveryCtx:                recoveryCtx,
+		recoveryCancel:             recoveryCancel,
+		recoverySignal:             make(chan struct{}, 1),
+		recoveryDone:               make(chan struct{}),
+		js:                         js,
+		conn:                       conn,
+		fetchBatchSize:             fetchBatchSize,
+		fetchTimeout:               fetchTimeout,
+		defaultMaxConcurrency:      maxConcurrency,
+		streamName:                 streamName,
+		dispatcher:                 dispatcher,
+		tracer:                     tracer,
+		dispatchDuration:           dispatchDuration,
+		processDuration:            processDuration,
+		tokenSource:                tokenSource,
+		subscriptions:              make(map[string]*TriggerSubscription),
+		tokenFailures:              make(map[string]map[string]struct{}),
+		tokenValidationGenerations: make(map[string]int64),
+		shutdownDone:               make(chan struct{}),
 	}
+	go cm.runTokenRecovery()
 
 	// Observable gauge: in-flight dispatches per trigger. len(sem) is the
 	// number of currently-held semaphore slots, which equals the number of
@@ -290,6 +334,350 @@ func NewConsumerManager(ctx context.Context, conn *nats.Conn, js nats.JetStreamC
 	}
 
 	return cm
+}
+
+// Ready reports whether every reconciled Trigger can obtain all tokens
+// required by its current destinations.
+func (m *ConsumerManager) Ready() bool {
+	ready := true
+	if m.tokenRequirements != nil {
+		requirements, synced := m.tokenRequirements()
+		if !synced {
+			return false
+		}
+		m.readinessMu.RLock()
+		if len(m.tokenFailures) != 0 {
+			m.readinessMu.RUnlock()
+			return false
+		}
+		for _, requirement := range requirements {
+			if !requirement.resolved {
+				// Trigger resolution is gated on Broker readiness. An unresolved
+				// Trigger cannot have a subscription or send an unauthenticated
+				// request, so excluding it here breaks the initial Broker/filter
+				// readiness cycle without weakening authenticated delivery.
+				continue
+			}
+			if requirement.authenticated && m.tokenValidationGenerations[requirement.triggerUID] != requirement.generation {
+				m.readinessMu.RUnlock()
+				return false
+			}
+		}
+		m.readinessMu.RUnlock()
+	} else {
+		m.readinessMu.RLock()
+		ready = len(m.tokenFailures) == 0
+		m.readinessMu.RUnlock()
+	}
+	if !ready {
+		return false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.audienceConfigurationInvalid {
+		return false
+	}
+	for _, sub := range m.subscriptions {
+		if sub.configurationPaused {
+			return false
+		}
+	}
+	return true
+}
+
+func (m *ConsumerManager) setAudienceConfigurationValid(valid bool) bool {
+	invalid := !valid
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	changed := m.audienceConfigurationInvalid != invalid
+	if !changed {
+		return false
+	}
+	m.audienceConfigurationInvalid = invalid
+	if valid {
+		return true
+	}
+	for _, sub := range m.subscriptions {
+		if !sub.configurationPaused {
+			sub.configurationPaused = true
+			if sub.cancel != nil {
+				sub.cancel()
+			}
+		}
+	}
+	return false
+}
+
+func (m *ConsumerManager) startFetchLoopLocked(sub *TriggerSubscription) {
+	fetchCtx, fetchCancel := context.WithCancel(m.ctx)
+	sub.cancel = fetchCancel
+	sub.done = make(chan struct{})
+	logger := m.logger.With(
+		zap.String("trigger", sub.trigger.Name),
+		zap.String("namespace", sub.trigger.Namespace),
+	)
+	go m.fetchLoop(fetchCtx, sub.dispatchCtx, sub.done, &sub.inflight, sub.subscription, sub.handler, sub.ackWait, sub.fetchBatchSize, sub.fetchTimeout, sub.sem, logger)
+}
+
+func (m *ConsumerManager) setTokenReadinessRequirements(requirements func() ([]tokenReadinessRequirement, bool)) {
+	m.tokenRequirements = requirements
+}
+
+func (m *ConsumerManager) markDestinationTokensValidated(triggerUID string, generation int64) {
+	m.readinessMu.Lock()
+	defer m.readinessMu.Unlock()
+	m.tokenValidationGenerations[triggerUID] = generation
+}
+
+func (m *ConsumerManager) clearDestinationTokenValidation(triggerUID string) {
+	m.readinessMu.Lock()
+	defer m.readinessMu.Unlock()
+	delete(m.tokenValidationGenerations, triggerUID)
+}
+
+func (m *ConsumerManager) markDestinationTokenFailure(triggerUID, audience string) bool {
+	m.readinessMu.Lock()
+	defer m.readinessMu.Unlock()
+	failures := m.tokenFailures[triggerUID]
+	if failures == nil {
+		failures = make(map[string]struct{})
+		m.tokenFailures[triggerUID] = failures
+	}
+	_, found := failures[audience]
+	failures[audience] = struct{}{}
+	return !found
+}
+
+func (m *ConsumerManager) clearDestinationTokenFailure(triggerUID, audience string) bool {
+	m.readinessMu.Lock()
+	defer m.readinessMu.Unlock()
+	failures := m.tokenFailures[triggerUID]
+	delete(failures, audience)
+	if len(failures) == 0 {
+		delete(m.tokenFailures, triggerUID)
+		return true
+	}
+	return false
+}
+
+func (m *ConsumerManager) clearDestinationTokenFailures(triggerUID string) {
+	m.readinessMu.Lock()
+	defer m.readinessMu.Unlock()
+	delete(m.tokenFailures, triggerUID)
+	delete(m.tokenValidationGenerations, triggerUID)
+}
+
+func (m *ConsumerManager) destinationTokensReady(triggerUID string) bool {
+	m.readinessMu.RLock()
+	defer m.readinessMu.RUnlock()
+	return len(m.tokenFailures[triggerUID]) == 0
+}
+
+func (m *ConsumerManager) hasDestinationTokenFailure(triggerUID string) bool {
+	m.readinessMu.RLock()
+	defer m.readinessMu.RUnlock()
+	return len(m.tokenFailures[triggerUID]) != 0
+}
+
+func (m *ConsumerManager) hasDestinationTokenFailureFor(triggerUID, audience string) bool {
+	m.readinessMu.RLock()
+	defer m.readinessMu.RUnlock()
+	_, found := m.tokenFailures[triggerUID][audience]
+	return found
+}
+
+// pauseTriggerForToken stops only the fetch producer. It must not unsubscribe
+// synchronously from a dispatch goroutine because unsubscribe waits for that
+// same goroutine. A background recovery loop restarts fetching after the
+// destination token becomes available again.
+func (m *ConsumerManager) reportDestinationTokenFailure(triggerUID, audience string) {
+	if !m.markDestinationTokenFailure(triggerUID, audience) {
+		return
+	}
+	m.recoveryPending.Store(tokenRecoveryKey{triggerUID: triggerUID, audience: audience}, struct{}{})
+	select {
+	case m.recoverySignal <- struct{}{}:
+	default:
+	}
+}
+
+func (m *ConsumerManager) runTokenRecovery() {
+	defer close(m.recoveryDone)
+	for {
+		select {
+		case <-m.recoveryCtx.Done():
+			return
+		case <-m.recoverySignal:
+			m.recoveryPending.Range(func(key, _ interface{}) bool {
+				recovery, ok := key.(tokenRecoveryKey)
+				if !ok || !m.recoveryPending.CompareAndDelete(key, struct{}{}) {
+					return true
+				}
+				m.recoveryWorkers.Add(1)
+				go func() {
+					defer m.recoveryWorkers.Done()
+					m.pauseTriggerForToken(recovery.triggerUID, recovery.audience)
+				}()
+				return true
+			})
+		}
+	}
+}
+
+func (m *ConsumerManager) pauseTriggerForToken(triggerUID, audience string) {
+	m.mu.Lock()
+	sub, found := m.subscriptions[triggerUID]
+	if !found || m.closing {
+		m.mu.Unlock()
+		return
+	}
+	if !sub.tokenPaused {
+		sub.tokenPaused = true
+		if sub.cancel != nil {
+			sub.cancel()
+		}
+	}
+	done := sub.done
+	m.mu.Unlock()
+
+	m.resumeTriggerAfterToken(triggerUID, audience, sub, done)
+}
+
+func (m *ConsumerManager) resumeTriggerAfterToken(triggerUID, audience string, sub *TriggerSubscription, done <-chan struct{}) {
+	select {
+	case <-done:
+	case <-m.recoveryCtx.Done():
+		return
+	}
+	backoff := time.Second
+	for {
+		m.mu.RLock()
+		current := !m.closing && m.subscriptions[triggerUID] == sub
+		m.mu.RUnlock()
+		if !current {
+			return
+		}
+		if !m.hasDestinationTokenFailureFor(triggerUID, audience) {
+			break
+		}
+		token, err := m.tokenSource(m.recoveryCtx, audience)
+		if err == nil && strings.TrimSpace(token) != "" {
+			break
+		}
+		jittered := backoff - backoff/4 + time.Duration(rand.Int64N(int64(backoff/2)))
+		timer := time.NewTimer(jittered)
+		select {
+		case <-timer.C:
+		case <-m.recoveryCtx.Done():
+			timer.Stop()
+			return
+		}
+		if backoff < 30*time.Second {
+			backoff *= 2
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+		}
+	}
+	m.clearDestinationTokenFailure(triggerUID, audience)
+
+	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		return
+	}
+	if m.subscriptions[triggerUID] != sub {
+		m.mu.Unlock()
+		return
+	}
+	if !sub.tokenPaused {
+		m.mu.Unlock()
+		return
+	}
+	if !m.destinationTokensReady(triggerUID) {
+		m.mu.Unlock()
+		return
+	}
+	sub.tokenPaused = false
+	if sub.configurationPaused {
+		m.mu.Unlock()
+		return
+	}
+	m.startFetchLoopLocked(sub)
+	m.mu.Unlock()
+}
+
+func (m *ConsumerManager) validateDestinationTokens(ctx context.Context, triggerUID string, subscriber duckv1.Addressable, deadLetterSink *duckv1.Addressable) error {
+	destinations := []*duckv1.Addressable{&subscriber, deadLetterSink}
+	current := make(map[string]struct{}, len(destinations))
+	var firstErr error
+	for _, destination := range destinations {
+		if destination == nil || destination.Audience == nil || *destination.Audience == "" {
+			continue
+		}
+		audience := *destination.Audience
+		current[audience] = struct{}{}
+		if m.tokenSource == nil {
+			m.markDestinationTokenFailure(triggerUID, audience)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("%w (%s)", ErrOIDCTokenUnavailable, brokeroidc.AudienceKey(audience))
+			}
+			continue
+		}
+		token, err := m.tokenSource(ctx, audience)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		if err != nil || strings.TrimSpace(token) == "" {
+			m.markDestinationTokenFailure(triggerUID, audience)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("%w (%s)", ErrOIDCTokenUnavailable, brokeroidc.AudienceKey(audience))
+			}
+			continue
+		}
+		m.clearDestinationTokenFailure(triggerUID, audience)
+	}
+	m.readinessMu.Lock()
+	for audience := range m.tokenFailures[triggerUID] {
+		if _, found := current[audience]; !found {
+			delete(m.tokenFailures[triggerUID], audience)
+		}
+	}
+	if len(m.tokenFailures[triggerUID]) == 0 {
+		delete(m.tokenFailures, triggerUID)
+	}
+	m.readinessMu.Unlock()
+	m.resumePausedTriggerAfterRequirementsChanged(ctx, triggerUID)
+	return firstErr
+}
+
+func (m *ConsumerManager) resumePausedTriggerAfterRequirementsChanged(ctx context.Context, triggerUID string) {
+	m.mu.RLock()
+	sub := m.subscriptions[triggerUID]
+	if sub == nil || !sub.tokenPaused || m.closing {
+		m.mu.RUnlock()
+		return
+	}
+	done := sub.done
+	m.mu.RUnlock()
+
+	if done != nil {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return
+		}
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closing || m.subscriptions[triggerUID] != sub || !sub.tokenPaused || !m.destinationTokensReady(triggerUID) {
+		return
+	}
+	sub.tokenPaused = false
+	if !sub.configurationPaused {
+		m.startFetchLoopLocked(sub)
+	}
 }
 
 // parseTriggerAnnotationInt reads key from annotations as a positive int,
@@ -365,10 +753,33 @@ func (m *ConsumerManager) SubscribeTrigger(
 		newBatch := parseTriggerAnnotationInt(trigger.Annotations, TriggerFetchBatchSizeAnnotation, m.fetchBatchSize, logger)
 		newTimeout := parseTriggerAnnotationDuration(trigger.Annotations, TriggerFetchTimeoutAnnotation, m.fetchTimeout, logger)
 		newMaxConc := parseTriggerAnnotationInt(trigger.Annotations, TriggerMaxConcurrencyAnnotation, m.defaultMaxConcurrency, logger)
+		parametersChanged := newBatch != existing.fetchBatchSize ||
+			newTimeout != existing.fetchTimeout ||
+			newMaxConc != existing.maxConcurrency
 
-		if newBatch == existing.fetchBatchSize &&
-			newTimeout == existing.fetchTimeout &&
-			newMaxConc == existing.maxConcurrency {
+		if existing.configurationPaused {
+			if parametersChanged {
+				existing.fetchBatchSize = newBatch
+				existing.fetchTimeout = newTimeout
+				existing.maxConcurrency = newMaxConc
+				existing.sem = make(chan struct{}, newMaxConc)
+			}
+			if m.audienceConfigurationInvalid {
+				logger.Debugw("updated trigger subscription while the OIDC audience set remains invalid")
+				return nil
+			}
+			if existing.done != nil {
+				<-existing.done
+			}
+			existing.configurationPaused = false
+			if !existing.tokenPaused {
+				m.startFetchLoopLocked(existing)
+			}
+			logger.Debugw("resumed trigger subscription after validating the OIDC audience set")
+			return nil
+		}
+
+		if !parametersChanged {
 			logger.Debugw("trigger subscription updated in place")
 			return nil
 		}
@@ -382,6 +793,19 @@ func (m *ConsumerManager) SubscribeTrigger(
 			zap.Int("new_max_concurrency", newMaxConc),
 		)
 
+		newSem := make(chan struct{}, newMaxConc)
+		if existing.tokenPaused {
+			// The recovery loop owns the next fetch-loop start while destination
+			// credentials are unavailable. Update the captured parameters now,
+			// but do not start a second producer behind its back.
+			existing.fetchBatchSize = newBatch
+			existing.fetchTimeout = newTimeout
+			existing.maxConcurrency = newMaxConc
+			existing.sem = newSem
+			logger.Debugw("updated paused trigger subscription")
+			return nil
+		}
+
 		// Stop the current fetch loop and wait until it has stopped calling
 		// Fetch. Two goroutines must not overlap on the same pull subscription.
 		// Canceling the fetch context also interrupts an in-progress Fetch.
@@ -390,7 +814,6 @@ func (m *ConsumerManager) SubscribeTrigger(
 		existing.cancel()
 		<-existing.done
 
-		newSem := make(chan struct{}, newMaxConc)
 		fetchCtx, fetchCancel := context.WithCancel(m.ctx)
 		newDone := make(chan struct{})
 
@@ -421,6 +844,16 @@ func (m *ConsumerManager) SubscribeTrigger(
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create trigger handler: %w", err)
+	}
+	if m.tokenSource != nil {
+		handler.setAudienceTokenSource(func(ctx context.Context, audience string) (string, error) {
+			token, err := m.tokenSource(ctx, audience)
+			if (err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)) ||
+				(err == nil && strings.TrimSpace(token) == "") {
+				m.reportDestinationTokenFailure(triggerUID, audience)
+			}
+			return token, err
+		})
 	}
 
 	// Derive stream and consumer names
@@ -495,6 +928,14 @@ func (m *ConsumerManager) SubscribeTrigger(
 		done:           done,
 	}
 	m.subscriptions[triggerUID] = ts
+	configurationValid := !m.audienceConfigurationInvalid
+	if !configurationValid {
+		ts.configurationPaused = true
+		fetchCancel()
+		close(done)
+		logger.Debugw("trigger subscription remains paused while the OIDC audience set is invalid")
+		return nil
+	}
 
 	logger.Infow("starting fetch loop",
 		zap.Int("fetch_batch_size", fetchBatchSize),
@@ -649,19 +1090,26 @@ func (m *ConsumerManager) fetchLoop(
 
 // UnsubscribeTrigger removes a subscription for a trigger
 func (m *ConsumerManager) UnsubscribeTrigger(triggerUID string) error {
+	return m.unsubscribeTrigger(triggerUID, true)
+}
+
+func (m *ConsumerManager) unsubscribeTrigger(triggerUID string, clearTokenFailure bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closing {
 		return ErrConsumerManagerClosed
 	}
 
-	return m.unsubscribeLocked(triggerUID)
+	return m.unsubscribeLocked(triggerUID, clearTokenFailure)
 }
 
 // unsubscribeLocked removes a subscription (must be called with lock held)
-func (m *ConsumerManager) unsubscribeLocked(triggerUID string) error {
+func (m *ConsumerManager) unsubscribeLocked(triggerUID string, clearTokenFailure bool) error {
 	sub, ok := m.subscriptions[triggerUID]
 	if !ok {
+		if clearTokenFailure {
+			m.clearDestinationTokenFailures(triggerUID)
+		}
 		return nil
 	}
 
@@ -704,6 +1152,9 @@ func (m *ConsumerManager) unsubscribeLocked(triggerUID string) error {
 
 	// Remove from map
 	delete(m.subscriptions, triggerUID)
+	if clearTokenFailure {
+		m.clearDestinationTokenFailures(triggerUID)
+	}
 
 	return nil
 }
@@ -744,6 +1195,13 @@ func (m *ConsumerManager) shutdownWithMode(ctx context.Context, forceImmediately
 		subscriptions = append(subscriptions, sub)
 	}
 	m.mu.Unlock()
+	if m.recoveryCancel != nil {
+		m.recoveryCancel()
+	}
+	if m.recoveryDone != nil {
+		<-m.recoveryDone
+	}
+	m.recoveryWorkers.Wait()
 
 	err := m.shutdown(ctx, subscriptions, forceImmediately)
 

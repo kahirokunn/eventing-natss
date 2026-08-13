@@ -18,12 +18,15 @@ package controller
 
 import (
 	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/yaml"
 )
 
@@ -162,10 +165,14 @@ func TestBrokerControllerManifestCanManageOnlyNamespacedDataplaneRBAC(t *testing
 	}
 	assertLifecycleVerbs(t, clusterRole.Rules, "serviceaccounts")
 	assertLifecycleVerbs(t, clusterRole.Rules, "rolebindings")
+	namespaceRules := rulesForResource(clusterRole.Rules, "namespaces")
+	if len(namespaceRules) != 1 || !reflect.DeepEqual(namespaceRules[0].Verbs, []string{"get"}) {
+		t.Errorf("controller namespace authority = %#v, want only get", namespaceRules)
+	}
 	clusterRoleRules := rulesForResource(clusterRole.Rules, "clusterroles")
 	if len(clusterRoleRules) != 1 || !reflect.DeepEqual(clusterRoleRules[0].Verbs, []string{"bind"}) ||
-		!reflect.DeepEqual(clusterRoleRules[0].ResourceNames, []string{FilterReaderClusterRoleName}) {
-		t.Errorf("controller ClusterRole bind authority = %#v, want only bind on %q", clusterRoleRules, FilterReaderClusterRoleName)
+		!reflect.DeepEqual(clusterRoleRules[0].ResourceNames, []string{FilterReaderClusterRoleName, OIDCTokenCreatorClusterRoleName}) {
+		t.Errorf("controller ClusterRole bind authority = %#v, want exact reader and OIDC token creator roles", clusterRoleRules)
 	}
 
 	// Exact Secret Roles live in the system namespace, so their lifecycle can
@@ -173,6 +180,83 @@ func TestBrokerControllerManifestCanManageOnlyNamespacedDataplaneRBAC(t *testing
 	systemRole := readRoleManifest(t, "../../../config/broker/200-broker-controller-role.yaml")
 	assertLifecycleVerbs(t, systemRole.Rules, "roles")
 	assertLifecycleVerbs(t, systemRole.Rules, "rolebindings")
+}
+
+func TestOnlyDedicatedOIDCClusterRoleCanCreateExactServiceAccountToken(t *testing.T) {
+	roles := make(map[string][]rbacv1.PolicyRule)
+	if err := filepath.WalkDir("../../../config", func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() || (!strings.HasSuffix(path, ".yaml") && !strings.HasSuffix(path, ".yml")) {
+			return nil
+		}
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		meta := metav1.TypeMeta{}
+		if err := yaml.Unmarshal(contents, &meta); err != nil {
+			return err
+		}
+		switch meta.Kind {
+		case "Role":
+			role := rbacv1.Role{}
+			if err := yaml.Unmarshal(contents, &role); err != nil {
+				return err
+			}
+			roles[path] = role.Rules
+		case "ClusterRole":
+			role := rbacv1.ClusterRole{}
+			if err := yaml.Unmarshal(contents, &role); err != nil {
+				return err
+			}
+			roles[path] = role.Rules
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	wantPath := filepath.Clean("../../../config/broker/200-oidc-token-creator-clusterrole.yaml")
+	foundDedicatedGrant := false
+	for path, rules := range roles {
+		for _, rule := range rules {
+			coreAPI := len(rule.APIGroups) == 0
+			for _, group := range rule.APIGroups {
+				coreAPI = coreAPI || group == "" || group == "*"
+			}
+			if !coreAPI {
+				continue
+			}
+			canCreate := false
+			for _, verb := range rule.Verbs {
+				canCreate = canCreate || verb == "create" || verb == "*"
+			}
+			if !canCreate {
+				continue
+			}
+			for _, resource := range rule.Resources {
+				if resource == "serviceaccounts/token" || resource == "serviceaccounts/*" || resource == "*" {
+					if filepath.Clean(path) != wantPath {
+						t.Errorf("%s must not create service account tokens: %#v", path, rule)
+						continue
+					}
+					want := rbacv1.PolicyRule{
+						APIGroups: []string{""}, Resources: []string{"serviceaccounts/token"},
+						ResourceNames: []string{"natsjs-broker-oidc"}, Verbs: []string{"create"},
+					}
+					if !reflect.DeepEqual(rule, want) {
+						t.Errorf("dedicated OIDC TokenRequest rule = %#v, want exact %#v", rule, want)
+					}
+					foundDedicatedGrant = true
+				}
+			}
+		}
+	}
+	if !foundDedicatedGrant {
+		t.Fatal("dedicated exact-name OIDC TokenRequest grant is missing")
+	}
 }
 
 func TestIngressUsesDedicatedNamespacedRBAC(t *testing.T) {

@@ -29,6 +29,7 @@ import (
 	eventingv1 "knative.dev/eventing/pkg/apis/eventing/v1"
 
 	brokerconfig "knative.dev/eventing-natss/pkg/broker/config"
+	brokeroidc "knative.dev/eventing-natss/pkg/broker/oidc"
 )
 
 const (
@@ -41,13 +42,14 @@ const (
 
 // FilterArgs contains arguments for creating filter resources
 type FilterArgs struct {
-	Broker             *eventingv1.Broker
-	Image              string
-	ServiceAccountName string
-	StreamName         string
-	NatsURL            string
-	NatsConfigJSON     string
-	Template           *brokerconfig.DeploymentTemplate
+	Broker                *eventingv1.Broker
+	Image                 string
+	ServiceAccountName    string
+	StreamName            string
+	NatsURL               string
+	NatsConfigJSON        string
+	OIDCServiceAccountUID string
+	Template              *brokerconfig.DeploymentTemplate
 }
 
 // MakeFilterDeployment creates a Deployment for the broker filter
@@ -222,6 +224,10 @@ func MakeFilterService(broker *eventingv1.Broker) *corev1.Service {
 }
 
 func makeFilterEnv(args *FilterArgs) []corev1.EnvVar {
+	oidcServiceAccount := ""
+	if args.OIDCServiceAccountUID != "" {
+		oidcServiceAccount = brokeroidc.DeliveryServiceAccountName
+	}
 	required := []corev1.EnvVar{
 		{
 			Name:  system.NamespaceEnvKey,
@@ -257,6 +263,17 @@ func makeFilterEnv(args *FilterArgs) []corev1.EnvVar {
 			Value: args.NatsConfigJSON,
 		},
 		{
+			Name:  "OIDC_SERVICE_ACCOUNT",
+			Value: oidcServiceAccount,
+		},
+		{
+			// A ServiceAccount recreation changes the identity behind the fixed
+			// name. Keeping its UID in the Pod template rolls every filter onto a
+			// fresh token cache.
+			Name:  "OIDC_SERVICE_ACCOUNT_UID",
+			Value: args.OIDCServiceAccountUID,
+		},
+		{
 			Name:  "METRICS_DOMAIN",
 			Value: "knative.dev/eventing",
 		},
@@ -281,7 +298,6 @@ func makeFilterEnv(args *FilterArgs) []corev1.EnvVar {
 			Value: FilterContainerName,
 		},
 	}
-
 	env := make([]corev1.EnvVar, 0, len(required))
 	reserved := make(map[string]struct{}, len(required))
 	for _, variable := range required {

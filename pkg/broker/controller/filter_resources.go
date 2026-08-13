@@ -53,7 +53,6 @@ func mergeFilterDeployment(existing, expected *appsv1.Deployment) (*appsv1.Deplo
 	} else {
 		existingPod.Affinity = expectedPod.Affinity.DeepCopy()
 	}
-
 	expectedContainer, err := namedContainer(expectedPod.Containers, resources.FilterContainerName)
 	if err != nil {
 		return nil, fmt.Errorf("invalid expected filter deployment: %w", err)

@@ -21,6 +21,7 @@ import (
 
 	"github.com/kelseyhightower/envconfig"
 	"go.uber.org/zap"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/tools/cache"
 
@@ -34,8 +35,10 @@ import (
 	triggerinformer "knative.dev/eventing/pkg/client/injection/informers/eventing/v1/trigger"
 	triggerreconciler "knative.dev/eventing/pkg/client/injection/reconciler/eventing/v1/trigger"
 	eventinglisters "knative.dev/eventing/pkg/client/listers/eventing/v1"
+	serviceaccountinformer "knative.dev/pkg/client/injection/kube/informers/core/v1/serviceaccount"
 
 	"knative.dev/eventing-natss/pkg/broker/constants"
+	brokeroidc "knative.dev/eventing-natss/pkg/broker/oidc"
 	"knative.dev/eventing-natss/pkg/common/configloader/fsloader"
 	commonnats "knative.dev/eventing-natss/pkg/common/nats"
 )
@@ -100,12 +103,14 @@ func NewController(
 	// Get informers
 	triggerInformer := triggerinformer.Get(ctx)
 	brokerInformer := brokerinformer.Get(ctx)
+	serviceAccountInformer := serviceaccountinformer.Get(ctx)
 
 	// Create reconciler
 	r := &Reconciler{
-		brokerLister:      brokerInformer.Lister(),
-		js:                js,
-		filterServiceName: env.FilterServiceName,
+		brokerLister:         brokerInformer.Lister(),
+		serviceAccountLister: serviceAccountInformer.Lister(),
+		js:                   js,
+		filterServiceName:    env.FilterServiceName,
 	}
 
 	// Create controller implementation using the generated NewImpl
@@ -130,10 +135,39 @@ func NewController(
 		FilterFunc: filterBrokersByClass,
 		Handler:    controller.HandleAll(enqueueTriggerOfBroker(triggerInformer.Lister(), impl)),
 	})
+	serviceAccountInformer.Informer().AddEventHandler(cache.FilteringResourceEventHandler{
+		FilterFunc: func(obj interface{}) bool {
+			if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+				obj = tombstone.Obj
+			}
+			serviceAccount, ok := obj.(*corev1.ServiceAccount)
+			return ok && serviceAccount.Name == brokeroidc.DeliveryServiceAccountName
+		},
+		Handler: controller.HandleAll(enqueueTriggersInNamespace(triggerInformer.Lister(), impl)),
+	})
 
 	logger.Info("NATS JetStream Trigger controller initialized")
 
 	return impl
+}
+
+func enqueueTriggersInNamespace(lister eventinglisters.TriggerLister, impl *controller.Impl) func(obj interface{}) {
+	return func(obj interface{}) {
+		if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+			obj = tombstone.Obj
+		}
+		serviceAccount, ok := obj.(*corev1.ServiceAccount)
+		if !ok {
+			return
+		}
+		triggers, err := lister.Triggers(serviceAccount.Namespace).List(labels.Everything())
+		if err != nil {
+			return
+		}
+		for _, trigger := range triggers {
+			impl.Enqueue(trigger)
+		}
+	}
 }
 
 // filterTriggersByBrokerClass returns a filter function that only passes triggers

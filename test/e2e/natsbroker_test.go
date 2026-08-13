@@ -22,6 +22,7 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,6 +30,7 @@ import (
 	// For our e2e testing, we want this linked first so that our
 	// system namespace environment variable is defaulted prior to
 	// logstream initialization.
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -93,6 +95,7 @@ func assertLogicalEventBatch(ctx context.Context, t feature.T, store *eventshub.
 
 func TestNatsBrokerKEDAAutoscaling(t *testing.T) {
 	ctx, env := global.Environment(
+		environment.Managed(t),
 		knative.WithKnativeNamespace(system.Namespace()),
 		knative.WithLoggingConfig,
 		knative.WithObservabilityConfig,
@@ -101,7 +104,6 @@ func TestNatsBrokerKEDAAutoscaling(t *testing.T) {
 	env.Test(ctx, t, namedRecorderFeature("autoscale-recorder-a", eventshub.ResponseWaitTime(time.Second)))
 	env.Test(ctx, t, namedRecorderFeature("autoscale-recorder-b"))
 	env.Test(ctx, t, NatsBrokerKEDAAutoscalingFeature())
-	env.Finish()
 }
 
 func NatsBrokerKEDAAutoscalingFeature() *feature.Feature {
@@ -133,6 +135,18 @@ func NatsBrokerKEDAAutoscalingFeature() *feature.Feature {
 			{namespace: "keda", name: "keda-operator"},
 			{namespace: "keda", name: "keda-metrics-apiserver"},
 		}, func() {
+			// Capture a newly failed outage step before withDeploymentsStopped
+			// restores KEDA. Successful runs avoid the extra API and log traffic.
+			failedBefore := t.Failed()
+			defer func() {
+				if !shouldCaptureOutageSnapshot(failedBefore, t.Failed()) {
+					return
+				}
+				t.Logf("KEDA outage workload snapshot before restore:\n%s", outageWorkloadStatusSnapshot(ctx, []string{
+					environment.FromContext(ctx).Namespace(),
+					"keda",
+				}))
+			}()
 			autoscaling.InstallProducerWithEventType("autoscale-outage-producer", outageEventCount, outageEventType)(ctx, t)
 			waitForDeployment(ctx, t, "autoscale-broker-a-broker-filter", func(replicas int32) bool { return replicas >= 1 })
 			assertFilterReplicas(ctx, t, "autoscale-broker-b-broker-filter", 0)
@@ -143,6 +157,10 @@ func NatsBrokerKEDAAutoscalingFeature() *feature.Feature {
 		AllGoReady(ctx, t)
 	})
 	return f
+}
+
+func shouldCaptureOutageSnapshot(failedBefore, failedAfter bool) bool {
+	return !failedBefore && failedAfter
 }
 
 type deploymentRef struct {
@@ -293,6 +311,106 @@ func withDeploymentsStopped(ctx context.Context, t feature.T, refs []deploymentR
 	run()
 }
 
+func outageWorkloadStatusSnapshot(ctx context.Context, namespaces []string) string {
+	diagnosticsCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	return workloadStatusSnapshot(diagnosticsCtx, namespaces)
+}
+
+func workloadStatusSnapshot(ctx context.Context, namespaces []string) string {
+	const (
+		logTailLines  = int64(200)
+		logLimitBytes = int64(256 * 1024)
+	)
+	client := kubeclient.Get(ctx)
+	seen := make(map[string]struct{}, len(namespaces))
+	var snapshot strings.Builder
+	for _, namespace := range namespaces {
+		if namespace == "" {
+			continue
+		}
+		if _, found := seen[namespace]; found {
+			continue
+		}
+		seen[namespace] = struct{}{}
+		fmt.Fprintf(&snapshot, "namespace %s\n", namespace)
+
+		deployments, err := client.AppsV1().Deployments(namespace).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			fmt.Fprintf(&snapshot, "  deployments: %v\n", err)
+		} else {
+			for _, deployment := range deployments.Items {
+				desired := int32(1)
+				if deployment.Spec.Replicas != nil {
+					desired = *deployment.Spec.Replicas
+				}
+				fmt.Fprintf(&snapshot, "  deployment %s desired=%d replicas=%d updated=%d ready=%d available=%d unavailable=%d\n",
+					deployment.Name, desired, deployment.Status.Replicas, deployment.Status.UpdatedReplicas,
+					deployment.Status.ReadyReplicas, deployment.Status.AvailableReplicas, deployment.Status.UnavailableReplicas)
+			}
+		}
+
+		pods, err := client.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			fmt.Fprintf(&snapshot, "  pods: %v\n", err)
+		} else {
+			for _, pod := range pods.Items {
+				fmt.Fprintf(&snapshot, "  pod %s phase=%s node=%s", pod.Name, pod.Status.Phase, pod.Spec.NodeName)
+				statuses := make([]corev1.ContainerStatus, 0, len(pod.Status.InitContainerStatuses)+len(pod.Status.ContainerStatuses)+len(pod.Status.EphemeralContainerStatuses))
+				statuses = append(statuses, pod.Status.InitContainerStatuses...)
+				statuses = append(statuses, pod.Status.ContainerStatuses...)
+				statuses = append(statuses, pod.Status.EphemeralContainerStatuses...)
+				for _, status := range statuses {
+					fmt.Fprintf(&snapshot, " container=%s/ready=%t/restarts=%d", status.Name, status.Ready, status.RestartCount)
+				}
+				fmt.Fprintln(&snapshot)
+
+				containerNames := make([]string, 0, len(pod.Spec.InitContainers)+len(pod.Spec.Containers)+len(pod.Spec.EphemeralContainers))
+				for _, container := range pod.Spec.InitContainers {
+					containerNames = append(containerNames, container.Name)
+				}
+				for _, container := range pod.Spec.Containers {
+					containerNames = append(containerNames, container.Name)
+				}
+				for _, container := range pod.Spec.EphemeralContainers {
+					containerNames = append(containerNames, container.Name)
+				}
+				for _, container := range containerNames {
+					for _, previous := range []bool{false, true} {
+						instance := "current"
+						if previous {
+							instance = "previous"
+						}
+						logs, err := client.CoreV1().Pods(namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
+							Container:  container,
+							Previous:   previous,
+							Timestamps: true,
+							TailLines:  ptr.To(logTailLines),
+							LimitBytes: ptr.To(logLimitBytes),
+						}).DoRaw(ctx)
+						if err != nil {
+							fmt.Fprintf(&snapshot, "  logs pod=%s container=%s instance=%s error=%v\n", pod.Name, container, instance, err)
+							continue
+						}
+						fmt.Fprintf(&snapshot, "  logs pod=%s container=%s instance=%s tail=%d limitBytes=%d\n%s\n",
+							pod.Name, container, instance, logTailLines, logLimitBytes, logs)
+					}
+				}
+			}
+		}
+
+		jobs, err := client.BatchV1().Jobs(namespace).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			fmt.Fprintf(&snapshot, "  jobs: %v\n", err)
+		} else {
+			for _, job := range jobs.Items {
+				fmt.Fprintf(&snapshot, "  job %s active=%d succeeded=%d failed=%d\n", job.Name, job.Status.Active, job.Status.Succeeded, job.Status.Failed)
+			}
+		}
+	}
+	return snapshot.String()
+}
+
 func updateDeploymentReplicas(ctx context.Context, ref deploymentRef, replicas int32) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		deployments := kubeclient.Get(ctx).AppsV1().Deployments(ref.namespace)
@@ -377,6 +495,7 @@ func namedRecorderFeature(name string, options ...eventshub.EventsHubOption) *fe
 func TestNatsBrokerDirect(t *testing.T) {
 	t.Parallel()
 	ctx, env := global.Environment(
+		environment.Managed(t),
 		knative.WithKnativeNamespace(system.Namespace()),
 		knative.WithLoggingConfig,
 		knative.WithObservabilityConfig,
@@ -384,7 +503,6 @@ func TestNatsBrokerDirect(t *testing.T) {
 	)
 	env.Test(ctx, t, RecorderFeature())
 	env.Test(ctx, t, NatsBrokerDirectFeature())
-	env.Finish()
 }
 
 // NatsBrokerDirectFeature tests direct event delivery through NatsJetStream broker.
@@ -414,6 +532,7 @@ func NatsBrokerDirectFeature() *feature.Feature {
 func TestNatsBrokerDeadLetter(t *testing.T) {
 	t.Parallel()
 	ctx, env := global.Environment(
+		environment.Managed(t),
 		knative.WithKnativeNamespace(system.Namespace()),
 		knative.WithLoggingConfig,
 		knative.WithObservabilityConfig,
@@ -421,7 +540,6 @@ func TestNatsBrokerDeadLetter(t *testing.T) {
 	)
 	env.Test(ctx, t, namedRecorderFeature("dls-recorder"))
 	env.Test(ctx, t, NatsBrokerDeadLetterFeature())
-	env.Finish()
 }
 
 // NatsBrokerDeadLetterFeature tests that failed events reach the dead letter sink.
@@ -448,6 +566,7 @@ func NatsBrokerDeadLetterFeature() *feature.Feature {
 func TestNatsBrokerFiltering(t *testing.T) {
 	t.Parallel()
 	ctx, env := global.Environment(
+		environment.Managed(t),
 		knative.WithKnativeNamespace(system.Namespace()),
 		knative.WithLoggingConfig,
 		knative.WithObservabilityConfig,
@@ -456,7 +575,6 @@ func TestNatsBrokerFiltering(t *testing.T) {
 	env.Test(ctx, t, namedRecorderFeature("recorder-type-a"))
 	env.Test(ctx, t, namedRecorderFeature("recorder-type-b"))
 	env.Test(ctx, t, NatsBrokerFilteringFeature())
-	env.Finish()
 }
 
 // NatsBrokerFilteringFeature tests type-based event routing through NatsJetStream broker.

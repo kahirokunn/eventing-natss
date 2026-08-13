@@ -21,7 +21,7 @@ metadata:
     nats.eventing.knative.dev/release: devel
     eventing.knative.dev/brokerRole: controller
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: natsjetstream-broker-controller
@@ -31,6 +31,21 @@ spec:
         app: natsjetstream-broker-controller
         eventing.knative.dev/brokerRole: controller
     spec:
+      # Prefer distinct failure domains without making single-node development
+      # clusters unschedulable.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: natsjetstream-broker-controller
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: natsjetstream-broker-controller
       serviceAccountName: natsjetstream-broker-controller
       containers:
         - name: controller

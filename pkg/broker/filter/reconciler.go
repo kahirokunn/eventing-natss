@@ -90,32 +90,59 @@ func (r *FilterReconciler) Reconcile(ctx context.Context, key string) error {
 	trigger, err := r.triggerLister.Triggers(namespace).Get(name)
 	if err != nil {
 		if apierrs.IsNotFound(err) {
-			// Trigger has been deleted — clean up subscription
-			r.mu.RLock()
-			uid, ok := r.triggerUIDs[key]
-			r.mu.RUnlock()
-			if ok {
-				if delErr := r.DeleteTrigger(uid); delErr != nil {
-					return delErr
-				}
-				r.mu.Lock()
-				delete(r.triggerUIDs, key)
-				r.mu.Unlock()
-			}
-			return nil
+			// Trigger has been deleted — clean up subscription.
+			return r.deleteTrackedTrigger(key)
 		}
 		return fmt.Errorf("failed to get trigger: %w", err)
 	}
 	if !r.ownsTrigger(trigger) {
-		return nil
+		// A FilteringResourceEventHandler turns an update that changes
+		// spec.broker into a delete for the old Broker. By the time this key is
+		// reconciled, the shared lister already contains the new object, so
+		// ownership loss must be handled like deletion rather than skipped.
+		return r.deleteTrackedTrigger(key)
 	}
 
-	// Track key→UID mapping for delete handling
+	// A same-name Trigger can also be deleted and recreated before its queued
+	// key is reconciled. Retire the previous UID before tracking the replacement
+	// so its old process-local pull subscription cannot survive the recreation.
+	uid := string(trigger.UID)
+	r.mu.RLock()
+	trackedUID, tracked := r.triggerUIDs[key]
+	r.mu.RUnlock()
+	if tracked && trackedUID != uid {
+		if err := r.deleteTrackedTrigger(key); err != nil {
+			return err
+		}
+	}
+
+	// Track key→UID mapping for delete and ownership-change handling.
 	r.mu.Lock()
-	r.triggerUIDs[key] = string(trigger.UID)
+	r.triggerUIDs[key] = uid
 	r.mu.Unlock()
 
 	return r.ReconcileTrigger(ctx, trigger)
+}
+
+// deleteTrackedTrigger unsubscribes the UID most recently observed for key.
+// The compare-before-delete preserves a newer mapping if this helper is ever
+// called concurrently outside the controller work queue's per-key ordering.
+func (r *FilterReconciler) deleteTrackedTrigger(key string) error {
+	r.mu.RLock()
+	uid, ok := r.triggerUIDs[key]
+	r.mu.RUnlock()
+	if !ok {
+		return nil
+	}
+	if err := r.DeleteTrigger(uid); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	if r.triggerUIDs[key] == uid {
+		delete(r.triggerUIDs, key)
+	}
+	r.mu.Unlock()
+	return nil
 }
 
 // ReconcileTrigger reconciles a trigger to ensure the filter has a subscription

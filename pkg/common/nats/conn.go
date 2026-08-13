@@ -76,13 +76,6 @@ func NewNatsConnFromURL(ctx context.Context, url string) (*nats.Conn, error) {
 }
 
 func NewNatsConn(ctx context.Context, config commonconfig.EventingNatsConfig) (*nats.Conn, error) {
-	logger := logging.FromContext(ctx)
-
-	url := config.URL
-	if url == "" {
-		url = constants.DefaultNatsURL
-	}
-
 	// Try to get config from injection, fall back to in-cluster config
 	cfg := injection.GetConfig(ctx)
 	if cfg == nil {
@@ -98,7 +91,19 @@ func NewNatsConn(ctx context.Context, config commonconfig.EventingNatsConfig) (*
 		return nil, err
 	}
 
-	secrets := coreV1Client.Secrets(getNamespace(ctx))
+	return NewNatsConnWithSecrets(ctx, config, coreV1Client.Secrets(getNamespace(ctx)))
+}
+
+// NewNatsConnWithSecrets creates a NATS connection using the supplied Secret
+// client for credential, client certificate, and root CA references. Callers
+// should prefer this API so namespace scoping is explicit.
+func NewNatsConnWithSecrets(ctx context.Context, config commonconfig.EventingNatsConfig, secrets clientsetcorev1.SecretInterface, additionalOptions ...nats.Option) (*nats.Conn, error) {
+	logger := logging.FromContext(ctx)
+
+	url := config.URL
+	if url == "" {
+		url = constants.DefaultNatsURL
+	}
 
 	opts := []nats.Option{nats.Name("kn jsm dispatcher")}
 
@@ -149,6 +154,7 @@ func NewNatsConn(ctx context.Context, config commonconfig.EventingNatsConfig) (*
 			logger.Fatal("Exiting, no JSM servers available")
 		}))
 	}
+	opts = append(opts, additionalOptions...)
 	return nats.Connect(url, opts...)
 }
 

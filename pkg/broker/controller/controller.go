@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 
 	"github.com/kelseyhightower/envconfig"
 	"go.uber.org/zap"
@@ -111,6 +112,10 @@ func NewController(
 	if err != nil {
 		logger.Fatalw("Failed to create JetStream context", zap.Error(err))
 	}
+	natsConfigJSON, err := json.Marshal(natsConfig)
+	if err != nil {
+		logger.Fatalw("Failed to serialize NATS configuration for filters", zap.Error(err))
+	}
 
 	// Get informers
 	brokerInformer := brokerinformer.Get(ctx)
@@ -137,7 +142,8 @@ func NewController(
 
 		js: js,
 
-		natsURL: natsConfig.URL,
+		natsURL:        natsConfig.URL,
+		natsConfigJSON: string(natsConfigJSON),
 
 		filterImage:          env.FilterImage,
 		filterServiceAccount: env.FilterServiceAccount,

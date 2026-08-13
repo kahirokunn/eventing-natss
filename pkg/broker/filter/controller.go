@@ -18,15 +18,19 @@ package filter
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/kelseyhightower/envconfig"
+	"github.com/nats-io/nats.go"
 	"go.uber.org/zap"
 	"k8s.io/client-go/tools/cache"
 
+	kubeclient "knative.dev/pkg/client/injection/kube/client"
 	"knative.dev/pkg/configmap"
 	"knative.dev/pkg/controller"
 	"knative.dev/pkg/logging"
+	"knative.dev/pkg/system"
 
 	eventingv1 "knative.dev/eventing/pkg/apis/eventing/v1"
 	brokerinformer "knative.dev/eventing/pkg/client/injection/informers/eventing/v1/broker"
@@ -34,13 +38,15 @@ import (
 	eventinglisters "knative.dev/eventing/pkg/client/listers/eventing/v1"
 
 	"knative.dev/eventing-natss/pkg/broker/constants"
+	commonconfig "knative.dev/eventing-natss/pkg/common/config"
 	commonnats "knative.dev/eventing-natss/pkg/common/nats"
 )
 
 type envConfig struct {
 	PodName        string        `envconfig:"POD_NAME" required:"true"`
 	ContainerName  string        `envconfig:"CONTAINER_NAME" required:"true"`
-	NatsURL        string        `envconfig:"NATS_URL" required:"true"`
+	NatsURL        string        `envconfig:"NATS_URL"`
+	NatsConfig     string        `envconfig:"NATS_CONFIG"`
 	FetchBatchSize int           `envconfig:"CONSUMER_FETCH_BATCH_SIZE" default:"0"`
 	FetchTimeout   time.Duration `envconfig:"CONSUMER_FETCH_TIMEOUT" default:"0"`
 	MaxConcurrency int           `envconfig:"CONSUMER_MAX_CONCURRENCY" default:"0"`
@@ -65,8 +71,7 @@ func newController(ctx context.Context, _ configmap.Watcher, runtime *Runtime) *
 		logger.Fatalw("Failed to process environment variables", zap.Error(err))
 	}
 
-	// Create NATS connection using URL from environment variable
-	natsConn, err := commonnats.NewNatsConnFromURL(ctx, env.NatsURL)
+	natsConn, err := connectFilterNATS(ctx, env)
 	if err != nil {
 		logger.Fatalw("Failed to create NATS connection", zap.Error(err))
 	}
@@ -122,6 +127,64 @@ func newController(ctx context.Context, _ configmap.Watcher, runtime *Runtime) *
 
 	logger.Info("Filter controller initialized")
 	return impl
+}
+
+func filterNATSConfig(env *envConfig) (commonconfig.EventingNatsConfig, error) {
+	if env.NatsConfig != "" {
+		return commonnats.ParseEventingNatsConfig(env.NatsConfig)
+	}
+	if env.NatsURL == "" {
+		return commonconfig.EventingNatsConfig{}, fmt.Errorf("one of NATS_CONFIG or NATS_URL is required")
+	}
+	return commonconfig.EventingNatsConfig{URL: env.NatsURL}, nil
+}
+
+func connectFilterNATS(ctx context.Context, env *envConfig) (*nats.Conn, error) {
+	// Preserve the public URL-only controller contract for manually managed
+	// filters. This path intentionally needs no Kubernetes Secret client.
+	if env.NatsConfig == "" {
+		if env.NatsURL == "" {
+			return nil, fmt.Errorf("one of NATS_CONFIG or NATS_URL is required")
+		}
+		return commonnats.NewNatsConnFromURL(ctx, env.NatsURL)
+	}
+
+	config, err := filterNATSConfig(env)
+	if err != nil {
+		return nil, err
+	}
+	// Resolve every credential reference in the system namespace. The filter's
+	// informer scope may be its Broker namespace and must not affect Secret lookup.
+	return commonnats.NewNatsConnWithSecrets(ctx, config,
+		kubeclient.Get(ctx).CoreV1().Secrets(system.Namespace()), filterNATSOptions(ctx, config)...)
+}
+
+func filterNATSOptions(ctx context.Context, config commonconfig.EventingNatsConfig) []nats.Option {
+	logger := logging.FromContext(ctx)
+	options := []nats.Option{
+		nats.Name("natsjs broker filter"),
+		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
+			logger.Warnw("Disconnected from NATS", zap.Error(err))
+		}),
+		nats.ReconnectHandler(func(conn *nats.Conn) {
+			logger.Infow("Reconnected to NATS", zap.String("url", conn.ConnectedUrl()))
+		}),
+		nats.ClosedHandler(func(_ *nats.Conn) {
+			logger.Error("NATS connection closed; liveness will restart the filter")
+		}),
+	}
+	if config.ConnOpts != nil && config.ConnOpts.RetryOnFailedConnect {
+		reconnectWait := time.Duration(config.ConnOpts.ReconnectWaitMilliseconds) * time.Millisecond
+		maxReconnects := config.ConnOpts.MaxReconnects
+		options = append(options, nats.CustomReconnectDelay(func(attempts int) time.Duration {
+			logger.Warnw("Waiting to reconnect to NATS",
+				zap.Int("attempt", attempts),
+				zap.Int("max_reconnects", maxReconnects),
+			)
+			return reconnectWait
+		}))
+	}
+	return options
 }
 
 // filterTriggersByBrokerClass returns a filter function that only passes triggers

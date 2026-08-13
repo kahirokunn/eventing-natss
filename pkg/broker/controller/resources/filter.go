@@ -45,6 +45,7 @@ type FilterArgs struct {
 	ServiceAccountName string
 	StreamName         string
 	NatsURL            string
+	NatsConfigJSON     string
 	Template           *brokerconfig.DeploymentTemplate
 }
 
@@ -212,6 +213,13 @@ func makeFilterEnv(args *FilterArgs) []corev1.EnvVar {
 		{
 			Name:  "NATS_URL",
 			Value: args.NatsURL,
+		},
+		{
+			// NATS_CONFIG is the controller's startup snapshot of the full
+			// non-secret connection configuration. NATS_URL remains for rolling
+			// downgrade compatibility; new filters give NATS_CONFIG precedence.
+			Name:  "NATS_CONFIG",
+			Value: args.NatsConfigJSON,
 		},
 		{
 			Name:  "METRICS_DOMAIN",

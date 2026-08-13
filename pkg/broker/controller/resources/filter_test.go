@@ -237,6 +237,23 @@ func TestMakeFilterDeployment(t *testing.T) {
 	}
 }
 
+func TestMakeFilterDeploymentTerminationGracePeriod(t *testing.T) {
+	broker := &eventingv1.Broker{ObjectMeta: metav1.ObjectMeta{
+		Name:      "test-broker",
+		Namespace: "test-namespace",
+		UID:       "test-uid",
+	}}
+
+	deployment := MakeFilterDeployment(&FilterArgs{Broker: broker})
+	got := deployment.Spec.Template.Spec.TerminationGracePeriodSeconds
+	if got == nil {
+		t.Fatal("terminationGracePeriodSeconds is nil, want 45")
+	}
+	if *got != 45 {
+		t.Errorf("terminationGracePeriodSeconds = %d, want 45", *got)
+	}
+}
+
 func TestMakeFilterDeploymentRequiredLabelsCannotBeOverridden(t *testing.T) {
 	broker := &eventingv1.Broker{ObjectMeta: metav1.ObjectMeta{
 		Name: "test-broker", Namespace: "test-namespace", UID: "test-uid",

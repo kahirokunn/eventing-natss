@@ -50,7 +50,17 @@ type envConfig struct {
 }
 
 // NewController creates a new filter controller
-func NewController(ctx context.Context, _ configmap.Watcher) *controller.Impl {
+func NewController(ctx context.Context, watcher configmap.Watcher) *controller.Impl {
+	return newController(ctx, watcher, nil)
+}
+
+// NewController creates a filter controller whose data-plane resources are
+// owned and shut down by this Runtime.
+func (r *Runtime) NewController(ctx context.Context, watcher configmap.Watcher) *controller.Impl {
+	return newController(ctx, watcher, r)
+}
+
+func newController(ctx context.Context, _ configmap.Watcher, runtime *Runtime) *controller.Impl {
 	logger := logging.FromContext(ctx)
 
 	env := &envConfig{}
@@ -81,7 +91,14 @@ func NewController(ctx context.Context, _ configmap.Watcher) *controller.Impl {
 		MaxConcurrency: env.MaxConcurrency,
 		StreamName:     env.StreamName,
 	}
-	consumerManager := NewConsumerManager(ctx, natsConn, js, consumerConfig)
+	consumerCtx := ctx
+	if runtime != nil {
+		consumerCtx = context.WithoutCancel(ctx)
+	}
+	consumerManager := NewConsumerManager(consumerCtx, natsConn, js, consumerConfig)
+	if runtime != nil {
+		runtime.Attach(consumerManager, natsConn)
+	}
 
 	// Create filter reconciler
 	reconciler := NewFilterReconciler(

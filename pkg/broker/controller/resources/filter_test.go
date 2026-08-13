@@ -193,6 +193,44 @@ func TestMakeFilterDeploymentTerminationGracePeriod(t *testing.T) {
 		t.Errorf("terminationGracePeriodSeconds = %d, want 45", *got)
 	}
 }
+
+func TestMakeFilterDeploymentRequiredLabelsCannotBeOverridden(t *testing.T) {
+	broker := &eventingv1.Broker{ObjectMeta: metav1.ObjectMeta{
+		Name: "test-broker", Namespace: "test-namespace", UID: "test-uid",
+	}}
+	deployment := MakeFilterDeployment(&FilterArgs{
+		Broker: broker,
+		Template: &brokerconfig.DeploymentTemplate{
+			Labels: map[string]string{
+				BrokerLabelKey: "wrong-broker", RoleLabelKey: "wrong-role",
+				"custom-deployment-label": "kept",
+			},
+			PodLabels: map[string]string{
+				BrokerLabelKey: "wrong-broker", RoleLabelKey: "wrong-role",
+				"custom-pod-label": "kept",
+			},
+		},
+	})
+	required := FilterLabels(broker.Name)
+	for key, want := range required {
+		if got := deployment.Labels[key]; got != want {
+			t.Errorf("Deployment label %q = %q, want required value %q", key, got, want)
+		}
+		if got := deployment.Spec.Selector.MatchLabels[key]; got != want {
+			t.Errorf("selector label %q = %q, want required value %q", key, got, want)
+		}
+		if got := deployment.Spec.Template.Labels[key]; got != want {
+			t.Errorf("Pod label %q = %q, want required value %q", key, got, want)
+		}
+	}
+	if got := deployment.Labels["custom-deployment-label"]; got != "kept" {
+		t.Errorf("custom Deployment label = %q, want kept", got)
+	}
+	if got := deployment.Spec.Template.Labels["custom-pod-label"]; got != "kept" {
+		t.Errorf("custom Pod label = %q, want kept", got)
+	}
+}
+
 func TestMakeFilterDeploymentWithResources(t *testing.T) {
 	broker := &eventingv1.Broker{
 		ObjectMeta: metav1.ObjectMeta{

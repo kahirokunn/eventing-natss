@@ -411,6 +411,48 @@ func TestReconcileFilterDeploymentUpdate(t *testing.T) {
 	}
 }
 
+func TestReconcileFilterDeploymentRepairsRequiredLabelsAndPreservesCustomLabels(t *testing.T) {
+	b := testBroker(testNamespace, testBrokerName)
+	existing := resources.MakeFilterDeployment(&resources.FilterArgs{
+		Broker: b, Image: "filter:latest", ServiceAccountName: "dp-sa",
+		StreamName: "TEST_STREAM", NatsURL: "nats://localhost:4222",
+	})
+	existing.Labels[resources.BrokerLabelKey] = "wrong-broker"
+	existing.Labels[resources.RoleLabelKey] = "wrong-role"
+	existing.Labels["custom-existing-label"] = "kept"
+	kube := kubefake.NewSimpleClientset(existing)
+	r := &Reconciler{
+		kubeClientSet: kube, deploymentLister: newDeploymentLister(existing),
+		filterImage: "filter:latest", filterServiceAccount: "dp-sa",
+		natsURL: "nats://localhost:4222",
+	}
+
+	if err := r.reconcileFilterDeployment(testContext(), b, "TEST_STREAM", brokerconfig.DefaultBrokerConfig()); err != nil {
+		t.Fatalf("reconcileFilterDeployment() error: %v", err)
+	}
+	got, err := kube.AppsV1().Deployments(b.Namespace).Get(context.Background(), existing.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range resources.FilterLabels(b.Name) {
+		if got.Labels[key] != want {
+			t.Errorf("Deployment label %q = %q, want repaired value %q", key, got.Labels[key], want)
+		}
+	}
+	if got.Labels["custom-existing-label"] != "kept" {
+		t.Errorf("custom existing label = %q, want kept", got.Labels["custom-existing-label"])
+	}
+	updates := 0
+	for _, action := range kube.Actions() {
+		if action.Matches("update", "deployments") {
+			updates++
+		}
+	}
+	if updates != 1 {
+		t.Fatalf("Deployment updates = %d, want exactly 1", updates)
+	}
+}
+
 func TestEnqueueBrokerOfTrigger(t *testing.T) {
 	var got []types.NamespacedName
 	h := enqueueBrokerOfTrigger(func(k types.NamespacedName) { got = append(got, k) })

@@ -53,7 +53,7 @@ type DeploymentTemplate struct {
 	// +optional
 	Annotations map[string]string `json:"annotations,omitempty"`
 
-	// Labels to add to the deployment.
+	// Labels to add to the deployment. Controller-managed labels take precedence.
 	// +optional
 	Labels map[string]string `json:"labels,omitempty"`
 
@@ -61,7 +61,7 @@ type DeploymentTemplate struct {
 	// +optional
 	PodAnnotations map[string]string `json:"podAnnotations,omitempty"`
 
-	// PodLabels to add to the pod template.
+	// PodLabels to add to the pod template. Controller-managed labels take precedence.
 	// +optional
 	PodLabels map[string]string `json:"podLabels,omitempty"`
 
@@ -78,6 +78,7 @@ type DeploymentTemplate struct {
 	Affinity *corev1.Affinity `json:"affinity,omitempty"`
 
 	// Env defines additional environment variables for the container.
+	// Controller-managed environment variables take precedence.
 	// +optional
 	Env []corev1.EnvVar `json:"env,omitempty"`
 }

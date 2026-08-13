@@ -69,7 +69,9 @@ type DeploymentTemplate struct {
 	// +optional
 	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
 
-	// Resources for the container.
+	// Resources for the container. When empty, generated filters use safe
+	// requests (100m CPU, 64Mi memory) and limits (500m CPU, 256Mi memory).
+	// A non-empty partial value is used exactly as configured.
 	// +optional
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
 

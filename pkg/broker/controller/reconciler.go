@@ -101,6 +101,7 @@ type Reconciler struct {
 
 	// NATS URL for data plane components
 	natsURL          string
+	natsConfigJSON   string
 	autoscalerConfig *commonconfig.NatsAutoscalerConfig
 
 	// Image configuration
@@ -505,6 +506,7 @@ func (r *Reconciler) reconcileFilterDeployment(ctx context.Context, b *eventingv
 		ServiceAccountName: r.filterServiceAccount,
 		StreamName:         streamName,
 		NatsURL:            r.natsURL,
+		NatsConfigJSON:     r.natsConfigJSON,
 		Template:           filterTemplate,
 	})
 	if policy.desiredReplicas != nil {

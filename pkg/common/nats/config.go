@@ -30,5 +30,10 @@ func LoadEventingNatsConfig(configMap map[string]string) (config commonconfig.Ev
 		return config, fmt.Errorf("missing configmap entry: %s", constants.EventingNatsSettingsConfigKey)
 	}
 
-	return config, yaml.Unmarshal([]byte(eventingNats), &config)
+	return ParseEventingNatsConfig(eventingNats)
+}
+
+// ParseEventingNatsConfig parses a serialized eventing-nats configuration.
+func ParseEventingNatsConfig(serialized string) (config commonconfig.EventingNatsConfig, err error) {
+	return config, yaml.Unmarshal([]byte(serialized), &config)
 }

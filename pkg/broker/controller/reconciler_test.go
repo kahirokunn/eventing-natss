@@ -428,6 +428,7 @@ func TestReconcileFilterDeploymentUpdate(t *testing.T) {
 		filterImage:          "filter:latest",
 		filterServiceAccount: "dp-sa",
 		natsURL:              "nats://localhost:4222",
+		natsConfigJSON:       `{"url":"tls://nats.example:4222"}`,
 	}
 
 	if err := r.reconcileFilterDeployment(testContext(), b, "TEST_STREAM", brokerconfig.DefaultBrokerConfig()); err != nil {
@@ -439,6 +440,13 @@ func TestReconcileFilterDeploymentUpdate(t *testing.T) {
 	}
 	if len(got.Spec.Template.Spec.Containers) == 0 {
 		t.Error("deployment spec was not updated to the expected spec")
+	}
+	envValues := make(map[string]string)
+	for _, env := range got.Spec.Template.Spec.Containers[0].Env {
+		envValues[env.Name] = env.Value
+	}
+	if got, want := envValues["NATS_CONFIG"], r.natsConfigJSON; got != want {
+		t.Errorf("NATS_CONFIG = %q, want controller snapshot %q", got, want)
 	}
 }
 

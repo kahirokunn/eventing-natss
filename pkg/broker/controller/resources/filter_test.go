@@ -438,6 +438,7 @@ func TestMakeFilterEnvVars(t *testing.T) {
 		ServiceAccountName: "test-sa",
 		StreamName:         "TEST_STREAM",
 		NatsURL:            "nats://nats:4222",
+		NatsConfigJSON:     `{"url":"tls://nats:4222","auth":{"credentialFile":{"secret":{"name":"credentials"}}}}`,
 	}
 
 	deployment := MakeFilterDeployment(args)
@@ -472,6 +473,10 @@ func TestMakeFilterEnvVars(t *testing.T) {
 		t.Errorf("NATS_URL = %v, want nats://nats:4222", envMap["NATS_URL"])
 	}
 
+	if envMap["NATS_CONFIG"] != args.NatsConfigJSON {
+		t.Errorf("NATS_CONFIG = %v, want controller snapshot", envMap["NATS_CONFIG"])
+	}
+
 	if envMap["CONTAINER_NAME"] != FilterContainerName {
 		t.Errorf("CONTAINER_NAME = %v, want %s", envMap["CONTAINER_NAME"], FilterContainerName)
 	}
@@ -493,6 +498,7 @@ func TestMakeFilterEnvRequiredValuesCannotBeOverridden(t *testing.T) {
 		"BROKER_NAMESPACE":           broker.Namespace,
 		"STREAM_NAME":                "TEST_STREAM",
 		"NATS_URL":                   "nats://nats:4222",
+		"NATS_CONFIG":                `{"url":"tls://nats:4222"}`,
 		"METRICS_DOMAIN":             "knative.dev/eventing",
 		"CONFIG_LOGGING_NAME":        "config-logging",
 		"CONFIG_LEADERELECTION_NAME": "config-leader-election",
@@ -507,10 +513,11 @@ func TestMakeFilterEnvRequiredValuesCannotBeOverridden(t *testing.T) {
 		corev1.EnvVar{Name: "CUSTOM_ENV", Value: "$(BROKER_NAME)-suffix"},
 	)
 	deployment := MakeFilterDeployment(&FilterArgs{
-		Broker:     broker,
-		StreamName: "TEST_STREAM",
-		NatsURL:    "nats://nats:4222",
-		Template:   &brokerconfig.DeploymentTemplate{Env: templateEnv},
+		Broker:         broker,
+		StreamName:     "TEST_STREAM",
+		NatsURL:        "nats://nats:4222",
+		NatsConfigJSON: requiredValues["NATS_CONFIG"],
+		Template:       &brokerconfig.DeploymentTemplate{Env: templateEnv},
 	})
 
 	counts := make(map[string]int)

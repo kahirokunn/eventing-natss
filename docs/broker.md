@@ -166,6 +166,46 @@ spec:
 
 ## Configuration
 
+### Configure NATS authentication and TLS
+
+The Broker controller, Trigger controller, ingress, and generated filters use
+the `eventing-nats` entry in `knative-eventing/config-nats-broker`. Filters
+receive the controller's startup snapshot of this configuration and resolve
+referenced Secrets only from `knative-eventing`; Secret data is never copied to
+a Pod environment variable or into a user namespace.
+
+The shared connection settings support NATS credential files, client mTLS, and
+a custom root CA. For example:
+
+```yaml
+data:
+  eventing-nats: |
+    url: tls://nats.nats-io.svc.cluster.local:4222
+    auth:
+      credentialFile:
+        secret:
+          name: nats-credentials
+          key: nats.creds
+      tls:
+        secret:
+          name: nats-client-tls
+    tls:
+      secret:
+        name: nats-root-ca
+```
+
+The TLS Secret uses `tls.crt` and `tls.key`; the root CA Secret uses `ca.crt`.
+An inline base64-encoded CA can be supplied as `tls.caBundle` instead. Invalid
+or missing referenced credentials fail closed; filters do not fall back to the
+URL-only connection when a full snapshot is present.
+
+Connection configuration and credentials are loaded at process startup. After
+changing the ConfigMap, restart the Broker controller and ingress; the restarted
+controller updates generated filter Pods with the same snapshot. After rotating
+a referenced Secret, restart those two system Deployments and every generated
+filter Deployment so all NATS clients move to the new credential revision
+together.
+
 ### Scale a Broker Filter to Zero with KEDA
 
 Cluster operators can install KEDA to stop filter Pods while every Trigger on a
@@ -305,7 +345,8 @@ template uses the same key or environment variable name.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `NATS_URL` | NATS server URL | Required |
+| `NATS_CONFIG` | Controller-owned full connection snapshot; takes precedence over `NATS_URL` | Set on generated filters |
+| `NATS_URL` | Legacy URL-only connection fallback for manually managed filters | Required when `NATS_CONFIG` is unset |
 | `POD_NAME` | Pod name for identification | Required |
 | `CONTAINER_NAME` | Container name for identification | Required |
 | `BROKER_NAME` | Broker served by this filter process | Required |

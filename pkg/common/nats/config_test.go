@@ -22,6 +22,60 @@ import (
 	"knative.dev/eventing-natss/pkg/common/constants"
 )
 
+func TestLoadEventingNatsConfigSecureConnection(t *testing.T) {
+	config, err := LoadEventingNatsConfig(map[string]string{
+		constants.EventingNatsSettingsConfigKey: `
+url: tls://nats.example.test:4222
+auth:
+  credentialFile:
+    secret:
+      name: nats-credentials
+      key: account.creds
+  tls:
+    secret:
+      name: nats-client-tls
+tls:
+  secret:
+    name: nats-root-ca
+connOpts:
+  retryOnFailedConnect: true
+  maxReconnects: 17
+  reconnectWaitMilliseconds: 250
+  reconnectJitterMilliseconds: 75
+  reconnectJitterTLSMilliseconds: 125
+`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.URL != "tls://nats.example.test:4222" {
+		t.Errorf("URL = %q, want secure NATS URL", config.URL)
+	}
+	if config.Auth == nil || config.Auth.CredentialFile == nil || config.Auth.CredentialFile.Secret == nil {
+		t.Fatal("credentialFile secret was not decoded")
+	}
+	credentialSecret := config.Auth.CredentialFile.Secret
+	if credentialSecret.Name != "nats-credentials" || credentialSecret.Key != "account.creds" {
+		t.Errorf("credentialFile secret = %#v", credentialSecret)
+	}
+	if config.Auth.TLS == nil || config.Auth.TLS.Secret == nil || config.Auth.TLS.Secret.Name != "nats-client-tls" {
+		t.Errorf("mTLS secret = %#v", config.Auth.TLS)
+	}
+	if config.RootCA == nil || config.RootCA.Secret == nil || config.RootCA.Secret.Name != "nats-root-ca" {
+		t.Errorf("root CA secret = %#v", config.RootCA)
+	}
+	if config.ConnOpts == nil {
+		t.Fatal("connOpts was not decoded")
+	}
+	if !config.ConnOpts.RetryOnFailedConnect ||
+		config.ConnOpts.MaxReconnects != 17 ||
+		config.ConnOpts.ReconnectWaitMilliseconds != 250 ||
+		config.ConnOpts.ReconnectJitterMilliseconds != 75 ||
+		config.ConnOpts.ReconnectJitterTLSMilliseconds != 125 {
+		t.Errorf("connOpts = %#v", config.ConnOpts)
+	}
+}
+
 func TestLoadEventingNatsConfigAutoscaler(t *testing.T) {
 	config, err := LoadEventingNatsConfig(map[string]string{
 		constants.EventingNatsSettingsConfigKey: `

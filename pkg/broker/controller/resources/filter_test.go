@@ -208,6 +208,7 @@ func TestMakeFilterDeploymentWithResources(t *testing.T) {
 		ServiceAccountName: "test-sa",
 		StreamName:         "TEST_STREAM",
 		NatsURL:            "nats://nats:4222",
+		NatsConfigJSON:     `{"url":"tls://nats:4222","auth":{"credentialFile":{"secret":{"name":"credentials"}}}}`,
 		Template: &brokerconfig.DeploymentTemplate{
 			Resources: corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
@@ -363,6 +364,10 @@ func TestMakeFilterEnvVars(t *testing.T) {
 
 	if envMap["NATS_URL"] != "nats://nats:4222" {
 		t.Errorf("NATS_URL = %v, want nats://nats:4222", envMap["NATS_URL"])
+	}
+
+	if envMap["NATS_CONFIG"] != args.NatsConfigJSON {
+		t.Errorf("NATS_CONFIG = %v, want controller snapshot", envMap["NATS_CONFIG"])
 	}
 
 	if envMap["CONTAINER_NAME"] != FilterContainerName {

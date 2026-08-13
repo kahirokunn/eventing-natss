@@ -28,3 +28,7 @@ data:
       reconnectWaitMilliseconds: 2000
       reconnectJitterMilliseconds: 100
       reconnectJitterTLSMilliseconds: 1000
+    autoscaler:
+      monitoringEndpoint: nats.nats-io.svc.cluster.local:8222
+      account: "$G"
+      useHttps: false

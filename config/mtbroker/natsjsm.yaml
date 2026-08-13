@@ -58,6 +58,10 @@ spec:
     port: 4222
     protocol: TCP
     targetPort: client
+  - name: monitoring
+    port: 8222
+    protocol: TCP
+    targetPort: monitoring
   selector:
     app: nats-jetstream
   sessionAffinity: None
@@ -89,6 +93,7 @@ spec:
           - -D
           - --jetstream
           - --port=4222
+          - --http_port=8222
           - --config=/etc/nats-jetstream/jetstream.conf
           env:
             - name: POD_NAME

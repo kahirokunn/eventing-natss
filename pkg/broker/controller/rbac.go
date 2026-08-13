@@ -28,7 +28,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/retry"
 
@@ -208,7 +207,7 @@ func (r *Reconciler) reconcileRoleBinding(ctx context.Context, b *eventingv1.Bro
 	if existing.RoleRef != expected.RoleRef {
 		// RoleRef is immutable. Revoke the obsolete grant first and retry rather
 		// than leaving a Pod running with broader or unrelated authority.
-		if err := client.Delete(ctx, existing.Name, uidDeleteOptions(existing.UID)); err != nil {
+		if err := client.Delete(ctx, existing.Name, objectDeleteOptions(existing, nil)); err != nil {
 			return err
 		}
 		return kncontroller.NewRequeueAfter(time.Second)
@@ -277,10 +276,6 @@ func (r *Reconciler) deleteDataplaneRBAC(ctx context.Context, b *eventingv1.Brok
 	return r.deleteManagedServiceAccount(ctx, b, identity)
 }
 
-func uidDeleteOptions(uid types.UID) metav1.DeleteOptions {
-	return metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}}
-}
-
 func (r *Reconciler) deleteManagedRoleBinding(ctx context.Context, b *eventingv1.Broker, namespace, name string, namespacedOwner bool) error {
 	client := r.kubeClientSet.RbacV1().RoleBindings(namespace)
 	existing, err := client.Get(ctx, name, metav1.GetOptions{})
@@ -297,7 +292,7 @@ func (r *Reconciler) deleteManagedRoleBinding(ctx context.Context, b *eventingv1
 	if !owned {
 		return fmt.Errorf("refusing to delete role binding %s/%s not owned by Broker UID %s", namespace, name, b.UID)
 	}
-	return client.Delete(ctx, name, uidDeleteOptions(existing.UID))
+	return client.Delete(ctx, name, objectDeleteOptions(existing, nil))
 }
 
 func (r *Reconciler) deleteManagedServiceAccount(ctx context.Context, b *eventingv1.Broker, name string) error {
@@ -312,7 +307,7 @@ func (r *Reconciler) deleteManagedServiceAccount(ctx context.Context, b *eventin
 	if !metav1.IsControlledBy(existing, b) {
 		return fmt.Errorf("refusing to delete service account %s/%s not owned by Broker UID %s", b.Namespace, name, b.UID)
 	}
-	return client.Delete(ctx, name, uidDeleteOptions(existing.UID))
+	return client.Delete(ctx, name, objectDeleteOptions(existing, nil))
 }
 
 func (r *Reconciler) runDataplaneRBACSweeper(ctx context.Context, brokerSynced cache.InformerSynced) {
@@ -374,7 +369,7 @@ func (r *Reconciler) sweepOrphanedDataplaneBindings(ctx context.Context) error {
 			errs = append(errs, fmt.Errorf("live check Broker %s/%s for RoleBinding %s: %w", namespace, name, binding.Name, liveErr))
 			continue
 		}
-		if err := r.kubeClientSet.RbacV1().RoleBindings(system.Namespace()).Delete(ctx, binding.Name, uidDeleteOptions(binding.UID)); err != nil && !apierrs.IsNotFound(err) {
+		if err := r.kubeClientSet.RbacV1().RoleBindings(system.Namespace()).Delete(ctx, binding.Name, objectDeleteOptions(binding, nil)); err != nil && !apierrs.IsNotFound(err) {
 			errs = append(errs, fmt.Errorf("delete orphaned RoleBinding %s: %w", binding.Name, err))
 			continue
 		}

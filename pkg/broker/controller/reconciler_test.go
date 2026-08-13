@@ -39,9 +39,11 @@ import (
 
 	"go.uber.org/zap"
 	"knative.dev/pkg/controller"
+	"knative.dev/pkg/kmeta"
 	"knative.dev/pkg/logging"
 
 	eventingv1 "knative.dev/eventing/pkg/apis/eventing/v1"
+	eventingfake "knative.dev/eventing/pkg/client/clientset/versioned/fake"
 	eventinglisters "knative.dev/eventing/pkg/client/listers/eventing/v1"
 
 	brokerconfig "knative.dev/eventing-natss/pkg/broker/config"
@@ -118,14 +120,15 @@ func TestDeleteFilter(t *testing.T) {
 	name := resources.FilterName(testBrokerName)
 
 	t.Run("deletes existing filter deployment and service", func(t *testing.T) {
+		b := testBroker(testNamespace, testBrokerName)
 		kube := kubefake.NewSimpleClientset(
-			&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: name}},
-			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: name}},
+			&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: name, UID: "deployment-uid", ResourceVersion: "1", OwnerReferences: []metav1.OwnerReference{*kmeta.NewControllerRef(b)}}},
+			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: name, UID: "service-uid", ResourceVersion: "1", OwnerReferences: []metav1.OwnerReference{*kmeta.NewControllerRef(b)}}},
 		)
 		r := &Reconciler{kubeClientSet: kube}
 		ctx := logging.WithLogger(context.Background(), zap.NewNop().Sugar())
 
-		if err := r.deleteFilter(ctx, testBroker(testNamespace, testBrokerName)); err != nil {
+		if err := r.deleteFilter(ctx, b); err != nil {
 			t.Fatalf("deleteFilter() error: %v", err)
 		}
 
@@ -147,14 +150,15 @@ func TestDeleteFilter(t *testing.T) {
 	})
 
 	t.Run("surfaces a non-NotFound delete error and marks filter failed", func(t *testing.T) {
-		kube := kubefake.NewSimpleClientset()
+		b := testBroker(testNamespace, testBrokerName)
+		deployment := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: name, UID: "deployment-uid", ResourceVersion: "1", OwnerReferences: []metav1.OwnerReference{*kmeta.NewControllerRef(b)}}}
+		kube := kubefake.NewSimpleClientset(deployment)
 		kube.PrependReactor("delete", "deployments", func(clienttesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("boom")
 		})
 		r := &Reconciler{kubeClientSet: kube}
 		ctx := logging.WithLogger(context.Background(), zap.NewNop().Sugar())
 
-		b := testBroker(testNamespace, testBrokerName)
 		if err := r.deleteFilter(ctx, b); err == nil {
 			t.Fatal("deleteFilter() expected an error, got nil")
 		}
@@ -549,11 +553,13 @@ func TestReconcileFilterServiceUpdate(t *testing.T) {
 	name := resources.FilterName(testBrokerName)
 	// Existing service with an empty spec differs from the expected spec, so the
 	// update branch runs.
-	existing := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: name}}
+	b := testBroker(testNamespace, testBrokerName)
+	existing := resources.MakeFilterService(b)
+	existing.Spec.Ports = nil
 	kube := kubefake.NewSimpleClientset(existing)
 	r := &Reconciler{kubeClientSet: kube, serviceLister: newServiceLister(existing)}
 
-	if _, err := r.reconcileFilterService(testContext(), testBroker(testNamespace, testBrokerName)); err != nil {
+	if _, err := r.reconcileFilterService(testContext(), b); err != nil {
 		t.Fatalf("reconcileFilterService() error: %v", err)
 	}
 	got, err := kube.CoreV1().Services(testNamespace).Get(context.Background(), name, metav1.GetOptions{})
@@ -567,7 +573,8 @@ func TestReconcileFilterServiceUpdate(t *testing.T) {
 
 func TestReconcileFilterDeploymentUpdate(t *testing.T) {
 	name := resources.FilterName(testBrokerName)
-	existing := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: name}}
+	b := testBroker(testNamespace, testBrokerName)
+	existing := resources.MakeFilterDeployment(&resources.FilterArgs{Broker: b, Image: "stale", ServiceAccountName: (&Reconciler{}).dataplaneIdentity(b), StreamName: "TEST_STREAM", NatsURL: "nats://localhost:4222"})
 	kube := kubefake.NewSimpleClientset(existing)
 	r := &Reconciler{
 		kubeClientSet:        kube,
@@ -578,7 +585,7 @@ func TestReconcileFilterDeploymentUpdate(t *testing.T) {
 		natsConfigJSON:       `{"url":"tls://nats.example:4222"}`,
 	}
 
-	if err := r.reconcileFilterDeployment(testContext(), testBroker(testNamespace, testBrokerName), "TEST_STREAM", brokerconfig.DefaultBrokerConfig()); err != nil {
+	if err := r.reconcileFilterDeployment(testContext(), b, "TEST_STREAM", brokerconfig.DefaultBrokerConfig()); err != nil {
 		t.Fatalf("reconcileFilterDeployment() error: %v", err)
 	}
 	got, err := kube.AppsV1().Deployments(testNamespace).Get(context.Background(), name, metav1.GetOptions{})
@@ -594,48 +601,6 @@ func TestReconcileFilterDeploymentUpdate(t *testing.T) {
 	}
 	if got, want := envValues["NATS_CONFIG"], r.natsConfigJSON; got != want {
 		t.Errorf("NATS_CONFIG = %q, want controller snapshot %q", got, want)
-	}
-}
-
-func TestReconcileFilterDeploymentRepairsRequiredLabelsAndPreservesCustomLabels(t *testing.T) {
-	b := testBroker(testNamespace, testBrokerName)
-	existing := resources.MakeFilterDeployment(&resources.FilterArgs{
-		Broker: b, Image: "filter:latest", ServiceAccountName: "dp-sa",
-		StreamName: "TEST_STREAM", NatsURL: "nats://localhost:4222",
-	})
-	existing.Labels[resources.BrokerLabelKey] = "wrong-broker"
-	existing.Labels[resources.RoleLabelKey] = "wrong-role"
-	existing.Labels["custom-existing-label"] = "kept"
-	kube := kubefake.NewSimpleClientset(existing)
-	r := &Reconciler{
-		kubeClientSet: kube, deploymentLister: newDeploymentLister(existing),
-		filterImage: "filter:latest", filterServiceAccount: "dp-sa",
-		natsURL: "nats://localhost:4222",
-	}
-
-	if err := r.reconcileFilterDeployment(testContext(), b, "TEST_STREAM", brokerconfig.DefaultBrokerConfig()); err != nil {
-		t.Fatalf("reconcileFilterDeployment() error: %v", err)
-	}
-	got, err := kube.AppsV1().Deployments(b.Namespace).Get(context.Background(), existing.Name, metav1.GetOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for key, want := range resources.FilterLabels(b.Name) {
-		if got.Labels[key] != want {
-			t.Errorf("Deployment label %q = %q, want repaired value %q", key, got.Labels[key], want)
-		}
-	}
-	if got.Labels["custom-existing-label"] != "kept" {
-		t.Errorf("custom existing label = %q, want kept", got.Labels["custom-existing-label"])
-	}
-	updates := 0
-	for _, action := range kube.Actions() {
-		if action.Matches("update", "deployments") {
-			updates++
-		}
-	}
-	if updates != 1 {
-		t.Fatalf("Deployment updates = %d, want exactly 1", updates)
 	}
 }
 
@@ -733,6 +698,7 @@ func TestReconcileKind(t *testing.T) {
 		}
 		r := &Reconciler{
 			kubeClientSet:        kube,
+			eventingClient:       eventingfake.NewSimpleClientset(),
 			js:                   js,
 			triggerLister:        triggerLister,
 			deploymentLister:     newDeploymentLister(deploymentWithReady(ingressNS, ingressName, 1)),

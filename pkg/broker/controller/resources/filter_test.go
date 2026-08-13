@@ -32,7 +32,53 @@ import (
 
 	brokerautoscaler "knative.dev/eventing-natss/pkg/broker/autoscaler"
 	brokerconfig "knative.dev/eventing-natss/pkg/broker/config"
+	brokeroidc "knative.dev/eventing-natss/pkg/broker/oidc"
 )
+
+func TestMakeFilterDeploymentConfiguresDedicatedOIDCTokenIdentity(t *testing.T) {
+	broker := &eventingv1.Broker{ObjectMeta: metav1.ObjectMeta{
+		Name: "test-broker", Namespace: "test-namespace", UID: "test-uid",
+	}}
+	for _, tc := range []struct {
+		name     string
+		uid      string
+		wantName string
+		wantUID  string
+	}{
+		{name: "OIDC enabled", uid: "delivery-sa-uid", wantName: brokeroidc.DeliveryServiceAccountName, wantUID: "delivery-sa-uid"},
+		{name: "OIDC disabled leaves both values empty"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			deployment := MakeFilterDeployment(&FilterArgs{
+				Broker: broker, Image: "filter:latest", ServiceAccountName: "filter-sa",
+				StreamName: "TEST_STREAM", NatsURL: "nats://nats:4222", OIDCServiceAccountUID: tc.uid,
+			})
+			pod := deployment.Spec.Template.Spec
+			if len(pod.Volumes) != 0 {
+				t.Errorf("filter Pod volumes = %#v, want no projected tokens", pod.Volumes)
+			}
+			if len(pod.Containers) != 1 {
+				t.Fatalf("filter containers = %d, want 1", len(pod.Containers))
+			}
+			if len(pod.Containers[0].VolumeMounts) != 0 {
+				t.Errorf("filter volume mounts = %#v, want none", pod.Containers[0].VolumeMounts)
+			}
+			env := make(map[string]string)
+			for _, variable := range pod.Containers[0].Env {
+				env[variable.Name] = variable.Value
+			}
+			if got := env["OIDC_SERVICE_ACCOUNT"]; got != tc.wantName {
+				t.Errorf("OIDC_SERVICE_ACCOUNT = %q, want %q", got, tc.wantName)
+			}
+			if got := env["OIDC_SERVICE_ACCOUNT_UID"]; got != tc.wantUID {
+				t.Errorf("OIDC_SERVICE_ACCOUNT_UID = %q, want %q", got, tc.wantUID)
+			}
+			if _, found := env["OIDC_TOKEN_FILES"]; found {
+				t.Error("legacy OIDC_TOKEN_FILES env remains")
+			}
+		})
+	}
+}
 
 func TestLongBrokerGeneratedResourceNamesFitDNSLabelLimit(t *testing.T) {
 	broker := &eventingv1.Broker{ObjectMeta: metav1.ObjectMeta{

@@ -23,6 +23,7 @@ metadata:
 spec:
   broker: autoscale-broker-a
   subscriber:
+    audience: https://eventing-natss-e2e.example
     ref:
       apiVersion: v1
       kind: Service
@@ -39,6 +40,7 @@ metadata:
 spec:
   broker: autoscale-broker-b
   subscriber:
+    audience: https://eventing-natss-e2e.example
     ref:
       apiVersion: v1
       kind: Service

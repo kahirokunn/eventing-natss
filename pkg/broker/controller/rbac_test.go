@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -32,11 +33,29 @@ import (
 	kubefake "k8s.io/client-go/kubernetes/fake"
 	clienttesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/utils/ptr"
 
 	eventingv1 "knative.dev/eventing/pkg/apis/eventing/v1"
 	eventingfake "knative.dev/eventing/pkg/client/clientset/versioned/fake"
 	eventinglisters "knative.dev/eventing/pkg/client/listers/eventing/v1"
+
+	brokerconfig "knative.dev/eventing-natss/pkg/broker/config"
+	"knative.dev/eventing-natss/pkg/broker/controller/resources"
+	brokeroidc "knative.dev/eventing-natss/pkg/broker/oidc"
 )
+
+func assignServiceAccountUIDsOnCreate(t *testing.T, kube *kubefake.Clientset) {
+	t.Helper()
+	sequence := 0
+	kube.PrependReactor("create", "serviceaccounts", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		serviceAccount := action.(clienttesting.CreateAction).GetObject().(*corev1.ServiceAccount)
+		if serviceAccount.UID == "" {
+			sequence++
+			serviceAccount.UID = types.UID(fmt.Sprintf("%s-uid-%d", serviceAccount.Name, sequence))
+		}
+		return false, nil, nil
+	})
+}
 
 func TestDataplaneIdentityIsUIDStableAndDNS1123(t *testing.T) {
 	oldController := &Reconciler{filterServiceAccount: "old-filter-service-account-prefix"}
@@ -137,6 +156,193 @@ func TestReconcileDataplaneRBACRejectsForeignServiceAccount(t *testing.T) {
 		if action.GetVerb() == "create" || action.GetVerb() == "update" || action.GetVerb() == "patch" || action.GetVerb() == "delete" {
 			t.Errorf("foreign ServiceAccount reconcile performed %s %s", action.GetVerb(), action.GetResource().Resource)
 		}
+	}
+}
+
+func TestReconcileDataplaneRBACCreatesSharedOutboundOIDCIdentityAndExactBindings(t *testing.T) {
+	t.Setenv("SYSTEM_NAMESPACE", "knative-eventing")
+	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: testNamespace, UID: "namespace-uid"}}
+	kube := kubefake.NewSimpleClientset(namespace)
+	assignServiceAccountUIDsOnCreate(t, kube)
+	r := &Reconciler{kubeClientSet: kube}
+	brokers := []*eventingv1.Broker{
+		testBroker(testNamespace, "broker-a"),
+		testBroker(testNamespace, "broker-b"),
+	}
+	for _, broker := range brokers {
+		if err := r.reconcileDataplaneRBAC(testContext(), broker, true); err != nil {
+			t.Fatalf("reconcileDataplaneRBAC(%s) = %v", broker.Name, err)
+		}
+	}
+
+	delivery, err := kube.CoreV1().ServiceAccounts(testNamespace).Get(context.Background(), brokeroidc.DeliveryServiceAccountName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !brokeroidc.IsManagedDeliveryServiceAccount(delivery) {
+		t.Fatalf("shared delivery ServiceAccount is not safely namespace-owned: %#v", delivery)
+	}
+	if delivery.AutomountServiceAccountToken == nil || *delivery.AutomountServiceAccountToken {
+		t.Errorf("delivery automountServiceAccountToken = %v, want false", delivery.AutomountServiceAccountToken)
+	}
+
+	bindings, err := kube.RbacV1().RoleBindings(testNamespace).List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oidcBindings := 0
+	for _, binding := range bindings.Items {
+		if binding.RoleRef.Name != OIDCTokenCreatorClusterRoleName {
+			continue
+		}
+		oidcBindings++
+		if binding.RoleRef.Kind != "ClusterRole" || len(binding.Subjects) != 1 {
+			t.Errorf("OIDC binding %q shape = %#v", binding.Name, binding)
+			continue
+		}
+		if binding.Subjects[0].Name == brokeroidc.DeliveryServiceAccountName {
+			t.Errorf("OIDC binding %q grants the outbound identity permission to mint its own tokens", binding.Name)
+		}
+		if binding.Subjects[0].Namespace != testNamespace {
+			t.Errorf("OIDC binding %q subject namespace = %q", binding.Name, binding.Subjects[0].Namespace)
+		}
+	}
+	if oidcBindings != len(brokers) {
+		t.Errorf("OIDC TokenRequest bindings = %d, want one per Broker (%d)", oidcBindings, len(brokers))
+	}
+
+	if err := r.deleteDataplaneRBAC(testContext(), brokers[0]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := kube.CoreV1().ServiceAccounts(testNamespace).Get(context.Background(), brokeroidc.DeliveryServiceAccountName, metav1.GetOptions{}); err != nil {
+		t.Errorf("deleting one Broker removed shared outbound identity: %v", err)
+	}
+	secondBinding := systemRBACName(r.dataplaneIdentity(brokers[1]), "-oidc-token")
+	if _, err := kube.RbacV1().RoleBindings(testNamespace).Get(context.Background(), secondBinding, metav1.GetOptions{}); err != nil {
+		t.Errorf("deleting one Broker removed another Broker's OIDC binding: %v", err)
+	}
+}
+
+func TestReconcileDataplaneRBACRevokesOIDCBindingWhenNoAudience(t *testing.T) {
+	t.Setenv("SYSTEM_NAMESPACE", "knative-eventing")
+	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: testNamespace, UID: "namespace-uid"}}
+	kube := kubefake.NewSimpleClientset(namespace)
+	assignServiceAccountUIDsOnCreate(t, kube)
+	r := &Reconciler{kubeClientSet: kube}
+	broker := testBroker(testNamespace, testBrokerName)
+	if err := r.reconcileDataplaneRBAC(testContext(), broker, true); err != nil {
+		t.Fatal(err)
+	}
+	bindingName := systemRBACName(r.dataplaneIdentity(broker), "-oidc-token")
+	if _, err := kube.RbacV1().RoleBindings(testNamespace).Get(context.Background(), bindingName, metav1.GetOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.reconcileDataplaneRBAC(testContext(), broker, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := kube.RbacV1().RoleBindings(testNamespace).Get(context.Background(), bindingName, metav1.GetOptions{}); err == nil {
+		t.Error("OIDC TokenRequest binding remains after all OIDC audiences were removed")
+	}
+	if _, err := kube.CoreV1().ServiceAccounts(testNamespace).Get(context.Background(), brokeroidc.DeliveryServiceAccountName, metav1.GetOptions{}); err != nil {
+		t.Errorf("audience removal deleted shared outbound identity: %v", err)
+	}
+}
+
+func TestReconcileDataplaneRBACRejectsForeignSharedOIDCIdentity(t *testing.T) {
+	t.Setenv("SYSTEM_NAMESPACE", "knative-eventing")
+	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: testNamespace, UID: "namespace-uid"}}
+	foreign := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{
+		Name: brokeroidc.DeliveryServiceAccountName, Namespace: testNamespace,
+		Labels: map[string]string{brokeroidc.ManagedServiceAccountLabelKey: "foreign-manager"},
+	}}
+	kube := kubefake.NewSimpleClientset(namespace, foreign)
+	r := &Reconciler{kubeClientSet: kube}
+	broker := testBroker(testNamespace, testBrokerName)
+	if err := r.reconcileDataplaneRBAC(testContext(), broker, true); err == nil {
+		t.Fatal("reconcileDataplaneRBAC() accepted a foreign shared OIDC ServiceAccount")
+	}
+	got, err := kube.CoreV1().ServiceAccounts(testNamespace).Get(context.Background(), foreign.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got.Labels, foreign.Labels) || len(got.OwnerReferences) != 0 {
+		t.Errorf("foreign shared OIDC ServiceAccount was mutated: %#v", got)
+	}
+	bindingName := systemRBACName(r.dataplaneIdentity(broker), "-oidc-token")
+	if _, err := kube.RbacV1().RoleBindings(testNamespace).Get(context.Background(), bindingName, metav1.GetOptions{}); err == nil {
+		t.Error("OIDC binding was created despite foreign shared identity")
+	}
+}
+
+func TestReconcileDataplaneRBACCarriesValidatedOIDCUIDWithoutSecondGET(t *testing.T) {
+	t.Setenv("SYSTEM_NAMESPACE", "knative-eventing")
+	const oldUID = types.UID("validated-old-uid")
+	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: testNamespace, UID: "namespace-uid"}}
+	controller, blockOwnerDeletion := true, false
+	managed := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{
+		Name: brokeroidc.DeliveryServiceAccountName, Namespace: testNamespace, UID: oldUID,
+		Labels: map[string]string{brokeroidc.ManagedServiceAccountLabelKey: brokeroidc.ManagedServiceAccountLabel},
+		OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: "v1", Kind: "Namespace", Name: testNamespace, UID: namespace.UID,
+			Controller: &controller, BlockOwnerDeletion: &blockOwnerDeletion,
+		}},
+	}, AutomountServiceAccountToken: ptr.To(false)}
+	foreignReplacement := managed.DeepCopy()
+	foreignReplacement.UID = "foreign-recreated-uid"
+	foreignReplacement.Labels[brokeroidc.ManagedServiceAccountLabelKey] = "foreign-manager"
+
+	kube := kubefake.NewSimpleClientset(namespace, managed)
+	assignServiceAccountUIDsOnCreate(t, kube)
+	exactGets := 0
+	kube.PrependReactor("get", "serviceaccounts", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		get := action.(clienttesting.GetAction)
+		if get.GetName() != brokeroidc.DeliveryServiceAccountName {
+			return false, nil, nil
+		}
+		exactGets++
+		if exactGets == 1 {
+			return true, managed.DeepCopy(), nil
+		}
+		return true, foreignReplacement.DeepCopy(), nil
+	})
+
+	broker := testBroker(testNamespace, testBrokerName)
+	r := &Reconciler{
+		kubeClientSet: kube, deploymentLister: newDeploymentLister(),
+		filterImage: "filter:latest", natsURL: "nats://localhost:4222",
+	}
+	uid, err := r.reconcileDataplaneRBACWithOIDCIdentity(testContext(), broker, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uid != oldUID {
+		t.Fatalf("reconciled OIDC UID = %q, want captured validated UID %q", uid, oldUID)
+	}
+	if exactGets != 1 {
+		t.Fatalf("OIDC ServiceAccount GETs = %d, want one validated snapshot", exactGets)
+	}
+
+	policy := filterReplicaStatic
+	policy.oidcServiceAccountUID = uid
+	if err := r.reconcileFilterDeployment(testContext(), broker, "TEST_STREAM", brokerconfig.DefaultBrokerConfig(), policy); err != nil {
+		t.Fatal(err)
+	}
+	deployment, err := kube.AppsV1().Deployments(testNamespace).Get(context.Background(), resources.FilterName(broker.Name), metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	values := make(map[string]string)
+	for _, variable := range deployment.Spec.Template.Spec.Containers[0].Env {
+		values[variable.Name] = variable.Value
+	}
+	if got := values["OIDC_SERVICE_ACCOUNT_UID"]; got != string(oldUID) {
+		t.Errorf("Deployment OIDC_SERVICE_ACCOUNT_UID = %q, want captured %q", got, oldUID)
+	}
+	if got := values["OIDC_SERVICE_ACCOUNT_UID"]; got == string(foreignReplacement.UID) {
+		t.Errorf("Deployment adopted foreign replacement UID %q", got)
+	}
+	if exactGets != 1 {
+		t.Errorf("deployment path re-read the swappable singleton: GETs=%d", exactGets)
 	}
 }
 

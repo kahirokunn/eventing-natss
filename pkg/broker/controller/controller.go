@@ -22,9 +22,11 @@ import (
 
 	"github.com/kelseyhightower/envconfig"
 	"go.uber.org/zap"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
 
-	"k8s.io/apimachinery/pkg/types"
 	kubeclient "knative.dev/pkg/client/injection/kube/client"
 	"knative.dev/pkg/configmap"
 	"knative.dev/pkg/controller"
@@ -36,15 +38,18 @@ import (
 	eventingv1 "knative.dev/eventing/pkg/apis/eventing/v1"
 	eventingclient "knative.dev/eventing/pkg/client/injection/client"
 	"knative.dev/eventing/pkg/client/injection/reconciler/eventing/v1/broker"
+	eventinglisters "knative.dev/eventing/pkg/client/listers/eventing/v1"
 
 	brokerinformer "knative.dev/eventing/pkg/client/injection/informers/eventing/v1/broker"
 	triggerinformer "knative.dev/eventing/pkg/client/injection/informers/eventing/v1/trigger"
 	deploymentinformer "knative.dev/pkg/client/injection/kube/informers/apps/v1/deployment"
 	configmapinformer "knative.dev/pkg/client/injection/kube/informers/core/v1/configmap"
 	serviceinformer "knative.dev/pkg/client/injection/kube/informers/core/v1/service"
+	serviceaccountinformer "knative.dev/pkg/client/injection/kube/informers/core/v1/serviceaccount"
 
 	"knative.dev/eventing-natss/pkg/broker/constants"
 	"knative.dev/eventing-natss/pkg/broker/contract"
+	brokeroidc "knative.dev/eventing-natss/pkg/broker/oidc"
 	"knative.dev/eventing-natss/pkg/common/configloader/fsloader"
 	commonnats "knative.dev/eventing-natss/pkg/common/nats"
 )
@@ -128,6 +133,7 @@ func NewController(
 	triggerInformer := triggerinformer.Get(ctx)
 	deploymentInformer := deploymentinformer.Get(ctx)
 	serviceInformer := serviceinformer.Get(ctx)
+	serviceAccountInformer := serviceaccountinformer.Get(ctx)
 	configMapInformer := configmapinformer.Get(ctx)
 
 	// Create contract manager for shared ingress
@@ -198,9 +204,44 @@ func NewController(
 	// is added or removed — this is what creates/deletes the per-broker filter.
 	triggerInformer.Informer().AddEventHandler(controller.HandleAll(enqueueBrokerOfTrigger(impl.EnqueueKey)))
 
+	// A recreated namespace delivery identity has a new UID. Reconcile every
+	// Broker in that namespace so its filter Pod template drops cached tokens
+	// minted for the previous identity.
+	serviceAccountInformer.Informer().AddEventHandler(cache.FilteringResourceEventHandler{
+		FilterFunc: func(obj interface{}) bool {
+			if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+				obj = tombstone.Obj
+			}
+			serviceAccount, ok := obj.(*corev1.ServiceAccount)
+			return ok && serviceAccount.Name == brokeroidc.DeliveryServiceAccountName
+		},
+		Handler: controller.HandleAll(enqueueBrokersInNamespace(brokerInformer.Lister(), impl.EnqueueKey)),
+	})
+
 	logger.Info("NATS JetStream Broker controller initialized")
 
 	return impl
+}
+
+func enqueueBrokersInNamespace(lister eventinglisters.BrokerLister, enqueue func(types.NamespacedName)) func(obj interface{}) {
+	return func(obj interface{}) {
+		if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+			obj = tombstone.Obj
+		}
+		serviceAccount, ok := obj.(*corev1.ServiceAccount)
+		if !ok {
+			return
+		}
+		brokers, err := lister.Brokers(serviceAccount.Namespace).List(labels.Everything())
+		if err != nil {
+			return
+		}
+		for _, broker := range brokers {
+			if broker.Annotations[eventingv1.BrokerClassAnnotationKey] == constants.BrokerClassName {
+				enqueue(types.NamespacedName{Namespace: broker.Namespace, Name: broker.Name})
+			}
+		}
+	}
 }
 
 // enqueueBrokerOfTrigger returns a handler that enqueues the broker referenced

@@ -18,6 +18,7 @@ package filter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"sync"
@@ -25,6 +26,7 @@ import (
 
 	"go.uber.org/zap"
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/tools/cache"
 
 	duckv1 "knative.dev/pkg/apis/duck/v1"
@@ -36,6 +38,7 @@ import (
 	"knative.dev/eventing/pkg/kncloudevents"
 
 	"knative.dev/eventing-natss/pkg/broker/constants"
+	brokeroidc "knative.dev/eventing-natss/pkg/broker/oidc"
 	brokerutils "knative.dev/eventing-natss/pkg/broker/utils"
 )
 
@@ -51,6 +54,7 @@ type FilterReconciler struct {
 	consumerManager *ConsumerManager
 	brokerNamespace string
 	brokerName      string
+	enqueue         func(interface{})
 
 	// triggerUIDs maps "namespace/name" keys to trigger UIDs so that
 	// delete events (where the object is gone from the lister) can
@@ -91,7 +95,9 @@ func (r *FilterReconciler) Reconcile(ctx context.Context, key string) error {
 	if err != nil {
 		if apierrs.IsNotFound(err) {
 			// Trigger has been deleted — clean up subscription.
-			return r.deleteTrackedTrigger(key)
+			cleanupErr := r.deleteTrackedTrigger(key)
+			validationErr := r.refreshActiveOIDCAudienceState()
+			return errors.Join(cleanupErr, validationErr)
 		}
 		return fmt.Errorf("failed to get trigger: %w", err)
 	}
@@ -100,7 +106,9 @@ func (r *FilterReconciler) Reconcile(ctx context.Context, key string) error {
 		// spec.broker into a delete for the old Broker. By the time this key is
 		// reconciled, the shared lister already contains the new object, so
 		// ownership loss must be handled like deletion rather than skipped.
-		return r.deleteTrackedTrigger(key)
+		cleanupErr := r.deleteTrackedTrigger(key)
+		validationErr := r.refreshActiveOIDCAudienceState()
+		return errors.Join(cleanupErr, validationErr)
 	}
 
 	// A same-name Trigger can also be deleted and recreated before its queued
@@ -155,6 +163,9 @@ func (r *FilterReconciler) ReconcileTrigger(ctx context.Context, trigger *eventi
 		logger.Debugw("trigger belongs to another broker, skipping")
 		return nil
 	}
+	if err := r.refreshActiveOIDCAudienceState(); err != nil {
+		return err
+	}
 
 	// Get the broker
 	broker, err := r.brokerLister.Brokers(trigger.Namespace).Get(trigger.Spec.Broker)
@@ -172,20 +183,44 @@ func (r *FilterReconciler) ReconcileTrigger(ctx context.Context, trigger *eventi
 		return nil
 	}
 
-	// Check if broker is ready
+	// Status is the credential authority consumed by this process. Never keep a
+	// subscription while it belongs to an older generation or is unresolved.
+	subscriber, deadLetterSink, destinationsResolved := resolvedTriggerDestinations(trigger)
 	if !broker.IsReady() {
-		logger.Debugw("broker is not ready, skipping trigger")
+		if destinationsResolved && r.consumerManager != nil && r.consumerManager.hasDestinationTokenFailure(string(trigger.UID)) {
+			if err := r.consumerManager.validateDestinationTokens(ctx, string(trigger.UID), subscriber, deadLetterSink); err != nil {
+				return err
+			}
+			r.consumerManager.markDestinationTokensValidated(string(trigger.UID), trigger.Generation)
+			return nil
+		}
+		logger.Debugw("broker is not ready, stopping trigger subscription")
+		if err := r.stopSubscriptionPreservingTokenFailure(string(trigger.UID)); err != nil {
+			return err
+		}
+		if r.consumerManager == nil {
+			return nil
+		}
+		if !destinationsResolved {
+			r.consumerManager.clearDestinationTokenFailures(string(trigger.UID))
+			return nil
+		}
+		// A token issuance failure makes this Pod unready, which in turn makes
+		// the Broker unready. Keep checking the already current, resolved status
+		// while stopped so credential recovery can break that dependency cycle.
+		if err := r.consumerManager.validateDestinationTokens(ctx, string(trigger.UID), subscriber, deadLetterSink); err != nil {
+			return err
+		}
+		r.consumerManager.markDestinationTokensValidated(string(trigger.UID), trigger.Generation)
 		return nil
 	}
-
-	// Check if trigger is ready
-	if trigger.Status.SubscriberURI == nil {
-		logger.Debugw("trigger subscriber URI not resolved yet, skipping")
-		return nil
+	if !destinationsResolved || !trigger.Status.IsReady() {
+		logger.Debugw("trigger subscriber is not currently resolved, stopping subscription")
+		if r.consumerManager != nil {
+			r.consumerManager.clearDestinationTokenValidation(string(trigger.UID))
+		}
+		return r.stopSubscription(string(trigger.UID))
 	}
-
-	// Build subscriber addressable from trigger status
-	subscriber := duckv1.Addressable{URL: trigger.Status.SubscriberURI}
 
 	// Get broker ingress URL for reply events
 	var brokerIngressURL *duckv1.Addressable
@@ -193,17 +228,16 @@ func (r *FilterReconciler) ReconcileTrigger(ctx context.Context, trigger *eventi
 		brokerIngressURL = &duckv1.Addressable{URL: broker.Status.Address.URL.DeepCopy()}
 	}
 
-	// Get dead letter sink if configured. Carry the CA certs and OIDC audience
-	// resolved into the trigger status so delivery to a TLS/OIDC-protected sink
-	// works, not just the URL.
-	var deadLetterSink *duckv1.Addressable
-	if trigger.Status.DeadLetterSinkURI != nil {
-		deadLetterSink = &duckv1.Addressable{
-			URL:      trigger.Status.DeadLetterSinkURI.DeepCopy(),
-			CACerts:  trigger.Status.DeadLetterSinkCACerts,
-			Audience: trigger.Status.DeadLetterSinkAudience,
-		}
+	if (nonEmptyAudience(subscriber.Audience) || (deadLetterSink != nil && nonEmptyAudience(deadLetterSink.Audience))) &&
+		(trigger.Status.Auth == nil || trigger.Status.Auth.ServiceAccountName == nil || *trigger.Status.Auth.ServiceAccountName != brokeroidc.DeliveryServiceAccountName) {
+		logger.Debugw("trigger OIDC identity is not current, stopping subscription")
+		return r.stopSubscription(string(trigger.UID))
 	}
+	if err := r.consumerManager.validateDestinationTokens(ctx, string(trigger.UID), subscriber, deadLetterSink); err != nil {
+		_ = r.stopSubscriptionPreservingTokenFailure(string(trigger.UID))
+		return err
+	}
+	r.consumerManager.markDestinationTokensValidated(string(trigger.UID), trigger.Generation)
 
 	// Build retry config from the effective delivery spec (trigger overrides broker).
 	var retryConfig *kncloudevents.RetryConfig
@@ -247,6 +281,85 @@ func (r *FilterReconciler) ReconcileTrigger(ctx context.Context, trigger *eventi
 	}
 
 	return nil
+}
+
+func (r *FilterReconciler) validateActiveOIDCAudiences() error {
+	triggers, err := r.triggerLister.Triggers(r.brokerNamespace).List(labels.Everything())
+	if err != nil {
+		return fmt.Errorf("list Triggers for OIDC validation: %w", err)
+	}
+	owned := make([]*eventingv1.Trigger, 0, len(triggers))
+	for _, trigger := range triggers {
+		if trigger.Spec.Broker == r.brokerName {
+			owned = append(owned, trigger)
+		}
+	}
+	if _, err := brokeroidc.AudiencesFromTriggers(owned); err != nil {
+		return fmt.Errorf("invalid active OIDC audience set: %w", err)
+	}
+	return nil
+}
+
+func (r *FilterReconciler) refreshActiveOIDCAudienceState() error {
+	err := r.validateActiveOIDCAudiences()
+	if r.consumerManager != nil {
+		becameValid := r.consumerManager.setAudienceConfigurationValid(err == nil)
+		if becameValid && r.enqueue != nil {
+			triggers, listErr := r.triggerLister.Triggers(r.brokerNamespace).List(labels.Everything())
+			if listErr != nil {
+				return errors.Join(err, fmt.Errorf("list Triggers after OIDC audience recovery: %w", listErr))
+			}
+			for _, trigger := range triggers {
+				if r.ownsTrigger(trigger) {
+					r.enqueue(trigger)
+				}
+			}
+		}
+	}
+	return err
+}
+
+func nonEmptyAudience(audience *string) bool {
+	return audience != nil && *audience != ""
+}
+
+func resolvedTriggerDestinations(trigger *eventingv1.Trigger) (duckv1.Addressable, *duckv1.Addressable, bool) {
+	subscriberResolved := trigger.Status.GetCondition(eventingv1.TriggerConditionSubscriberResolved)
+	deadLetterResolved := trigger.Status.GetCondition(eventingv1.TriggerConditionDeadLetterSinkResolved)
+	if trigger.Status.ObservedGeneration != trigger.Generation ||
+		subscriberResolved == nil || !subscriberResolved.IsTrue() ||
+		deadLetterResolved == nil || !deadLetterResolved.IsTrue() ||
+		trigger.Status.SubscriberURI == nil {
+		return duckv1.Addressable{}, nil, false
+	}
+	subscriber := duckv1.Addressable{
+		URL:      trigger.Status.SubscriberURI.DeepCopy(),
+		CACerts:  trigger.Status.SubscriberCACerts,
+		Audience: trigger.Status.SubscriberAudience,
+	}
+	var deadLetterSink *duckv1.Addressable
+	if trigger.Status.DeadLetterSinkURI != nil {
+		deadLetterSink = &duckv1.Addressable{
+			URL:      trigger.Status.DeadLetterSinkURI.DeepCopy(),
+			CACerts:  trigger.Status.DeadLetterSinkCACerts,
+			Audience: trigger.Status.DeadLetterSinkAudience,
+		}
+	}
+	return subscriber, deadLetterSink, true
+}
+
+func (r *FilterReconciler) stopSubscription(triggerUID string) error {
+	if r.consumerManager == nil {
+		return nil
+	}
+	return r.consumerManager.UnsubscribeTrigger(triggerUID)
+}
+
+func (r *FilterReconciler) stopSubscriptionPreservingTokenFailure(triggerUID string) error {
+	if r.consumerManager == nil {
+		return nil
+	}
+	return r.consumerManager.unsubscribeTrigger(triggerUID, false)
 }
 
 func (r *FilterReconciler) ownsTrigger(trigger *eventingv1.Trigger) bool {

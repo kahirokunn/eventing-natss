@@ -153,6 +153,14 @@ rules:
       - update
       - patch
       - delete
+  # Resolve the UID of each namespace before creating its shared OIDC delivery
+  # ServiceAccount with a namespace owner reference.
+  - apiGroups:
+      - ""
+    resources:
+      - namespaces
+    verbs:
+      - get
   # Manage per-Broker bindings in user namespaces.
   - apiGroups:
       - rbac.authorization.k8s.io
@@ -166,7 +174,8 @@ rules:
       - update
       - patch
       - delete
-  # Bind only the namespaced filter reader ClusterRole.
+  # Bind only the namespaced filter reader and exact-name OIDC TokenRequest
+  # ClusterRoles.
   # The `bind` verb allows creating bindings to this specific role without the
   # controller needing to hold every permission the role contains (prevents escalation).
   - apiGroups:
@@ -175,5 +184,6 @@ rules:
       - clusterroles
     resourceNames:
       - natsjetstream-broker-filter-reader
+      - natsjetstream-broker-oidc-token-creator
     verbs:
       - bind

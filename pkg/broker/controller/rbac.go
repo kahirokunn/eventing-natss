@@ -28,8 +28,10 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/retry"
+	"k8s.io/utils/ptr"
 
 	kncontroller "knative.dev/pkg/controller"
 	"knative.dev/pkg/kmeta"
@@ -39,6 +41,8 @@ import (
 
 	eventingv1 "knative.dev/eventing/pkg/apis/eventing/v1"
 
+	brokeroidc "knative.dev/eventing-natss/pkg/broker/oidc"
+	brokerutils "knative.dev/eventing-natss/pkg/broker/utils"
 	commonnats "knative.dev/eventing-natss/pkg/common/nats"
 )
 
@@ -50,11 +54,10 @@ const (
 	brokerNamespaceAnnotation    = "nats.eventing.knative.dev/broker-namespace"
 	brokerNameAnnotation         = "nats.eventing.knative.dev/broker-name"
 	brokerUIDAnnotation          = "nats.eventing.knative.dev/broker-uid"
-	filterServiceAccountBase     = "natsjs-filter"
 )
 
 func (r *Reconciler) dataplaneIdentity(b *eventingv1.Broker) string {
-	return kmeta.ChildName(fmt.Sprintf("%s-%s-%s-%s", filterServiceAccountBase, b.Namespace, b.Name, b.UID), "")
+	return brokerutils.FilterServiceAccountName(b)
 }
 
 func systemRBACName(identity, suffix string) string {
@@ -113,11 +116,17 @@ func (r *Reconciler) natsSecretNames() ([]string, error) {
 
 // reconcileDataplaneRBAC grants one filter only the objects required by its
 // namespace-scoped informers and its configured system-namespace credentials.
-func (r *Reconciler) reconcileDataplaneRBAC(ctx context.Context, b *eventingv1.Broker) pkgreconciler.Event {
+func (r *Reconciler) reconcileDataplaneRBAC(ctx context.Context, b *eventingv1.Broker, oidcRequested ...bool) pkgreconciler.Event {
+	_, err := r.reconcileDataplaneRBACWithOIDCIdentity(ctx, b, oidcRequested...)
+	return err
+}
+
+func (r *Reconciler) reconcileDataplaneRBACWithOIDCIdentity(ctx context.Context, b *eventingv1.Broker, oidcRequested ...bool) (types.UID, error) {
 	identity := r.dataplaneIdentity(b)
+	enableOIDC := len(oidcRequested) > 0 && oidcRequested[0]
 	secretNames, err := r.natsSecretNames()
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	sa := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{
@@ -126,7 +135,7 @@ func (r *Reconciler) reconcileDataplaneRBAC(ctx context.Context, b *eventingv1.B
 		OwnerReferences: brokerOwnerReference(b),
 	}}
 	if err := r.reconcileServiceAccount(ctx, b, sa); err != nil {
-		return err
+		return "", err
 	}
 
 	subjects := []rbacv1.Subject{{Kind: rbacv1.ServiceAccountKind, Name: identity, Namespace: b.Namespace}}
@@ -140,7 +149,38 @@ func (r *Reconciler) reconcileDataplaneRBAC(ctx context.Context, b *eventingv1.B
 		RoleRef:  rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: FilterReaderClusterRoleName},
 	}
 	if err := r.reconcileRoleBinding(ctx, b, tenantBinding, true); err != nil {
-		return err
+		return "", err
+	}
+	oidcBindingName := systemRBACName(identity, "-oidc-token")
+	var oidcIdentityUID types.UID
+	if !enableOIDC {
+		if err := r.deleteManagedRoleBinding(ctx, b, b.Namespace, oidcBindingName, true); err != nil {
+			return "", err
+		}
+	} else {
+		oidcIdentityUID, err = r.reconcileOIDCServiceAccount(ctx, b.Namespace)
+		if err != nil {
+			return "", err
+		}
+		if oidcIdentityUID == "" {
+			return "", fmt.Errorf("OIDC delivery service account has no UID")
+		}
+		oidcBinding := &rbacv1.RoleBinding{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: oidcBindingName, Namespace: b.Namespace,
+				Labels:          map[string]string{managedByLabelKey: managedByLabelValue},
+				OwnerReferences: brokerOwnerReference(b),
+			},
+			Subjects: subjects,
+			RoleRef: rbacv1.RoleRef{
+				APIGroup: rbacv1.GroupName,
+				Kind:     "ClusterRole",
+				Name:     OIDCTokenCreatorClusterRoleName,
+			},
+		}
+		if err := r.reconcileRoleBinding(ctx, b, oidcBinding, true); err != nil {
+			return "", err
+		}
 	}
 
 	labels, annotations := managedMetadata(b)
@@ -153,22 +193,86 @@ func (r *Reconciler) reconcileDataplaneRBAC(ctx context.Context, b *eventingv1.B
 		RoleRef:  rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: eventingConfigReaderRoleName},
 	}
 	if err := r.reconcileRoleBinding(ctx, b, configBinding, false); err != nil {
-		return err
+		return "", err
 	}
 
 	if err := r.reconcileNATSSecretRole(ctx, secretNames); err != nil {
-		return err
+		return "", err
 	}
 	secretName := systemRBACName(identity, "-secrets")
 	if len(secretNames) == 0 {
-		return r.deleteManagedRoleBinding(ctx, b, system.Namespace(), secretName, false)
+		return oidcIdentityUID, r.deleteManagedRoleBinding(ctx, b, system.Namespace(), secretName, false)
 	}
 	secretBinding := &rbacv1.RoleBinding{
 		ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: system.Namespace(), Labels: labels, Annotations: annotations},
 		Subjects:   subjects,
 		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: natsSecretRoleName},
 	}
-	return r.reconcileRoleBinding(ctx, b, secretBinding, false)
+	return oidcIdentityUID, r.reconcileRoleBinding(ctx, b, secretBinding, false)
+}
+
+// reconcileOIDCServiceAccount creates one namespace-scoped delivery identity.
+// It is deliberately separate from the operational filter ServiceAccounts and
+// receives no operator-managed RoleBinding. Multiple Brokers in a namespace
+// share it, so it follows the Namespace lifecycle instead of any one Broker.
+func (r *Reconciler) reconcileOIDCServiceAccount(ctx context.Context, namespace string) (types.UID, error) {
+	namespaceObject, err := r.kubeClientSet.CoreV1().Namespaces().Get(ctx, namespace, metav1.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("get namespace for OIDC delivery identity: %w", err)
+	}
+	if namespaceObject.UID == "" {
+		return "", fmt.Errorf("namespace %s has no UID", namespace)
+	}
+	controller := true
+	blockOwnerDeletion := false
+	ownerReferences := []metav1.OwnerReference{{
+		APIVersion:         "v1",
+		Kind:               "Namespace",
+		Name:               namespaceObject.Name,
+		UID:                namespaceObject.UID,
+		Controller:         &controller,
+		BlockOwnerDeletion: &blockOwnerDeletion,
+	}}
+	client := r.kubeClientSet.CoreV1().ServiceAccounts(namespace)
+	expected := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{
+		Name:      brokeroidc.DeliveryServiceAccountName,
+		Namespace: namespace,
+		Labels: map[string]string{
+			brokeroidc.ManagedServiceAccountLabelKey: brokeroidc.ManagedServiceAccountLabel,
+		},
+		OwnerReferences: ownerReferences,
+	}, AutomountServiceAccountToken: ptr.To(false)}
+	var reconciledUID types.UID
+	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		existing, err := client.Get(ctx, expected.Name, metav1.GetOptions{})
+		if apierrs.IsNotFound(err) {
+			created, createErr := client.Create(ctx, expected, metav1.CreateOptions{})
+			err = createErr
+			if apierrs.IsAlreadyExists(err) {
+				return apierrs.NewConflict(corev1.Resource("serviceaccounts"), expected.Name, err)
+			}
+			if err == nil {
+				reconciledUID = created.UID
+			}
+			return err
+		}
+		if err != nil {
+			return err
+		}
+		if existing.Labels[brokeroidc.ManagedServiceAccountLabelKey] != brokeroidc.ManagedServiceAccountLabel ||
+			!equality.Semantic.DeepEqual(existing.OwnerReferences, ownerReferences) {
+			return fmt.Errorf("OIDC delivery service account %s/%s is not owned by Namespace UID %s", namespace, expected.Name, namespaceObject.UID)
+		}
+		reconciledUID = existing.UID
+		if existing.AutomountServiceAccountToken != nil && !*existing.AutomountServiceAccountToken {
+			return nil
+		}
+		updated := existing.DeepCopy()
+		updated.AutomountServiceAccountToken = ptr.To(false)
+		_, err = client.Update(ctx, updated, metav1.UpdateOptions{})
+		return err
+	})
+	return reconciledUID, err
 }
 
 func (r *Reconciler) reconcileServiceAccount(ctx context.Context, b *eventingv1.Broker, expected *corev1.ServiceAccount) error {
@@ -263,6 +367,9 @@ func (r *Reconciler) reconcileNATSSecretRole(ctx context.Context, secretNames []
 // account. UID checks prevent a stale finalizer from deleting replacement RBAC.
 func (r *Reconciler) deleteDataplaneRBAC(ctx context.Context, b *eventingv1.Broker) error {
 	identity := r.dataplaneIdentity(b)
+	if err := r.deleteManagedRoleBinding(ctx, b, b.Namespace, systemRBACName(identity, "-oidc-token"), true); err != nil {
+		return err
+	}
 	secretName := systemRBACName(identity, "-secrets")
 	if err := r.deleteManagedRoleBinding(ctx, b, system.Namespace(), secretName, false); err != nil {
 		return err

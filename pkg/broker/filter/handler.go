@@ -20,8 +20,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -43,6 +45,7 @@ import (
 	duckv1 "knative.dev/pkg/apis/duck/v1"
 	"knative.dev/pkg/logging"
 
+	brokeroidc "knative.dev/eventing-natss/pkg/broker/oidc"
 	jsutils "knative.dev/eventing-natss/pkg/channel/jetstream/utils"
 	"knative.dev/eventing-natss/pkg/tracing"
 	eventingduckv1 "knative.dev/eventing/pkg/apis/duck/v1"
@@ -57,6 +60,10 @@ import (
 var retryMax int32 = 3
 var retryTimeout = "PT1S"
 var retryBackoffDelay = "PT0.5S"
+
+var ErrOIDCTokenUnavailable = errors.New("OIDC token is unavailable")
+
+type audienceTokenSource func(context.Context, string) (string, error)
 
 // TypeExtractorTransformer extracts the CloudEvent type from a message.
 // Copied from channel/jetstream/dispatcher to avoid importing that package
@@ -100,6 +107,13 @@ type TriggerHandler struct {
 	tracer           trace.Tracer
 	dispatchDuration metric.Float64Histogram
 	processDuration  metric.Float64Histogram
+	tokenSource      audienceTokenSource
+}
+
+// setAudienceTokenSource keeps the public constructor compatible while
+// allowing the runtime to inject its context-aware TokenRequest source.
+func (h *TriggerHandler) setAudienceTokenSource(source func(context.Context, string) (string, error)) {
+	h.tokenSource = source
 }
 
 type handlerConfig struct {
@@ -355,13 +369,13 @@ func (h *TriggerHandler) doHandle(ctx context.Context, msg *nats.Msg) {
 		span.SetStatus(codes.Error, err.Error())
 		logger.Errorw("failed to dispatch event",
 			zap.Error(err),
-			zap.Int("response_code", dispatchInfo.ResponseCode),
+			zap.Int("response_code", dispatchResponseCode(dispatchInfo)),
 		)
 		return
 	}
 
 	logger.Debugw("event dispatched successfully",
-		zap.Int("response_code", dispatchInfo.ResponseCode),
+		zap.Int("response_code", dispatchResponseCode(dispatchInfo)),
 	)
 }
 
@@ -370,6 +384,10 @@ func (h *TriggerHandler) dispatchEvent(ctx context.Context, event *cloudevents.E
 	logger := logging.FromContext(ctx)
 
 	additionalHeaders := tracing.ConvertEventToHttpHeader(event)
+	subscriberHeaders, authErr := h.headersForDestination(ctx, config.subscriber, additionalHeaders)
+	if authErr != nil {
+		return &kncloudevents.DispatchInfo{}, authErr
+	}
 	te := TypeExtractorTransformer("")
 
 	// Get retry number from message metadata
@@ -387,7 +405,7 @@ func (h *TriggerHandler) dispatchEvent(ctx context.Context, event *cloudevents.E
 
 	// Dispatch the message to trigger's destination
 	dispatchInfo, err := h.dispatcher.SendEvent(ctx, *event, config.subscriber,
-		kncloudevents.WithHeader(additionalHeaders),
+		kncloudevents.WithHeader(subscriberHeaders),
 		kncloudevents.WithTransformers(&te),
 		kncloudevents.WithRetryConfig(config.noRetryConfig),
 	)
@@ -409,12 +427,19 @@ func (h *TriggerHandler) dispatchEvent(ctx context.Context, event *cloudevents.E
 	if eventProcessingDeadlineExceeded(err) {
 		return dispatchInfo, err
 	}
+	if errors.Is(err, ErrOIDCTokenUnavailable) {
+		return dispatchInfo, err
+	}
+	if dispatchInfo == nil {
+		dispatchInfo = &kncloudevents.DispatchInfo{}
+	}
 
 	result := determineNatsResult(dispatchInfo.ResponseCode, err)
 
 	// Extract pass-through headers (tracing, knative-*, x-b3-*, etc.) from
 	// the subscriber's response so they are available in every code path.
 	responseHeaders := eventingutils.PassThroughHeaders(dispatchInfo.ResponseHeader)
+	responseHeaders.Del("Authorization")
 
 	// Decorate the active span with the delivery attempt. The span was started
 	// in doHandle; SpanFromContext returns the same one. Per-branch nats.result
@@ -441,7 +466,7 @@ func (h *TriggerHandler) dispatchEvent(ctx context.Context, event *cloudevents.E
 				if replyErr != nil {
 					logger.Errorw("failed to send reply to broker ingress",
 						zap.Error(replyErr),
-						zap.Int("response_code", replyDispatchInfo.ResponseCode),
+						zap.Int("response_code", dispatchResponseCode(replyDispatchInfo)),
 					)
 				}
 			}
@@ -452,16 +477,20 @@ func (h *TriggerHandler) dispatchEvent(ctx context.Context, event *cloudevents.E
 	case protocol.IsNACK(result):
 		if lastTry {
 			if config.deadLetterSink != nil {
+				dlsHeaders, authErr := h.headersForDestination(ctx, *config.deadLetterSink, additionalHeaders)
+				if authErr != nil {
+					return dispatchInfo, authErr
+				}
 				// Send to dead letter sink
 				dlsDispatchInfo, dlsErr := h.dispatcher.SendEvent(ctx, *event, *config.deadLetterSink,
 					kncloudevents.WithRetryConfig(&defaultRetry),
-					kncloudevents.WithHeader(additionalHeaders),
+					kncloudevents.WithHeader(dlsHeaders),
 					kncloudevents.WithTransformers(&te),
 				)
 				if dlsErr != nil {
 					logger.Errorw("failed to send to dead letter sink",
 						zap.Error(dlsErr),
-						zap.Int("response_code", dlsDispatchInfo.ResponseCode),
+						zap.Int("response_code", dispatchResponseCode(dlsDispatchInfo)),
 					)
 				}
 				span.SetAttributes(attribute.String("nats.result", "ack_after_dls"))
@@ -484,16 +513,20 @@ func (h *TriggerHandler) dispatchEvent(ctx context.Context, event *cloudevents.E
 	default:
 		// Terminate - non-retriable error
 		if lastTry && config.deadLetterSink != nil {
+			dlsHeaders, authErr := h.headersForDestination(ctx, *config.deadLetterSink, additionalHeaders)
+			if authErr != nil {
+				return dispatchInfo, authErr
+			}
 			// Send to dead letter sink
 			dlsDispatchInfo, dlsErr := h.dispatcher.SendEvent(ctx, *event, *config.deadLetterSink,
 				kncloudevents.WithRetryConfig(&defaultRetry),
-				kncloudevents.WithHeader(additionalHeaders),
+				kncloudevents.WithHeader(dlsHeaders),
 				kncloudevents.WithTransformers(&te),
 			)
 			if dlsErr != nil {
 				logger.Errorw("failed to send to dead letter sink",
 					zap.Error(dlsErr),
-					zap.Int("response_code", dlsDispatchInfo.ResponseCode),
+					zap.Int("response_code", dispatchResponseCode(dlsDispatchInfo)),
 				)
 			}
 			span.SetAttributes(attribute.String("nats.result", "term_after_dls"))
@@ -507,6 +540,40 @@ func (h *TriggerHandler) dispatchEvent(ctx context.Context, event *cloudevents.E
 	}
 
 	return dispatchInfo, err
+}
+
+func (h *TriggerHandler) headersForDestination(ctx context.Context, destination duckv1.Addressable, base http.Header) (http.Header, error) {
+	headers := base.Clone()
+	if headers == nil {
+		headers = make(http.Header)
+	}
+	if destination.Audience == nil || *destination.Audience == "" {
+		headers.Del("Authorization")
+		return headers, nil
+	}
+	if h.tokenSource == nil {
+		return nil, fmt.Errorf("%w (%s)", ErrOIDCTokenUnavailable, brokeroidc.AudienceKey(*destination.Audience))
+	}
+	token, err := h.tokenSource(ctx, *destination.Audience)
+	token = strings.TrimSpace(token)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w (%s)", ErrOIDCTokenUnavailable, brokeroidc.AudienceKey(*destination.Audience))
+	}
+	if token == "" {
+		return nil, fmt.Errorf("%w (%s)", ErrOIDCTokenUnavailable, brokeroidc.AudienceKey(*destination.Audience))
+	}
+	headers.Set("Authorization", "Bearer "+token)
+	return headers, nil
+}
+
+func dispatchResponseCode(info *kncloudevents.DispatchInfo) int {
+	if info == nil {
+		return 0
+	}
+	return info.ResponseCode
 }
 
 func eventProcessingDeadlineExceeded(err error) bool {

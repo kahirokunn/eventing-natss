@@ -24,19 +24,25 @@ import (
 
 	"github.com/nats-io/nats.go"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	corev1listers "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/ptr"
 
 	"knative.dev/pkg/apis"
 	duckv1 "knative.dev/pkg/apis/duck/v1"
 	"knative.dev/pkg/controller"
 	"knative.dev/pkg/logging"
 	logtesting "knative.dev/pkg/logging/testing"
+	"knative.dev/pkg/resolver"
 
 	eventingduckv1 "knative.dev/eventing/pkg/apis/duck/v1"
 	eventingv1 "knative.dev/eventing/pkg/apis/eventing/v1"
 
 	"knative.dev/eventing-natss/pkg/broker/constants"
+	brokeroidc "knative.dev/eventing-natss/pkg/broker/oidc"
 )
 
 const (
@@ -263,10 +269,36 @@ var _ nats.JetStreamContext = (*mockJetStreamContext)(nil)
 
 func newReconcilerForTest(brokerLister *fakeBrokerLister, js nats.JetStreamContext) *Reconciler {
 	return &Reconciler{
-		brokerLister:      brokerLister,
-		js:                js,
-		filterServiceName: testFilterServiceName,
+		brokerLister:         brokerLister,
+		serviceAccountLister: newServiceAccountListerForTest(),
+		js:                   js,
+		filterServiceName:    testFilterServiceName,
 	}
+}
+
+func newServiceAccountListerForTest(accounts ...*corev1.ServiceAccount) corev1listers.ServiceAccountLister {
+	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
+	for _, account := range accounts {
+		if err := indexer.Add(account); err != nil {
+			panic(err)
+		}
+	}
+	return corev1listers.NewServiceAccountLister(indexer)
+}
+
+func managedOIDCServiceAccountForTest(broker *eventingv1.Broker) *corev1.ServiceAccount {
+	controller, blockOwnerDeletion := true, false
+	return &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{
+		Namespace: broker.Namespace,
+		Name:      brokeroidc.DeliveryServiceAccountName,
+		Labels: map[string]string{
+			brokeroidc.ManagedServiceAccountLabelKey: brokeroidc.ManagedServiceAccountLabel,
+		},
+		OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: "v1", Kind: "Namespace", Name: broker.Namespace, UID: "namespace-uid",
+			Controller: &controller, BlockOwnerDeletion: &blockOwnerDeletion,
+		}},
+	}, AutomountServiceAccountToken: ptr.To(false)}
 }
 
 func newReadyBroker(namespace, name string) *eventingv1.Broker {
@@ -280,6 +312,17 @@ func newReadyBroker(namespace, name string) *eventingv1.Broker {
 		},
 	})
 	return broker
+}
+
+func makeBrokerCurrentAndReady(broker *eventingv1.Broker) {
+	broker.Generation = 1
+	broker.Status.ObservedGeneration = 1
+	manager := broker.GetConditionSet().Manage(&broker.Status)
+	manager.MarkTrue(eventingv1.BrokerConditionIngress)
+	manager.MarkTrue(eventingv1.BrokerConditionTriggerChannel)
+	manager.MarkTrue(eventingv1.BrokerConditionFilter)
+	manager.MarkTrue(eventingv1.BrokerConditionDeadLetterSinkResolved)
+	manager.MarkTrue(eventingv1.BrokerConditionEventPoliciesReady)
 }
 
 func newTriggerWithSubscriber(namespace, name, brokerName string, subscriberURI string) *eventingv1.Trigger {
@@ -371,6 +414,180 @@ func TestReconcileKind_BrokerNotReady(t *testing.T) {
 	cond := trigger.Status.GetCondition(eventingv1.TriggerConditionBroker)
 	if cond == nil || cond.Status != corev1.ConditionFalse {
 		t.Errorf("Expected TriggerConditionBroker to be False, got %+v", cond)
+	}
+	if trigger.Status.SubscriberURI == nil {
+		t.Fatal("Broker NotReady SubscriberURI is nil")
+	}
+	if got := trigger.Status.SubscriberURI.Host; got != "subscriber.example.com" {
+		t.Errorf("Broker NotReady subscriber status = %#v, want freshly resolved subscriber.example.com", trigger.Status.SubscriberURI)
+	}
+	if condition := trigger.Status.GetCondition(eventingv1.TriggerConditionSubscriberResolved); condition == nil || !condition.IsTrue() {
+		t.Errorf("Broker NotReady SubscriberResolved = %#v, want true", condition)
+	}
+	if condition := trigger.Status.GetCondition(eventingv1.TriggerConditionDeadLetterSinkResolved); condition == nil || !condition.IsTrue() {
+		t.Errorf("Broker NotReady DeadLetterSinkResolved = %#v, want true/not configured", condition)
+	}
+	if len(js.consumers) != 0 {
+		t.Errorf("Broker NotReady created a JetStream consumer: %#v", js.consumers)
+	}
+}
+
+func TestReconcileKind_BrokerNotReadyRefreshesChangedOIDCAudienceWithoutConsumer(t *testing.T) {
+	ctx := testContextWithRecorder(t)
+	brokerLister := newFakeBrokerLister()
+	broker := newTestBroker(testNamespace, testBrokerName, constants.BrokerClassName)
+	broker.Status.InitializeConditions()
+	brokerLister.addBroker(broker)
+	js := newMockJetStreamContext()
+	r := newReconcilerForTest(brokerLister, js)
+	r.serviceAccountLister = newServiceAccountListerForTest(managedOIDCServiceAccountForTest(broker))
+	r.uriResolver = new(resolver.URIResolver)
+
+	trigger := newTriggerWithSubscriber(testNamespace, testTriggerName, testBrokerName, "subscriber.example.com")
+	oldAudience := "https://old-audience.example"
+	newAudience := "https://new-audience.example"
+	trigger.Status.SubscriberAudience = &oldAudience
+	trigger.Spec.Subscriber.Audience = &newAudience
+
+	if err := r.ReconcileKind(ctx, trigger); err != nil {
+		t.Fatal(err)
+	}
+	if trigger.Status.SubscriberAudience == nil || *trigger.Status.SubscriberAudience != newAudience {
+		t.Errorf("Broker NotReady subscriber audience = %v, want current %q", trigger.Status.SubscriberAudience, newAudience)
+	}
+	if trigger.Status.Auth == nil || trigger.Status.Auth.ServiceAccountName == nil || *trigger.Status.Auth.ServiceAccountName != brokeroidc.DeliveryServiceAccountName {
+		t.Errorf("Broker NotReady Auth = %#v, want outbound service account %q", trigger.Status.Auth, brokeroidc.DeliveryServiceAccountName)
+	}
+	if condition := trigger.Status.GetCondition(eventingv1.TriggerConditionOIDCIdentityCreated); condition == nil || !condition.IsTrue() {
+		t.Errorf("Broker NotReady OIDCIdentityCreated = %#v, want true", condition)
+	}
+	if len(js.consumers) != 0 {
+		t.Errorf("Broker NotReady audience refresh created a JetStream consumer: %#v", js.consumers)
+	}
+}
+
+func TestReconcileKind_PreservesSubscriberAddressableStatus(t *testing.T) {
+	ctx := testContextWithRecorder(t)
+	brokerLister := newFakeBrokerLister()
+	js := newMockJetStreamContext()
+
+	broker := newReadyBroker(testNamespace, testBrokerName)
+	makeBrokerCurrentAndReady(broker)
+	brokerLister.addBroker(broker)
+
+	trigger := newTriggerWithSubscriber(testNamespace, testTriggerName, testBrokerName, "subscriber.example.com")
+	subscriberCACerts := "subscriber-ca"
+	subscriberAudience := "subscriber-audience"
+	trigger.Spec.Subscriber.CACerts = &subscriberCACerts
+	trigger.Spec.Subscriber.Audience = &subscriberAudience
+
+	r := newReconcilerForTest(brokerLister, js)
+	r.serviceAccountLister = newServiceAccountListerForTest(managedOIDCServiceAccountForTest(broker))
+	// A zero URIResolver is sufficient for an absolute URI Destination; no
+	// informer or tracker is consulted on this path.
+	r.uriResolver = new(resolver.URIResolver)
+
+	if err := r.ReconcileKind(ctx, trigger); err != nil {
+		t.Fatalf("ReconcileKind() unexpected error: %v", err)
+	}
+	if trigger.Status.SubscriberURI == nil {
+		t.Fatal("SubscriberURI is nil")
+	}
+	if trigger.Status.SubscriberCACerts == nil || *trigger.Status.SubscriberCACerts != subscriberCACerts {
+		t.Errorf("SubscriberCACerts = %v, want %q", trigger.Status.SubscriberCACerts, subscriberCACerts)
+	}
+	if trigger.Status.SubscriberAudience == nil || *trigger.Status.SubscriberAudience != subscriberAudience {
+		t.Errorf("SubscriberAudience = %v, want %q", trigger.Status.SubscriberAudience, subscriberAudience)
+	}
+	wantServiceAccount := brokeroidc.DeliveryServiceAccountName
+	if trigger.Status.Auth == nil || trigger.Status.Auth.ServiceAccountName == nil || *trigger.Status.Auth.ServiceAccountName != wantServiceAccount {
+		t.Errorf("Auth.ServiceAccountName = %#v, want %q", trigger.Status.Auth, wantServiceAccount)
+	}
+}
+
+func TestReconcileKindOIDCFilterServiceAccountAuthority(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		audience          bool
+		accounts          func(*eventingv1.Broker) []*corev1.ServiceAccount
+		wantErr           bool
+		wantAuth          bool
+		wantOIDCCondition corev1.ConditionStatus
+	}{
+		{
+			name:     "managed namespace delivery identity",
+			audience: true,
+			accounts: func(broker *eventingv1.Broker) []*corev1.ServiceAccount {
+				return []*corev1.ServiceAccount{managedOIDCServiceAccountForTest(broker)}
+			},
+			wantAuth:          true,
+			wantOIDCCondition: corev1.ConditionTrue,
+		},
+		{
+			name:              "identity missing",
+			audience:          true,
+			wantErr:           true,
+			wantOIDCCondition: corev1.ConditionFalse,
+		},
+		{
+			name:     "foreign identity",
+			audience: true,
+			accounts: func(broker *eventingv1.Broker) []*corev1.ServiceAccount {
+				foreign := managedOIDCServiceAccountForTest(broker)
+				foreign.Labels[brokeroidc.ManagedServiceAccountLabelKey] = "foreign-manager"
+				return []*corev1.ServiceAccount{foreign}
+			},
+			wantErr:           true,
+			wantOIDCCondition: corev1.ConditionFalse,
+		},
+		{
+			name:              "no audience skips identity",
+			wantOIDCCondition: corev1.ConditionTrue,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := testContextWithRecorder(t)
+			broker := newReadyBroker(testNamespace, testBrokerName)
+			broker.UID = "broker-uid"
+			makeBrokerCurrentAndReady(broker)
+			brokerLister := newFakeBrokerLister()
+			brokerLister.addBroker(broker)
+			trigger := newTriggerWithSubscriber(testNamespace, testTriggerName, testBrokerName, "subscriber.example.com")
+			if tc.audience {
+				audience := "https://subscriber.example"
+				trigger.Spec.Subscriber.Audience = &audience
+			}
+			var accounts []*corev1.ServiceAccount
+			if tc.accounts != nil {
+				accounts = tc.accounts(broker)
+			}
+			r := newReconcilerForTest(brokerLister, newMockJetStreamContext())
+			r.serviceAccountLister = newServiceAccountListerForTest(accounts...)
+			r.uriResolver = new(resolver.URIResolver)
+
+			err := r.ReconcileKind(ctx, trigger)
+			if tc.wantErr && err == nil {
+				t.Fatal("ReconcileKind() expected OIDC identity error")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("ReconcileKind() unexpected error: %v", err)
+			}
+			condition := trigger.Status.GetCondition(eventingv1.TriggerConditionOIDCIdentityCreated)
+			if condition == nil || condition.Status != tc.wantOIDCCondition {
+				t.Errorf("OIDCIdentityCreated = %#v, want status %s", condition, tc.wantOIDCCondition)
+			}
+			if tc.wantAuth {
+				want := brokeroidc.DeliveryServiceAccountName
+				if trigger.Status.Auth == nil || trigger.Status.Auth.ServiceAccountName == nil || *trigger.Status.Auth.ServiceAccountName != want {
+					t.Errorf("Auth = %#v, want service account %q", trigger.Status.Auth, want)
+				}
+			} else if trigger.Status.Auth != nil {
+				t.Errorf("Auth = %#v, want nil", trigger.Status.Auth)
+			}
+			if !tc.audience && condition != nil && condition.Reason != "OIDCIdentitySkipped" {
+				t.Errorf("no-audience OIDC reason = %q, want OIDCIdentitySkipped", condition.Reason)
+			}
+		})
 	}
 }
 

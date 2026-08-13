@@ -21,6 +21,7 @@ import (
 	"strings"
 
 	eventingv1 "knative.dev/eventing/pkg/apis/eventing/v1"
+	"knative.dev/pkg/kmeta"
 )
 
 var (
@@ -51,6 +52,13 @@ func BrokerPublishSubjectName(namespace, name string) string {
 // Format: KN_TRIGGER_{UID} where hyphens are removed from the UID.
 func TriggerConsumerName(triggerUID string) string {
 	return fmt.Sprintf("KN_TRIGGER_%s", strings.ToUpper(uidReplacer.Replace(triggerUID)))
+}
+
+// FilterServiceAccountName returns the immutable per-Broker identity shared by
+// its filter replicas. Including the Broker UID prevents a recreated Broker
+// from inheriting the previous instance's credentials.
+func FilterServiceAccountName(b *eventingv1.Broker) string {
+	return kmeta.ChildName(fmt.Sprintf("natsjs-filter-%s-%s-%s", b.Namespace, b.Name, b.UID), "")
 }
 
 // TriggerConsumerSubjectName generates a shareable subject name for Trigger consumers.

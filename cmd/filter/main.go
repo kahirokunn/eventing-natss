@@ -17,6 +17,8 @@ limitations under the License.
 package main
 
 import (
+	"context"
+	"log"
 	"os"
 
 	"knative.dev/pkg/injection"
@@ -29,11 +31,40 @@ import (
 func main() {
 	component := "natsjs-broker-filter"
 
-	ctx := signals.NewContext()
-	ns := os.Getenv("NAMESPACE")
-	if ns != "" {
-		ctx = injection.WithNamespaceScope(ctx, ns)
-	}
+	signalCtx := signals.NewContext()
+	runtime := filter.NewRuntime(signalCtx)
+	ctx := configureContext(signalCtx, runtime, brokerNamespace())
 
-	sharedmain.MainWithContext(ctx, component, filter.NewController)
+	go func() {
+		<-signalCtx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), filter.DefaultShutdownTimeout)
+		defer cancel()
+		_ = runtime.Shutdown(shutdownCtx)
+	}()
+
+	sharedmain.MainWithContext(ctx, component, runtime.NewController)
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), filter.DefaultShutdownTimeout)
+	defer cancel()
+	if err := runtime.Shutdown(shutdownCtx); err != nil {
+		log.Printf("filter shutdown did not complete cleanly: %v", err)
+	}
+}
+
+func brokerNamespace() string {
+	ns := os.Getenv("BROKER_NAMESPACE")
+	if ns == "" {
+		ns = os.Getenv("NAMESPACE")
+	}
+	return ns
+}
+
+func configureContext(ctx context.Context, runtime *filter.Runtime, namespace string) context.Context {
+	ctx = sharedmain.WithHADisabled(ctx)
+	ctx = injection.AddReadiness(ctx, runtime.ReadinessHandler())
+	ctx = injection.AddLiveness(ctx, runtime.LivenessHandler())
+	if namespace != "" {
+		ctx = injection.WithNamespaceScope(ctx, namespace)
+	}
+	return ctx
 }

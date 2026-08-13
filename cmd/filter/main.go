@@ -30,7 +30,10 @@ func main() {
 	component := "natsjs-broker-filter"
 
 	ctx := signals.NewContext()
-	ns := os.Getenv("NAMESPACE")
+	ns := os.Getenv("BROKER_NAMESPACE")
+	if ns == "" {
+		ns = os.Getenv("NAMESPACE")
+	}
 	if ns != "" {
 		ctx = injection.WithNamespaceScope(ctx, ns)
 	}

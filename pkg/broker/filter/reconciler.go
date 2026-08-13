@@ -49,6 +49,8 @@ type FilterReconciler struct {
 	brokerLister  eventinglisters.BrokerLister
 
 	consumerManager *ConsumerManager
+	brokerNamespace string
+	brokerName      string
 
 	// triggerUIDs maps "namespace/name" keys to trigger UIDs so that
 	// delete events (where the object is gone from the lister) can
@@ -63,12 +65,16 @@ func NewFilterReconciler(
 	triggerLister eventinglisters.TriggerLister,
 	brokerLister eventinglisters.BrokerLister,
 	consumerManager *ConsumerManager,
+	brokerNamespace string,
+	brokerName string,
 ) *FilterReconciler {
 	return &FilterReconciler{
 		logger:          logging.FromContext(ctx),
 		triggerLister:   triggerLister,
 		brokerLister:    brokerLister,
 		consumerManager: consumerManager,
+		brokerNamespace: brokerNamespace,
+		brokerName:      brokerName,
 		triggerUIDs:     make(map[string]string),
 	}
 }
@@ -100,6 +106,9 @@ func (r *FilterReconciler) Reconcile(ctx context.Context, key string) error {
 		}
 		return fmt.Errorf("failed to get trigger: %w", err)
 	}
+	if !r.ownsTrigger(trigger) {
+		return nil
+	}
 
 	// Track key→UID mapping for delete handling
 	r.mu.Lock()
@@ -115,6 +124,10 @@ func (r *FilterReconciler) ReconcileTrigger(ctx context.Context, trigger *eventi
 		zap.String("trigger", trigger.Name),
 		zap.String("namespace", trigger.Namespace),
 	)
+	if !r.ownsTrigger(trigger) {
+		logger.Debugw("trigger belongs to another broker, skipping")
+		return nil
+	}
 
 	// Get the broker
 	broker, err := r.brokerLister.Brokers(trigger.Namespace).Get(trigger.Spec.Broker)
@@ -207,6 +220,12 @@ func (r *FilterReconciler) ReconcileTrigger(ctx context.Context, trigger *eventi
 	}
 
 	return nil
+}
+
+func (r *FilterReconciler) ownsTrigger(trigger *eventingv1.Trigger) bool {
+	return trigger != nil &&
+		trigger.Namespace == r.brokerNamespace &&
+		trigger.Spec.Broker == r.brokerName
 }
 
 // DeleteTrigger removes the subscription for a deleted trigger

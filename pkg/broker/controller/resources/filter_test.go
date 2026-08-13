@@ -336,6 +336,9 @@ func TestMakeFilterEnvVars(t *testing.T) {
 	if envMap["BROKER_NAME"] != "test-broker" {
 		t.Errorf("BROKER_NAME = %v, want test-broker", envMap["BROKER_NAME"])
 	}
+	if envMap["NAMESPACE"] != "test-namespace" {
+		t.Errorf("NAMESPACE = %v, want test-namespace", envMap["NAMESPACE"])
+	}
 
 	if envMap["BROKER_NAMESPACE"] != "test-namespace" {
 		t.Errorf("BROKER_NAMESPACE = %v, want test-namespace", envMap["BROKER_NAMESPACE"])

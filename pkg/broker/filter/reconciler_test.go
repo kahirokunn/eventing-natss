@@ -202,8 +202,10 @@ func TestReconcileTrigger(t *testing.T) {
 			ctx := logging.WithLogger(context.Background(), logging.FromContext(context.TODO()))
 
 			r := &FilterReconciler{
-				logger:       logging.FromContext(ctx),
-				brokerLister: brokerLister,
+				logger:          logging.FromContext(ctx),
+				brokerLister:    brokerLister,
+				brokerNamespace: testNamespace,
+				brokerName:      testBrokerName,
 			}
 
 			err := r.ReconcileTrigger(ctx, tc.trigger)
@@ -226,8 +228,10 @@ func TestReconcileTrigger_BrokerLookupError(t *testing.T) {
 	ctx := logging.WithLogger(context.Background(), logging.FromContext(context.TODO()))
 
 	r := &FilterReconciler{
-		logger:       logging.FromContext(ctx),
-		brokerLister: brokerLister,
+		logger:          logging.FromContext(ctx),
+		brokerLister:    brokerLister,
+		brokerNamespace: testNamespace,
+		brokerName:      testBrokerName,
 	}
 
 	trigger := newTestTrigger(testNamespace, testTriggerName, testBrokerName)
@@ -331,8 +335,10 @@ func TestReconcileTrigger_SkipReasons(t *testing.T) {
 	brokerLister.addBroker(broker)
 
 	r := &FilterReconciler{
-		logger:       logging.FromContext(ctx),
-		brokerLister: brokerLister,
+		logger:          logging.FromContext(ctx),
+		brokerLister:    brokerLister,
+		brokerNamespace: testNamespace,
+		brokerName:      testBrokerName,
 	}
 
 	// Even though trigger has a subscriber and broker is ready, the wrong
@@ -361,7 +367,7 @@ func int32Ptr(v int32) *int32 { return &v }
 func TestNewFilterReconciler(t *testing.T) {
 	ctx := logging.WithLogger(context.Background(), logging.FromContext(context.TODO()))
 
-	r := NewFilterReconciler(ctx, nil, nil, nil)
+	r := NewFilterReconciler(ctx, nil, nil, nil, testNamespace, testBrokerName)
 	if r == nil {
 		t.Fatal("NewFilterReconciler() returned nil")
 	}
@@ -376,6 +382,7 @@ func TestReconcileTrigger_FullPath(t *testing.T) {
 		brokerAddr      bool
 		deadLetterURI   string
 		deliveryRetry   *int32
+		streamName      string
 		jsErr           error
 		wantErrContains string
 	}{
@@ -415,6 +422,11 @@ func TestReconcileTrigger_FullPath(t *testing.T) {
 			jsErr:           nats.ErrConsumerNotFound,
 			wantErrContains: "not found",
 		},
+		{
+			name:            "another broker stream is rejected",
+			streamName:      "KN_BROKER_OTHER",
+			wantErrContains: "does not match filter stream",
+		},
 	}
 
 	for _, tc := range tests {
@@ -446,6 +458,7 @@ func TestReconcileTrigger_FullPath(t *testing.T) {
 				logger:        logging.FromContext(ctx),
 				ctx:           ctx,
 				js:            &fakeJetStream{consumerInfoErr: tc.jsErr},
+				streamName:    tc.streamName,
 				subscriptions: make(map[string]*TriggerSubscription),
 			}
 
@@ -453,6 +466,8 @@ func TestReconcileTrigger_FullPath(t *testing.T) {
 				logger:          logging.FromContext(ctx),
 				brokerLister:    brokerLister,
 				consumerManager: cm,
+				brokerNamespace: testNamespace,
+				brokerName:      testBrokerName,
 			}
 
 			err := r.ReconcileTrigger(ctx, trigger)
@@ -511,6 +526,8 @@ func TestReconcileTrigger_ExistingSubscription(t *testing.T) {
 		logger:          logging.FromContext(ctx),
 		brokerLister:    brokerLister,
 		consumerManager: cm,
+		brokerNamespace: testNamespace,
+		brokerName:      testBrokerName,
 	}
 
 	// Should return nil — all fields updated in place, no re-subscribe.
@@ -657,6 +674,8 @@ func TestReconcile(t *testing.T) {
 				triggerLister:   triggerLister,
 				brokerLister:    brokerLister,
 				consumerManager: cm,
+				brokerNamespace: testNamespace,
+				brokerName:      testBrokerName,
 				triggerUIDs:     make(map[string]string),
 			}
 

@@ -16,7 +16,11 @@ limitations under the License.
 
 package resources
 
-import "maps"
+import (
+	"maps"
+
+	"knative.dev/pkg/kmeta"
+)
 
 const (
 	// BrokerLabelKey is the label key for broker resources
@@ -46,7 +50,7 @@ const (
 
 // FilterName returns the name of the filter deployment/service for a broker
 func FilterName(brokerName string) string {
-	return brokerName + "-broker-filter"
+	return kmeta.ChildName(brokerName, "-broker-filter")
 }
 
 // BrokerLabels returns labels for broker-related resources
@@ -64,11 +68,11 @@ func FilterLabels(brokerName string) map[string]string {
 	}
 }
 
-// mergeMaps merges two maps, with values from the second map taking precedence.
-// The base map's required labels are preserved.
+// mergeMaps merges user values with controller-owned values. Required values
+// from base take precedence so selectors and generated resources stay aligned.
 func mergeMaps(base, override map[string]string) map[string]string {
 	result := make(map[string]string, len(base)+len(override))
-	maps.Copy(result, base)
 	maps.Copy(result, override)
+	maps.Copy(result, base)
 	return result
 }

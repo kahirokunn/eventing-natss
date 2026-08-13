@@ -18,10 +18,9 @@ metadata:
   name: natsjetstream-broker-dataplane
   labels:
     nats.eventing.knative.dev/release: devel
-subjects:
-  - kind: ServiceAccount
-    name: natsjetstream-broker-dataplane
-    namespace: knative-eventing
+# Security tombstone paired with the empty legacy ClusterRole. Dynamic
+# bindings from older releases remain harmless even before they are removed.
+subjects: []
 roleRef:
   kind: ClusterRole
   name: natsjetstream-broker-dataplane

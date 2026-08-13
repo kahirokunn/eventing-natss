@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"os"
 
 	"knative.dev/pkg/configmap"
@@ -32,13 +33,19 @@ func main() {
 	component := "natsjs-broker-ingress"
 
 	ctx := signals.NewContext()
-	ctx = sharedmain.WithHealthProbesDisabled(ctx)
+	ctx = configureContext(ctx, os.Getenv("NAMESPACE"))
 	ctx = fsloader.WithLoader(ctx, configmap.Load)
 
-	ns := os.Getenv("NAMESPACE")
-	if ns != "" {
-		ctx = injection.WithNamespaceScope(ctx, ns)
-	}
-
 	sharedmain.MainWithContext(ctx, component, ingress.NewController)
+}
+
+func configureContext(ctx context.Context, namespace string) context.Context {
+	// Every replica actively serves ingress traffic; leader election would add
+	// Lease authority and contention without gating any data-plane work.
+	ctx = sharedmain.WithHADisabled(ctx)
+	ctx = sharedmain.WithHealthProbesDisabled(ctx)
+	if namespace != "" {
+		ctx = injection.WithNamespaceScope(ctx, namespace)
+	}
+	return ctx
 }

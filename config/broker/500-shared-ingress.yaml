@@ -29,12 +29,16 @@ spec:
       labels:
         app: nats-broker-ingress
     spec:
-      serviceAccountName: natsjetstream-broker-dataplane
+      serviceAccountName: natsjetstream-broker-ingress
       containers:
         - name: ingress
           image: ko://knative.dev/eventing-natss/cmd/ingress
           env:
             - name: SYSTEM_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: NAMESPACE
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace

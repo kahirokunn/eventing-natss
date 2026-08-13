@@ -13,12 +13,17 @@
 # limitations under the License.
 
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
+kind: RoleBinding
 metadata:
-  name: natsjetstream-broker-dataplane
+  name: natsjetstream-broker-ingress
+  namespace: knative-eventing
   labels:
     nats.eventing.knative.dev/release: devel
-# Security tombstone for ClusterRoleBindings created by older releases. Keep
-# the role name so stale bindings cannot regain their former cluster-wide
-# Secret and Lease authority when manifests are re-applied.
-rules: []
+subjects:
+  - kind: ServiceAccount
+    name: natsjetstream-broker-ingress
+    namespace: knative-eventing
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: natsjetstream-broker-ingress

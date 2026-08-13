@@ -89,6 +89,24 @@ rules:
       - create
       - update
       - delete
+  # Wake a KEDA-managed filter from zero when the KEDA control plane is down.
+  - apiGroups:
+      - apps
+    resources:
+      - deployments/scale
+    verbs:
+      - get
+      - update
+  # Manage optional KEDA autoscaling for per-Broker filter deployments.
+  - apiGroups:
+      - keda.sh
+    resources:
+      - scaledobjects
+    verbs:
+      - get
+      - create
+      - update
+      - delete
   # Manage services for ingress and filter
   - apiGroups:
       - "serving.knative.dev"

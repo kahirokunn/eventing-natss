@@ -47,6 +47,7 @@ func TestMain(m *testing.M) {
 func TestBrokerDirect(t *testing.T) {
 	t.Parallel()
 	ctx, env := global.Environment(
+		environment.Managed(t),
 		knative.WithKnativeNamespace(system.Namespace()),
 		knative.WithLoggingConfig,
 		knative.WithObservabilityConfig,
@@ -54,5 +55,4 @@ func TestBrokerDirect(t *testing.T) {
 	)
 	env.Test(ctx, t, RecorderFeature())
 	env.Test(ctx, t, DirectTestBroker())
-	env.Finish()
 }

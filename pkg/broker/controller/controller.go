@@ -28,6 +28,7 @@ import (
 	kubeclient "knative.dev/pkg/client/injection/kube/client"
 	"knative.dev/pkg/configmap"
 	"knative.dev/pkg/controller"
+	dynamicclient "knative.dev/pkg/injection/clients/dynamicclient"
 	"knative.dev/pkg/logging"
 	pkgreconciler "knative.dev/pkg/reconciler"
 	"knative.dev/pkg/resolver"
@@ -115,7 +116,9 @@ func NewController(
 	if err != nil {
 		logger.Fatalw("Failed to create JetStream context", zap.Error(err))
 	}
-	natsConfigJSON, err := json.Marshal(natsConfig)
+	filterNATSConfig := natsConfig
+	filterNATSConfig.Autoscaler = nil
+	natsConfigJSON, err := json.Marshal(filterNATSConfig)
 	if err != nil {
 		logger.Fatalw("Failed to serialize NATS configuration for filters", zap.Error(err))
 	}
@@ -137,6 +140,7 @@ func NewController(
 	r := &Reconciler{
 		kubeClientSet:  kubeclient.Get(ctx),
 		eventingClient: eventingclient.Get(ctx),
+		dynamicClient:  dynamicclient.Get(ctx),
 
 		deploymentLister: deploymentInformer.Lister(),
 		serviceLister:    serviceInformer.Lister(),
@@ -147,8 +151,9 @@ func NewController(
 
 		js: js,
 
-		natsURL:        natsConfig.URL,
-		natsConfigJSON: string(natsConfigJSON),
+		natsURL:          natsConfig.URL,
+		natsConfigJSON:   string(natsConfigJSON),
+		autoscalerConfig: natsConfig.Autoscaler,
 
 		filterImage:          env.FilterImage,
 		filterServiceAccount: env.FilterServiceAccount,

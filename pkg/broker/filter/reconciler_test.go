@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/cache"
 
 	"knative.dev/pkg/apis"
 	duckv1 "knative.dev/pkg/apis/duck/v1"
@@ -39,6 +40,7 @@ import (
 	eventinglisters "knative.dev/eventing/pkg/client/listers/eventing/v1"
 
 	"knative.dev/eventing-natss/pkg/broker/constants"
+	natsTesting "knative.dev/eventing-natss/pkg/channel/jetstream/dispatcher/testing"
 )
 
 const (
@@ -202,8 +204,10 @@ func TestReconcileTrigger(t *testing.T) {
 			ctx := logging.WithLogger(context.Background(), logging.FromContext(context.TODO()))
 
 			r := &FilterReconciler{
-				logger:       logging.FromContext(ctx),
-				brokerLister: brokerLister,
+				logger:          logging.FromContext(ctx),
+				brokerLister:    brokerLister,
+				brokerNamespace: testNamespace,
+				brokerName:      testBrokerName,
 			}
 
 			err := r.ReconcileTrigger(ctx, tc.trigger)
@@ -226,8 +230,10 @@ func TestReconcileTrigger_BrokerLookupError(t *testing.T) {
 	ctx := logging.WithLogger(context.Background(), logging.FromContext(context.TODO()))
 
 	r := &FilterReconciler{
-		logger:       logging.FromContext(ctx),
-		brokerLister: brokerLister,
+		logger:          logging.FromContext(ctx),
+		brokerLister:    brokerLister,
+		brokerNamespace: testNamespace,
+		brokerName:      testBrokerName,
 	}
 
 	trigger := newTestTrigger(testNamespace, testTriggerName, testBrokerName)
@@ -331,8 +337,10 @@ func TestReconcileTrigger_SkipReasons(t *testing.T) {
 	brokerLister.addBroker(broker)
 
 	r := &FilterReconciler{
-		logger:       logging.FromContext(ctx),
-		brokerLister: brokerLister,
+		logger:          logging.FromContext(ctx),
+		brokerLister:    brokerLister,
+		brokerNamespace: testNamespace,
+		brokerName:      testBrokerName,
 	}
 
 	// Even though trigger has a subscriber and broker is ready, the wrong
@@ -361,7 +369,7 @@ func int32Ptr(v int32) *int32 { return &v }
 func TestNewFilterReconciler(t *testing.T) {
 	ctx := logging.WithLogger(context.Background(), logging.FromContext(context.TODO()))
 
-	r := NewFilterReconciler(ctx, nil, nil, nil)
+	r := NewFilterReconciler(ctx, nil, nil, nil, testNamespace, testBrokerName)
 	if r == nil {
 		t.Fatal("NewFilterReconciler() returned nil")
 	}
@@ -376,6 +384,7 @@ func TestReconcileTrigger_FullPath(t *testing.T) {
 		brokerAddr      bool
 		deadLetterURI   string
 		deliveryRetry   *int32
+		streamName      string
 		jsErr           error
 		wantErrContains string
 	}{
@@ -415,6 +424,11 @@ func TestReconcileTrigger_FullPath(t *testing.T) {
 			jsErr:           nats.ErrConsumerNotFound,
 			wantErrContains: "not found",
 		},
+		{
+			name:            "another broker stream is rejected",
+			streamName:      "KN_BROKER_OTHER",
+			wantErrContains: "does not match filter stream",
+		},
 	}
 
 	for _, tc := range tests {
@@ -446,6 +460,7 @@ func TestReconcileTrigger_FullPath(t *testing.T) {
 				logger:        logging.FromContext(ctx),
 				ctx:           ctx,
 				js:            &fakeJetStream{consumerInfoErr: tc.jsErr},
+				streamName:    tc.streamName,
 				subscriptions: make(map[string]*TriggerSubscription),
 			}
 
@@ -453,6 +468,8 @@ func TestReconcileTrigger_FullPath(t *testing.T) {
 				logger:          logging.FromContext(ctx),
 				brokerLister:    brokerLister,
 				consumerManager: cm,
+				brokerNamespace: testNamespace,
+				brokerName:      testBrokerName,
 			}
 
 			err := r.ReconcileTrigger(ctx, trigger)
@@ -524,6 +541,8 @@ func TestReconcileTrigger_ExistingSubscription(t *testing.T) {
 		logger:          logging.FromContext(ctx),
 		brokerLister:    brokerLister,
 		consumerManager: cm,
+		brokerNamespace: testNamespace,
+		brokerName:      testBrokerName,
 	}
 
 	// Should return nil — all fields updated in place, no re-subscribe.
@@ -671,6 +690,8 @@ func TestReconcile(t *testing.T) {
 				triggerLister:   triggerLister,
 				brokerLister:    brokerLister,
 				consumerManager: cm,
+				brokerNamespace: testNamespace,
+				brokerName:      testBrokerName,
 				triggerUIDs:     make(map[string]string),
 			}
 
@@ -721,6 +742,51 @@ func (s *reassignmentPullSubscription) Unsubscribe() error {
 	return nil
 }
 
+func TestReconcileOwnershipLossDeletesTrackedSubscription(t *testing.T) {
+	const brokerB = "broker-b"
+	ctx := logging.WithLogger(context.Background(), logging.FromContext(context.TODO()))
+	oldTrigger := newTestTrigger(testNamespace, testTriggerName, testBrokerName)
+	newTrigger := oldTrigger.DeepCopy()
+	newTrigger.Spec.Broker = brokerB
+	key := testNamespace + "/" + testTriggerName
+	uid := string(oldTrigger.UID)
+
+	triggerLister := newFakeTriggerLister()
+	triggerLister.addTrigger(newTrigger)
+	pullSub := &reassignmentPullSubscription{}
+	handler, err := NewTriggerHandler(ctx, oldTrigger, duckv1.Addressable{}, nil, nil, nil, nil, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := &ConsumerManager{
+		logger: logging.FromContext(ctx),
+		subscriptions: map[string]*TriggerSubscription{
+			uid: {trigger: oldTrigger, subscription: pullSub, handler: handler},
+		},
+	}
+	reconciler := NewFilterReconciler(ctx, triggerLister, newFakeBrokerLister(), manager, testNamespace, testBrokerName)
+	reconciler.triggerUIDs[key] = uid
+
+	if err := reconciler.Reconcile(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	if manager.HasSubscription(uid) {
+		t.Error("old Broker retained subscription after lister returned the reassigned Trigger")
+	}
+	if _, found := reconciler.triggerUIDs[key]; found {
+		t.Error("old Broker retained key-to-UID mapping after lister returned the reassigned Trigger")
+	}
+	if !pullSub.unsubscribed {
+		t.Error("old pull subscription was not unsubscribed")
+	}
+	handler.configMu.RLock()
+	handlerCleaned := handler.config == nil
+	handler.configMu.RUnlock()
+	if !handlerCleaned {
+		t.Error("old Trigger handler was not cleaned up")
+	}
+}
+
 func TestReconcileTriggerRecreationReplacesTrackedUID(t *testing.T) {
 	const (
 		oldUID = "old-trigger-uid"
@@ -750,7 +816,7 @@ func TestReconcileTriggerRecreationReplacesTrackedUID(t *testing.T) {
 			oldUID: {trigger: oldTrigger, subscription: pullSub, handler: handler},
 		},
 	}
-	reconciler := NewFilterReconciler(ctx, triggerLister, brokerLister, manager)
+	reconciler := NewFilterReconciler(ctx, triggerLister, brokerLister, manager, testNamespace, testBrokerName)
 	reconciler.triggerUIDs[key] = oldUID
 
 	if err := reconciler.Reconcile(ctx, key); err != nil {
@@ -776,5 +842,103 @@ func TestReconcileTriggerRecreationReplacesTrackedUID(t *testing.T) {
 	}
 	if manager.GetSubscriptionCount() != 0 {
 		t.Errorf("subscription count = %d, want 0 after old cleanup and new Broker readiness skip", manager.GetSubscriptionCount())
+	}
+}
+
+func TestTriggerBrokerReassignmentMovesSubscription(t *testing.T) {
+	const (
+		brokerA = "broker-a"
+		brokerB = "broker-b"
+	)
+	s := natsTesting.RunBasicJetstreamServer()
+	defer natsTesting.ShutdownJSServerAndRemoveStorage(t, s)
+	connA, jsA := natsTesting.JsClient(t, s)
+	defer connA.Close()
+	connB, jsB := natsTesting.JsClient(t, s)
+	defer connB.Close()
+
+	ctx := logging.WithLogger(context.Background(), logging.FromContext(context.TODO()))
+	oldTrigger := newTestTriggerWithSubscriber(testNamespace, testTriggerName, brokerA, "http://subscriber.example.com")
+	newTrigger := oldTrigger.DeepCopy()
+	newTrigger.Spec.Broker = brokerB
+	key := testNamespace + "/" + testTriggerName
+	uid := string(oldTrigger.UID)
+
+	oldBroker := newReadyTestBroker(testNamespace, brokerA, constants.BrokerClassName)
+	newBroker := newReadyTestBroker(testNamespace, brokerB, constants.BrokerClassName)
+	brokerLister := newFakeBrokerLister()
+	brokerLister.addBroker(oldBroker)
+	brokerLister.addBroker(newBroker)
+	triggerLister := newFakeTriggerLister()
+	triggerLister.addTrigger(oldTrigger)
+
+	// The Trigger controller owns creation of the durable consumers. Give both
+	// Broker streams a consumer for the immutable Trigger UID so this test can
+	// exercise the filter controllers' complete subscription handoff.
+	setupStreamAndConsumer(t, jsA, testNamespace, brokerA, uid)
+	setupStreamAndConsumer(t, jsA, testNamespace, brokerB, uid)
+	managerA := newConsumerManagerForTest(t, ctx, connA, jsA, nil)
+	defer managerA.Close() //nolint:errcheck
+	managerB := newConsumerManagerForTest(t, ctx, connB, jsB, nil)
+	defer managerB.Close() //nolint:errcheck
+
+	reconcilerA := NewFilterReconciler(ctx, triggerLister, brokerLister, managerA, testNamespace, brokerA)
+	reconcilerB := NewFilterReconciler(ctx, triggerLister, brokerLister, managerB, testNamespace, brokerB)
+
+	var reconcileErrors []error
+	newEventHandler := func(r *FilterReconciler, brokerName string) *cache.FilteringResourceEventHandler {
+		reconcile := func(obj interface{}) {
+			objectKey, err := cache.MetaNamespaceKeyFunc(obj)
+			if err == nil {
+				err = r.Reconcile(ctx, objectKey)
+			}
+			if err != nil {
+				reconcileErrors = append(reconcileErrors, err)
+			}
+		}
+		return &cache.FilteringResourceEventHandler{
+			FilterFunc: filterTriggersForBroker(brokerLister, testNamespace, brokerName),
+			Handler: cache.ResourceEventHandlerFuncs{
+				AddFunc: reconcile,
+				UpdateFunc: func(_, newObj interface{}) {
+					reconcile(newObj)
+				},
+				DeleteFunc: reconcile,
+			},
+		}
+	}
+	handlerA := newEventHandler(reconcilerA, brokerA)
+	handlerB := newEventHandler(reconcilerB, brokerB)
+
+	// Establish the original A-side subscription and key-to-UID mapping.
+	handlerA.OnAdd(oldTrigger, false)
+	if len(reconcileErrors) != 0 {
+		t.Fatalf("initial A reconcile: %v", reconcileErrors)
+	}
+	if !managerA.HasSubscription(uid) || reconcilerA.triggerUIDs[key] != uid {
+		t.Fatalf("A did not track initial Trigger UID %q and subscription", uid)
+	}
+
+	// Informer stores are updated before handlers run. On A this old-match to
+	// new-nonmatch transition is delivered as a delete event, but Reconcile
+	// reads the new B-owned Trigger from the lister. B observes it as an add.
+	triggerLister.addTrigger(newTrigger)
+	handlerA.OnUpdate(oldTrigger, newTrigger)
+	handlerB.OnUpdate(oldTrigger, newTrigger)
+	if len(reconcileErrors) != 0 {
+		t.Fatalf("reassignment reconcile: %v", reconcileErrors)
+	}
+
+	if managerA.HasSubscription(uid) {
+		t.Error("A retained the old subscription after Trigger moved to B")
+	}
+	if _, found := reconcilerA.triggerUIDs[key]; found {
+		t.Error("A retained the key-to-UID mapping after Trigger moved to B")
+	}
+	if !managerB.HasSubscription(uid) {
+		t.Error("B did not create a subscription after Trigger reassignment")
+	}
+	if got := reconcilerB.triggerUIDs[key]; got != uid {
+		t.Errorf("B key-to-UID mapping = %q, want %q", got, uid)
 	}
 }

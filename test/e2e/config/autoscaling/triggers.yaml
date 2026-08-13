@@ -1,0 +1,45 @@
+# Copyright 2026 The Knative Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: eventing.knative.dev/v1
+kind: Trigger
+metadata:
+  name: autoscale-trigger-a
+  namespace: {{ .namespace }}
+  annotations:
+    natsjetstream.eventing.knative.dev/fetch-batch-size: "1"
+    natsjetstream.eventing.knative.dev/max-concurrency: "1"
+spec:
+  broker: autoscale-broker-a
+  subscriber:
+    ref:
+      apiVersion: v1
+      kind: Service
+      name: autoscale-recorder-a
+---
+apiVersion: eventing.knative.dev/v1
+kind: Trigger
+metadata:
+  name: autoscale-trigger-b
+  namespace: {{ .namespace }}
+  annotations:
+    natsjetstream.eventing.knative.dev/fetch-batch-size: "1"
+    natsjetstream.eventing.knative.dev/max-concurrency: "1"
+spec:
+  broker: autoscale-broker-b
+  subscriber:
+    ref:
+      apiVersion: v1
+      kind: Service
+      name: autoscale-recorder-b

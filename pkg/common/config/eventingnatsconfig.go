@@ -20,13 +20,27 @@ import (
 	v1 "k8s.io/api/core/v1"
 )
 
-// EventingNatsConfig represents the YAML configuration which can be provided in the `config-nats` ConfigMap under the
-// key, "eventing-nats".
+// EventingNatsConfig represents the YAML configuration provided under the
+// "eventing-nats" key in a component's NATS settings ConfigMap.
 type EventingNatsConfig struct {
-	URL      string          `json:"url,omitempty"`
-	ConnOpts *ConnOpts       `json:"connOpts,omitempty"`
-	Auth     *ENConfigAuth   `json:"auth,omitempty"`
-	RootCA   *ENConfigRootCA `json:"tls,omitempty"`
+	URL        string                `json:"url,omitempty"`
+	ConnOpts   *ConnOpts             `json:"connOpts,omitempty"`
+	Auth       *ENConfigAuth         `json:"auth,omitempty"`
+	RootCA     *ENConfigRootCA       `json:"tls,omitempty"`
+	Autoscaler *NatsAutoscalerConfig `json:"autoscaler,omitempty"`
+}
+
+// NatsAutoscalerConfig tells KEDA how to query the NATS JetStream monitoring
+// endpoint. It is used only by Brokers that explicitly opt in to KEDA.
+type NatsAutoscalerConfig struct {
+	// MonitoringEndpoint is the cluster-reachable NATS monitoring host and
+	// port, without a URL scheme, for example nats.nats-io.svc:8222.
+	MonitoringEndpoint string `json:"monitoringEndpoint,omitempty"`
+	// Account is the JetStream account reported by the monitoring endpoint.
+	// It defaults to $G.
+	Account string `json:"account,omitempty"`
+	// UseHTTPS makes the KEDA scaler use HTTPS for monitoring requests.
+	UseHTTPS bool `json:"useHttps,omitempty"`
 }
 
 // ENConfigAuth provides configuration on how the client should authenticate itself to the server.

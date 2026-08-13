@@ -201,6 +201,21 @@ a referenced Secret, restart those two system Deployments and every generated
 filter Deployment so all NATS clients move to the new credential revision
 together.
 
+Each Broker filter runs as a dedicated ServiceAccount. Its user-namespace
+RoleBinding grants only Broker and Trigger reads in that namespace. Separate
+RoleBindings in `knative-eventing` grant ConfigMap reads required by Knative's
+runtime and `get` access only to the Secret names referenced by the NATS
+configuration; filters cannot list Secrets or read Secrets in other namespaces.
+Deleting the last Trigger or the Broker revokes those bindings. A periodic
+sweep also removes system-namespace bindings orphaned by force deletion.
+
+The legacy `natsjetstream-broker-dataplane` ClusterRole is intentionally kept
+with no rules. This tombstone makes ClusterRoleBindings left by older releases
+harmless and the role name must not be reused. For a disruption-free upgrade,
+roll out the new controller and per-Broker identities before applying the
+legacy-role tombstone; applying all manifests at once instead favors immediate
+credential revocation and may briefly restart existing filters.
+
 ### Filter Environment Variables
 
 These variables set the **broker-wide defaults** for the filter deployment. All triggers in the same broker share these defaults unless they override them with per-trigger annotations (see below).

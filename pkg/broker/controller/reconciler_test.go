@@ -57,7 +57,11 @@ const (
 )
 
 func testBroker(ns, name string) *eventingv1.Broker {
-	return &eventingv1.Broker{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name}}
+	return &eventingv1.Broker{ObjectMeta: metav1.ObjectMeta{
+		Namespace: ns,
+		Name:      name,
+		UID:       types.UID(name + "-uid"),
+	}}
 }
 
 func testTrigger(ns, name, brokerName string) *eventingv1.Trigger {
@@ -189,25 +193,207 @@ func deploymentWithReady(ns, name string, ready int32) *appsv1.Deployment {
 }
 
 func TestReconcileDataplaneRBAC(t *testing.T) {
+	t.Setenv("SYSTEM_NAMESPACE", "knative-eventing")
 	kube := kubefake.NewSimpleClientset()
-	r := &Reconciler{kubeClientSet: kube, filterServiceAccount: "dp-sa"}
+	r := &Reconciler{
+		kubeClientSet:        kube,
+		filterServiceAccount: "dp-sa",
+		natsConfigJSON: `{
+			"auth": {
+				"credentialFile": {"secret": {"name": "nats-credentials"}},
+				"tls": {"secret": {"name": "nats-client-tls"}}
+			},
+			"tls": {"secret": {"name": "nats-root-ca"}}
+		}`,
+	}
 	ctx := testContext()
-	b := testBroker(testNamespace, testBrokerName)
+	oldBroker := testBroker(testNamespace, "recreated-broker")
+	oldBroker.UID = "old-broker-uid"
+	newBroker := testBroker(testNamespace, "recreated-broker")
+	newBroker.UID = "new-broker-uid"
+	// Model delayed garbage collection during delete/recreate. The new Broker
+	// must never adopt the old Broker UID's credentials or ServiceAccount.
+	brokers := []*eventingv1.Broker{oldBroker, newBroker}
 
-	if err := r.reconcileDataplaneRBAC(ctx, b); err != nil {
-		t.Fatalf("reconcileDataplaneRBAC() error: %v", err)
+	for _, broker := range brokers {
+		if err := r.reconcileDataplaneRBAC(ctx, broker); err != nil {
+			t.Fatalf("reconcileDataplaneRBAC(%s) error: %v", broker.Name, err)
+		}
 	}
-	if _, err := kube.CoreV1().ServiceAccounts(testNamespace).Get(ctx, "dp-sa", metav1.GetOptions{}); err != nil {
-		t.Errorf("service account not created: %v", err)
+
+	for _, action := range kube.Actions() {
+		if action.GetResource().Resource == "clusterrolebindings" {
+			t.Errorf("reconcileDataplaneRBAC issued forbidden cluster-scoped action: %#v", action)
+		}
 	}
-	crbName := DataplaneClusterRoleName + "-" + testNamespace
-	if _, err := kube.RbacV1().ClusterRoleBindings().Get(ctx, crbName, metav1.GetOptions{}); err != nil {
-		t.Errorf("cluster role binding not created: %v", err)
+
+	serviceAccounts, err := kube.CoreV1().ServiceAccounts(testNamespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
 	}
-	// Running again is a no-op (resources already exist).
-	if err := r.reconcileDataplaneRBAC(ctx, b); err != nil {
+	if got, want := len(serviceAccounts.Items), len(brokers); got != want {
+		t.Errorf("service accounts = %d, want one per Broker (%d)", got, want)
+	}
+	serviceAccountOwners := make(map[types.UID]string)
+	serviceAccountNames := make(map[string]struct{})
+	serviceAccountUIDs := make(map[string]types.UID)
+	for _, serviceAccount := range serviceAccounts.Items {
+		serviceAccountNames[serviceAccount.Name] = struct{}{}
+		if len(serviceAccount.OwnerReferences) != 1 || serviceAccount.OwnerReferences[0].UID == "" {
+			t.Errorf("ServiceAccount %q owner references = %#v, want its Broker controller", serviceAccount.Name, serviceAccount.OwnerReferences)
+			continue
+		}
+		serviceAccountOwners[serviceAccount.OwnerReferences[0].UID] = serviceAccount.Name
+		serviceAccountUIDs[serviceAccount.Name] = serviceAccount.OwnerReferences[0].UID
+	}
+	for _, broker := range brokers {
+		if serviceAccountOwners[broker.UID] == "" {
+			t.Errorf("Broker %s/%s UID %q has no dedicated owned ServiceAccount", broker.Namespace, broker.Name, broker.UID)
+		}
+	}
+
+	tenantBindings, err := kube.RbacV1().RoleBindings(testNamespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(tenantBindings.Items), len(brokers); got != want {
+		t.Errorf("tenant RoleBindings = %d, want one per Broker (%d)", got, want)
+	}
+	for _, binding := range tenantBindings.Items {
+		if binding.RoleRef.Kind != "ClusterRole" || binding.RoleRef.Name != FilterReaderClusterRoleName {
+			t.Errorf("tenant RoleBinding %q roleRef = %#v, want ClusterRole %q", binding.Name, binding.RoleRef, FilterReaderClusterRoleName)
+		}
+		if len(binding.Subjects) != 1 || binding.Subjects[0].Kind != "ServiceAccount" || binding.Subjects[0].Namespace != testNamespace {
+			t.Errorf("tenant RoleBinding %q subjects = %#v, want one tenant ServiceAccount", binding.Name, binding.Subjects)
+			continue
+		}
+		if _, ok := serviceAccountNames[binding.Subjects[0].Name]; !ok {
+			t.Errorf("tenant RoleBinding %q refers to unknown ServiceAccount %q", binding.Name, binding.Subjects[0].Name)
+		}
+		if len(binding.OwnerReferences) != 1 || binding.OwnerReferences[0].UID != serviceAccountUIDs[binding.Subjects[0].Name] {
+			t.Errorf("tenant RoleBinding %q owner references = %#v, want the same Broker as ServiceAccount %q", binding.Name, binding.OwnerReferences, binding.Subjects[0].Name)
+		}
+	}
+
+	// Running again for the same Broker must not create or update RBAC.
+	actionsBefore := len(kube.Actions())
+	if err := r.reconcileDataplaneRBAC(ctx, brokers[0]); err != nil {
 		t.Errorf("second reconcileDataplaneRBAC() error: %v", err)
 	}
+	for _, action := range kube.Actions()[actionsBefore:] {
+		if action.GetVerb() == "create" || action.GetVerb() == "update" || action.GetVerb() == "patch" {
+			t.Errorf("steady-state RBAC reconcile wrote %s %s", action.GetVerb(), action.GetResource().Resource)
+		}
+	}
+}
+
+func TestReconcileDataplaneRBACScopesSystemAccess(t *testing.T) {
+	const systemNamespace = "knative-eventing"
+	t.Setenv("SYSTEM_NAMESPACE", systemNamespace)
+	kube := kubefake.NewSimpleClientset()
+	r := &Reconciler{
+		kubeClientSet:        kube,
+		filterServiceAccount: "dp-sa",
+		natsConfigJSON: `{
+			"auth": {
+				"credentialFile": {"secret": {"name": "nats-credentials"}},
+				"tls": {"secret": {"name": "nats-client-tls"}}
+			},
+			"tls": {"secret": {"name": "nats-root-ca"}}
+		}`,
+	}
+	ctx := testContext()
+	broker := testBroker(testNamespace, testBrokerName)
+
+	if err := r.reconcileDataplaneRBAC(ctx, broker); err != nil {
+		t.Fatalf("reconcileDataplaneRBAC() error: %v", err)
+	}
+
+	bindings, err := kube.RbacV1().RoleBindings(systemNamespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(bindings.Items), 2; got != want {
+		t.Errorf("system RoleBindings = %d, want config-reader and exact-secret bindings", got)
+	}
+	configReaderFound := false
+	for _, binding := range bindings.Items {
+		if len(binding.Subjects) != 1 || binding.Subjects[0].Kind != "ServiceAccount" || binding.Subjects[0].Namespace != broker.Namespace {
+			t.Errorf("system RoleBinding %q subjects = %#v, want the Broker ServiceAccount", binding.Name, binding.Subjects)
+		}
+		if binding.RoleRef.Kind == "ClusterRole" && binding.RoleRef.Name == "eventing-config-reader" {
+			configReaderFound = true
+		}
+		if !metadataContainsValue(binding.Labels, binding.Annotations, string(broker.UID)) {
+			t.Errorf("system RoleBinding %q has no Broker UID marker for safe cleanup: labels=%v annotations=%v", binding.Name, binding.Labels, binding.Annotations)
+		}
+	}
+	if !configReaderFound {
+		t.Error("system namespace has no eventing-config-reader RoleBinding for the Broker ServiceAccount")
+	}
+
+	roles, err := kube.RbacV1().Roles(systemNamespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(roles.Items), 1; got != want {
+		t.Fatalf("generated system Roles = %d, want one exact-secret Role", got)
+	}
+	if got, want := roles.Items[0].Name, natsSecretRoleName; got != want {
+		t.Errorf("singleton system Role = %q, want %q", got, want)
+	}
+	if metadataContainsValue(roles.Items[0].Labels, roles.Items[0].Annotations, string(broker.UID)) {
+		t.Errorf("singleton system Role %q must not be owned by one Broker UID: labels=%v annotations=%v", roles.Items[0].Name, roles.Items[0].Labels, roles.Items[0].Annotations)
+	}
+	secretBindingFound := false
+	for _, binding := range bindings.Items {
+		if binding.RoleRef.Kind == "Role" && binding.RoleRef.Name == roles.Items[0].Name {
+			secretBindingFound = true
+		}
+	}
+	if !secretBindingFound {
+		t.Errorf("no system RoleBinding refers to exact-secret Role %q", roles.Items[0].Name)
+	}
+	wantSecrets := map[string]bool{
+		"nats-credentials": false,
+		"nats-client-tls":  false,
+		"nats-root-ca":     false,
+	}
+	for _, rule := range roles.Items[0].Rules {
+		if len(rule.APIGroups) != 1 || rule.APIGroups[0] != "" || len(rule.Resources) != 1 || rule.Resources[0] != "secrets" {
+			t.Errorf("exact-secret Role contains unrelated rule: %#v", rule)
+			continue
+		}
+		if len(rule.Verbs) != 1 || rule.Verbs[0] != "get" {
+			t.Errorf("Secret verbs = %v, want [get]", rule.Verbs)
+		}
+		for _, name := range rule.ResourceNames {
+			if _, ok := wantSecrets[name]; !ok {
+				t.Errorf("unexpected Secret resourceName %q", name)
+			} else {
+				wantSecrets[name] = true
+			}
+		}
+	}
+	for name, found := range wantSecrets {
+		if !found {
+			t.Errorf("exact-secret Role does not grant get on %q", name)
+		}
+	}
+}
+
+func metadataContainsValue(labels, annotations map[string]string, want string) bool {
+	for _, value := range labels {
+		if value == want {
+			return true
+		}
+	}
+	for _, value := range annotations {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestGetBrokerConfig(t *testing.T) {
@@ -486,9 +672,16 @@ func TestFinalizeKind(t *testing.T) {
 
 	kube := kubefake.NewSimpleClientset()
 	cmLister := corev1listers.NewConfigMapLister(cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}))
-	r := &Reconciler{js: js, contractManager: contract.NewManager(kube, cmLister)}
+	r := &Reconciler{
+		kubeClientSet: kube, js: js, contractManager: contract.NewManager(kube, cmLister),
+		filterServiceAccount: "dp-sa",
+		natsConfigJSON:       `{"auth":{"credentialFile":{"secret":{"name":"credentials"}}}}`,
+	}
 	ctx := testContext()
 	b := testBroker(testNamespace, testBrokerName)
+	if err := r.reconcileDataplaneRBAC(ctx, b); err != nil {
+		t.Fatalf("reconcileDataplaneRBAC() error: %v", err)
+	}
 
 	streamName := brokerutils.BrokerStreamName(b)
 	if _, err := js.AddStream(&nats.StreamConfig{
@@ -503,6 +696,22 @@ func TestFinalizeKind(t *testing.T) {
 	}
 	if _, err := js.StreamInfo(streamName); !errors.Is(err, nats.ErrStreamNotFound) {
 		t.Errorf("stream not deleted: got err %v", err)
+	}
+	identity := r.dataplaneIdentity(b)
+	if _, err := kube.CoreV1().ServiceAccounts(b.Namespace).Get(ctx, identity, metav1.GetOptions{}); !apierrs.IsNotFound(err) {
+		t.Errorf("finalized ServiceAccount still exists: %v", err)
+	}
+	for _, key := range []types.NamespacedName{
+		{Namespace: b.Namespace, Name: identity},
+		{Namespace: "knative-eventing", Name: systemRBACName(identity, "-config")},
+		{Namespace: "knative-eventing", Name: systemRBACName(identity, "-secrets")},
+	} {
+		if _, err := kube.RbacV1().RoleBindings(key.Namespace).Get(ctx, key.Name, metav1.GetOptions{}); !apierrs.IsNotFound(err) {
+			t.Errorf("finalized RoleBinding %s still exists: %v", key, err)
+		}
+	}
+	if _, err := kube.RbacV1().Roles("knative-eventing").Get(ctx, natsSecretRoleName, metav1.GetOptions{}); err != nil {
+		t.Errorf("singleton NATS Secret Role was deleted during Broker finalization: %v", err)
 	}
 }
 
@@ -554,6 +763,40 @@ func TestReconcileKind(t *testing.T) {
 		}
 	})
 
+	t.Run("no triggers: RBAC is revoked even when filter deletion fails", func(t *testing.T) {
+		r, kube := setup(t)
+		r.natsConfigJSON = `{"auth":{"credentialFile":{"secret":{"name":"credentials"}}}}`
+		b := testBroker(testNamespace, testBrokerName)
+		if err := r.reconcileDataplaneRBAC(testContext(), b); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := kube.AppsV1().Deployments(b.Namespace).Create(context.Background(), &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Name: resources.FilterName(b.Name), Namespace: b.Namespace},
+		}, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		kube.PrependReactor("delete", "deployments", func(clienttesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("deployment delete failed")
+		})
+
+		if err := r.ReconcileKind(testContext(), b); err == nil {
+			t.Fatal("ReconcileKind() succeeded despite filter deletion failure")
+		}
+		identity := r.dataplaneIdentity(b)
+		if _, err := kube.CoreV1().ServiceAccounts(b.Namespace).Get(context.Background(), identity, metav1.GetOptions{}); !apierrs.IsNotFound(err) {
+			t.Errorf("ServiceAccount was not revoked after filter deletion failure: %v", err)
+		}
+		for _, key := range []types.NamespacedName{
+			{Namespace: b.Namespace, Name: identity},
+			{Namespace: ingressNS, Name: systemRBACName(identity, "-config")},
+			{Namespace: ingressNS, Name: systemRBACName(identity, "-secrets")},
+		} {
+			if _, err := kube.RbacV1().RoleBindings(key.Namespace).Get(context.Background(), key.Name, metav1.GetOptions{}); !apierrs.IsNotFound(err) {
+				t.Errorf("RoleBinding %s was not revoked after filter deletion failure: %v", key, err)
+			}
+		}
+	})
+
 	t.Run("with a trigger: filter deployment is created", func(t *testing.T) {
 		r, kube := setup(t, testTrigger(testNamespace, "t1", testBrokerName))
 		b := testBroker(testNamespace, testBrokerName)
@@ -561,8 +804,13 @@ func TestReconcileKind(t *testing.T) {
 		if err := r.ReconcileKind(testContext(), b); err != nil {
 			t.Fatalf("ReconcileKind() error: %v", err)
 		}
-		if _, err := kube.AppsV1().Deployments(testNamespace).Get(context.Background(), resources.FilterName(testBrokerName), metav1.GetOptions{}); err != nil {
+		deployment, err := kube.AppsV1().Deployments(testNamespace).Get(context.Background(), resources.FilterName(testBrokerName), metav1.GetOptions{})
+		if err != nil {
 			t.Errorf("filter deployment should be created: %v", err)
+			return
+		}
+		if got, want := deployment.Spec.Template.Spec.ServiceAccountName, r.dataplaneIdentity(b); got != want {
+			t.Errorf("filter ServiceAccount = %q, want per-Broker identity %q", got, want)
 		}
 	})
 }

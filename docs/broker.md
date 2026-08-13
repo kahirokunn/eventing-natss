@@ -298,6 +298,11 @@ configured static `filter.replicas` value.
 
 These variables set the **broker-wide defaults** for the filter deployment. All triggers in the same broker share these defaults unless they override them with per-trigger annotations (see below).
 
+Deployment template labels and environment variables are additive. The
+controller-owned Broker, role, namespace, stream, NATS, metrics, logging,
+leader-election, Pod, and container identity values take precedence when a
+template uses the same key or environment variable name.
+
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `NATS_URL` | NATS server URL | Required |

@@ -542,10 +542,18 @@ func (r *Reconciler) reconcileFilterDeployment(ctx context.Context, b *eventingv
 		expected.Spec.Replicas = ptr.To(*existing.Spec.Replicas)
 	}
 
-	// Update if needed
-	if !equality.Semantic.DeepEqual(expected.Spec, existing.Spec) {
-		toUpdate := existing.DeepCopy()
-		toUpdate.Spec = expected.Spec
+	toUpdate := existing.DeepCopy()
+	toUpdate.Spec = expected.Spec
+	if toUpdate.Labels == nil {
+		toUpdate.Labels = make(map[string]string, len(expected.Labels))
+	}
+	for key, value := range expected.Labels {
+		toUpdate.Labels[key] = value
+	}
+
+	// Update if needed. Existing extra metadata labels are preserved while
+	// controller-owned and current template labels are repaired.
+	if !equality.Semantic.DeepEqual(toUpdate.Spec, existing.Spec) || !equality.Semantic.DeepEqual(toUpdate.Labels, existing.Labels) {
 		_, err = r.kubeClientSet.AppsV1().Deployments(b.Namespace).Update(ctx, toUpdate, metav1.UpdateOptions{})
 		if err != nil {
 			logger.Errorw("Failed to update filter deployment", zap.Error(err))

@@ -17,16 +17,76 @@ limitations under the License.
 package resources
 
 import (
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/util/validation"
 	eventingv1 "knative.dev/eventing/pkg/apis/eventing/v1"
 	"knative.dev/pkg/ptr"
+	"knative.dev/pkg/system"
 
+	brokerautoscaler "knative.dev/eventing-natss/pkg/broker/autoscaler"
 	brokerconfig "knative.dev/eventing-natss/pkg/broker/config"
 )
+
+func TestLongBrokerGeneratedResourceNamesFitDNSLabelLimit(t *testing.T) {
+	broker := &eventingv1.Broker{ObjectMeta: metav1.ObjectMeta{
+		Name:      strings.Repeat("b", 63),
+		Namespace: "test-namespace",
+		UID:       "test-uid",
+	}}
+	filterName := FilterName(broker.Name)
+	deployment := MakeFilterDeployment(&FilterArgs{Broker: broker})
+	service := MakeFilterService(broker)
+	scaledObject, err := brokerautoscaler.MakeScaledObject(
+		broker,
+		nil,
+		filterName,
+		brokerautoscaler.Settings{Enabled: true, MinScale: 0, MaxScale: 2, PollingInterval: 10, CooldownPeriod: 30},
+		brokerautoscaler.MonitoringConfig{Endpoint: "nats.nats-io.svc:8222", Account: "$G"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hpaName, found, err := unstructured.NestedString(
+		scaledObject.Object,
+		"spec", "advanced", "horizontalPodAutoscalerConfig", "name",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("generated HPA name is missing")
+	}
+
+	for kind, name := range map[string]string{
+		"Deployment":   deployment.Name,
+		"Service":      service.Name,
+		"ScaledObject": scaledObject.GetName(),
+		"HPA":          hpaName,
+	} {
+		if len(name) > 63 {
+			t.Errorf("%s name has %d characters, want at most 63: %q", kind, len(name), name)
+		}
+		if errs := validation.IsDNS1035Label(name); len(errs) > 0 {
+			t.Errorf("%s name %q is not a DNS-1035 label: %v", kind, name, errs)
+		}
+	}
+	if deployment.Name != filterName || service.Name != filterName {
+		t.Fatalf("filter resource names differ: FilterName=%q Deployment=%q Service=%q", filterName, deployment.Name, service.Name)
+	}
+	targetName, found, err := unstructured.NestedString(scaledObject.Object, "spec", "scaleTargetRef", "name")
+	if err != nil || !found {
+		t.Fatalf("scaled target name is missing: found=%v err=%v", found, err)
+	}
+	if targetName != filterName {
+		t.Fatalf("scale target = %q, want %q", targetName, filterName)
+	}
+}
 
 func TestMakeFilterDeployment(t *testing.T) {
 	broker := &eventingv1.Broker{
@@ -174,6 +234,49 @@ func TestMakeFilterDeployment(t *testing.T) {
 				t.Error("ReadinessProbe should not be nil")
 			}
 		})
+	}
+}
+
+func TestMakeFilterDeploymentRequiredLabelsCannotBeOverridden(t *testing.T) {
+	broker := &eventingv1.Broker{ObjectMeta: metav1.ObjectMeta{
+		Name: "test-broker", Namespace: "test-namespace", UID: "test-uid",
+	}}
+	deployment := MakeFilterDeployment(&FilterArgs{
+		Broker: broker,
+		Template: &brokerconfig.DeploymentTemplate{
+			Labels: map[string]string{
+				BrokerLabelKey:            "wrong-broker",
+				RoleLabelKey:              "wrong-role",
+				"custom-deployment-label": "kept",
+			},
+			PodLabels: map[string]string{
+				BrokerLabelKey:     "wrong-broker",
+				RoleLabelKey:       "wrong-role",
+				"custom-pod-label": "kept",
+			},
+		},
+	})
+	required := FilterLabels(broker.Name)
+
+	for key, want := range required {
+		if got := deployment.Labels[key]; got != want {
+			t.Errorf("Deployment label %q = %q, want required value %q", key, got, want)
+		}
+		if got := deployment.Spec.Selector.MatchLabels[key]; got != want {
+			t.Errorf("selector label %q = %q, want required value %q", key, got, want)
+		}
+		if got := deployment.Spec.Template.Labels[key]; got != want {
+			t.Errorf("Pod label %q = %q, want required value %q", key, got, want)
+		}
+		if deployment.Spec.Template.Labels[key] != deployment.Spec.Selector.MatchLabels[key] {
+			t.Errorf("Pod label %q does not match selector: Pod=%q selector=%q", key, deployment.Spec.Template.Labels[key], deployment.Spec.Selector.MatchLabels[key])
+		}
+	}
+	if got := deployment.Labels["custom-deployment-label"]; got != "kept" {
+		t.Errorf("custom Deployment label = %q, want kept", got)
+	}
+	if got := deployment.Spec.Template.Labels["custom-pod-label"]; got != "kept" {
+		t.Errorf("custom Pod label = %q, want kept", got)
 	}
 }
 
@@ -359,5 +462,67 @@ func TestMakeFilterEnvVars(t *testing.T) {
 	// Filter should have CONFIG_LEADERELECTION_NAME
 	if envMap["CONFIG_LEADERELECTION_NAME"] != "config-leader-election" {
 		t.Errorf("CONFIG_LEADERELECTION_NAME = %v, want config-leader-election", envMap["CONFIG_LEADERELECTION_NAME"])
+	}
+}
+
+func TestMakeFilterEnvRequiredValuesCannotBeOverridden(t *testing.T) {
+	broker := &eventingv1.Broker{ObjectMeta: metav1.ObjectMeta{
+		Name: "test-broker", Namespace: "test-namespace",
+	}}
+	requiredValues := map[string]string{
+		system.NamespaceEnvKey:       system.Namespace(),
+		"NAMESPACE":                  broker.Namespace,
+		"BROKER_NAME":                broker.Name,
+		"BROKER_NAMESPACE":           broker.Namespace,
+		"STREAM_NAME":                "TEST_STREAM",
+		"NATS_URL":                   "nats://nats:4222",
+		"METRICS_DOMAIN":             "knative.dev/eventing",
+		"CONFIG_LOGGING_NAME":        "config-logging",
+		"CONFIG_LEADERELECTION_NAME": "config-leader-election",
+		"CONTAINER_NAME":             FilterContainerName,
+	}
+	templateEnv := make([]corev1.EnvVar, 0, len(requiredValues)+2)
+	for name := range requiredValues {
+		templateEnv = append(templateEnv, corev1.EnvVar{Name: name, Value: "user-override"})
+	}
+	templateEnv = append(templateEnv,
+		corev1.EnvVar{Name: "POD_NAME", Value: "user-override"},
+		corev1.EnvVar{Name: "CUSTOM_ENV", Value: "$(BROKER_NAME)-suffix"},
+	)
+	deployment := MakeFilterDeployment(&FilterArgs{
+		Broker:     broker,
+		StreamName: "TEST_STREAM",
+		NatsURL:    "nats://nats:4222",
+		Template:   &brokerconfig.DeploymentTemplate{Env: templateEnv},
+	})
+
+	counts := make(map[string]int)
+	byName := make(map[string]corev1.EnvVar)
+	indices := make(map[string]int)
+	for index, env := range deployment.Spec.Template.Spec.Containers[0].Env {
+		counts[env.Name]++
+		byName[env.Name] = env
+		indices[env.Name] = index
+	}
+	for name, want := range requiredValues {
+		if counts[name] != 1 {
+			t.Errorf("environment variable %q appears %d times, want exactly 1", name, counts[name])
+		}
+		if got := byName[name]; got.Value != want || got.ValueFrom != nil {
+			t.Errorf("environment variable %q = %#v, want controller value %q", name, got, want)
+		}
+	}
+	if counts["POD_NAME"] != 1 {
+		t.Errorf("environment variable POD_NAME appears %d times, want exactly 1", counts["POD_NAME"])
+	}
+	podName := byName["POD_NAME"]
+	if podName.Value != "" || podName.ValueFrom == nil || podName.ValueFrom.FieldRef == nil || podName.ValueFrom.FieldRef.FieldPath != "metadata.name" {
+		t.Errorf("POD_NAME = %#v, want controller metadata.name field reference", podName)
+	}
+	if counts["CUSTOM_ENV"] != 1 || byName["CUSTOM_ENV"].Value != "$(BROKER_NAME)-suffix" {
+		t.Errorf("CUSTOM_ENV = %#v count=%d, want retained custom value", byName["CUSTOM_ENV"], counts["CUSTOM_ENV"])
+	}
+	if indices["CUSTOM_ENV"] <= indices["BROKER_NAME"] {
+		t.Errorf("CUSTOM_ENV index = %d, want after BROKER_NAME index %d so Kubernetes can expand $(BROKER_NAME)", indices["CUSTOM_ENV"], indices["BROKER_NAME"])
 	}
 }

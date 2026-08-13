@@ -17,6 +17,7 @@ limitations under the License.
 package resources
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -44,6 +45,37 @@ func TestFilterName(t *testing.T) {
 				t.Errorf("FilterName() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestFilterNameLongBrokerBoundary(t *testing.T) {
+	legacyBoundary := strings.Repeat("a", 49)
+	if got, want := FilterName(legacyBoundary), legacyBoundary+"-broker-filter"; got != want {
+		t.Fatalf("FilterName(49 chars) = %q, want legacy name %q", got, want)
+	}
+	if got := FilterName(legacyBoundary); len(got) != 63 {
+		t.Fatalf("len(FilterName(49 chars)) = %d, want 63 (%q)", len(got), got)
+	}
+
+	for _, length := range []int{50, 63} {
+		brokerName := strings.Repeat("a", length)
+		got := FilterName(brokerName)
+		if len(got) > 63 {
+			t.Fatalf("len(FilterName(%d chars)) = %d, want at most 63 (%q)", length, len(got), got)
+		}
+		if got == brokerName+"-broker-filter" {
+			t.Fatalf("FilterName(%d chars) was not shortened: %q", length, got)
+		}
+		if again := FilterName(brokerName); again != got {
+			t.Fatalf("FilterName(%d chars) is unstable: first %q, second %q", length, got, again)
+		}
+	}
+
+	sharedPrefix := strings.Repeat("a", 49)
+	left := FilterName(sharedPrefix + "b")
+	right := FilterName(sharedPrefix + "c")
+	if left == right {
+		t.Fatalf("different long Broker names collided at %q", left)
 	}
 }
 
@@ -106,10 +138,10 @@ func TestMergeMaps(t *testing.T) {
 			want:     map[string]string{"a": "1", "b": "2"},
 		},
 		{
-			name:     "override takes precedence",
+			name:     "required base takes precedence",
 			base:     map[string]string{"a": "1", "b": "2"},
 			override: map[string]string{"b": "override", "c": "3"},
-			want:     map[string]string{"a": "1", "b": "override", "c": "3"},
+			want:     map[string]string{"a": "1", "b": "2", "c": "3"},
 		},
 	}
 

@@ -209,18 +209,19 @@ func TestDeleteDataplaneRBACUsesUIDPreconditions(t *testing.T) {
 	}
 
 	identity := r.dataplaneIdentity(broker)
-	setServiceAccountUID(t, kube, broker.Namespace, identity, "sa-uid")
-	setRoleBindingUID(t, kube, broker.Namespace, identity, "tenant-binding-uid")
-	setRoleBindingUID(t, kube, systemNamespace, systemRBACName(identity, "-config"), "config-binding-uid")
-	setRoleBindingUID(t, kube, systemNamespace, systemRBACName(identity, "-secrets"), "secret-binding-uid")
+	setServiceAccountIdentity(t, kube, broker.Namespace, identity, "sa-uid", "sa-rv")
+	setRoleBindingIdentity(t, kube, broker.Namespace, identity, "tenant-binding-uid", "tenant-binding-rv")
+	setRoleBindingIdentity(t, kube, systemNamespace, systemRBACName(identity, "-config"), "config-binding-uid", "config-binding-rv")
+	setRoleBindingIdentity(t, kube, systemNamespace, systemRBACName(identity, "-secrets"), "secret-binding-uid", "secret-binding-rv")
 	kube.ClearActions()
 
 	if err := r.deleteDataplaneRBAC(ctx, broker); err != nil {
 		t.Fatal(err)
 	}
-	wantUIDs := map[types.UID]bool{
-		"sa-uid": false, "tenant-binding-uid": false, "config-binding-uid": false, "secret-binding-uid": false,
+	wantPreconditions := map[types.UID]string{
+		"sa-uid": "sa-rv", "tenant-binding-uid": "tenant-binding-rv", "config-binding-uid": "config-binding-rv", "secret-binding-uid": "secret-binding-rv",
 	}
+	foundUIDs := make(map[types.UID]bool, len(wantPreconditions))
 	deletes := 0
 	for _, action := range kube.Actions() {
 		if action.GetVerb() != "delete" {
@@ -228,22 +229,27 @@ func TestDeleteDataplaneRBACUsesUIDPreconditions(t *testing.T) {
 		}
 		deletes++
 		options := action.(clienttesting.DeleteAction).GetDeleteOptions()
-		if options.Preconditions == nil || options.Preconditions.UID == nil {
-			t.Errorf("delete %s/%s has no UID precondition", action.GetNamespace(), action.GetResource().Resource)
+		if options.Preconditions == nil || options.Preconditions.UID == nil || options.Preconditions.ResourceVersion == nil {
+			t.Errorf("delete %s/%s has incomplete preconditions: %#v", action.GetNamespace(), action.GetResource().Resource, options.Preconditions)
 			continue
 		}
 		uid := *options.Preconditions.UID
-		if _, ok := wantUIDs[uid]; !ok {
+		wantResourceVersion, ok := wantPreconditions[uid]
+		if !ok {
 			t.Errorf("unexpected delete UID precondition %q", uid)
-		} else {
-			wantUIDs[uid] = true
+		} else if got := *options.Preconditions.ResourceVersion; got != wantResourceVersion {
+			t.Errorf("delete UID %q resourceVersion precondition = %q, want %q", uid, got, wantResourceVersion)
+		}
+		foundUIDs[uid] = true
+		if options.PropagationPolicy != nil {
+			t.Errorf("RBAC delete propagation = %v, want nil", options.PropagationPolicy)
 		}
 	}
-	if deletes != len(wantUIDs) {
-		t.Errorf("delete actions = %d, want %d", deletes, len(wantUIDs))
+	if deletes != len(wantPreconditions) {
+		t.Errorf("delete actions = %d, want %d", deletes, len(wantPreconditions))
 	}
-	for uid, found := range wantUIDs {
-		if !found {
+	for uid := range wantPreconditions {
+		if !foundUIDs[uid] {
 			t.Errorf("no delete used UID precondition %q", uid)
 		}
 	}
@@ -519,25 +525,27 @@ func countActions(actions []clienttesting.Action, verb, resource string) int {
 	return count
 }
 
-func setServiceAccountUID(t *testing.T, kube *kubefake.Clientset, namespace, name string, uid types.UID) {
+func setServiceAccountIdentity(t *testing.T, kube *kubefake.Clientset, namespace, name string, uid types.UID, resourceVersion string) {
 	t.Helper()
 	object, err := kube.CoreV1().ServiceAccounts(namespace).Get(context.Background(), name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	object.UID = uid
+	object.ResourceVersion = resourceVersion
 	if _, err := kube.CoreV1().ServiceAccounts(namespace).Update(context.Background(), object, metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func setRoleBindingUID(t *testing.T, kube *kubefake.Clientset, namespace, name string, uid types.UID) {
+func setRoleBindingIdentity(t *testing.T, kube *kubefake.Clientset, namespace, name string, uid types.UID, resourceVersion string) {
 	t.Helper()
 	object, err := kube.RbacV1().RoleBindings(namespace).Get(context.Background(), name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	object.UID = uid
+	object.ResourceVersion = resourceVersion
 	if _, err := kube.RbacV1().RoleBindings(namespace).Update(context.Background(), object, metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}

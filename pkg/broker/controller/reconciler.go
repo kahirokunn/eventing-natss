@@ -80,7 +80,10 @@ const (
 	FilterReaderClusterRoleName = "natsjetstream-broker-filter-reader"
 )
 
-var errFilterDeploymentNotOwned = errors.New("filter deployment is not owned by broker")
+var (
+	errFilterDeploymentNotOwned = errors.New("filter deployment is not owned by broker")
+	errFilterServiceNotOwned    = errors.New("filter service is not owned by broker")
+)
 
 // Reconciler implements controller.Reconciler for Broker resources.
 type Reconciler struct {
@@ -179,6 +182,13 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, b *eventingv1.Broker) pk
 	if err != nil {
 		b.Status.MarkFilterFailed("TriggerListFailed", "Failed to list triggers: %v", err)
 		return fmt.Errorf("failed to list triggers: %w", err)
+	}
+	if len(triggers) == 0 {
+		triggers, err = r.listLiveTriggers(ctx, b)
+		if err != nil {
+			b.Status.MarkFilterFailed("TriggerListFailed", "Failed to confirm the live trigger list: %v", err)
+			return fmt.Errorf("failed to confirm live triggers before filter cleanup: %w", err)
+		}
 	}
 	autoscalerFallback := false
 	autoscalerConfigured := false
@@ -556,18 +566,12 @@ func (r *Reconciler) reconcileFilterDeployment(ctx context.Context, b *eventingv
 		expected.Spec.Replicas = ptr.To(*existing.Spec.Replicas)
 	}
 
-	toUpdate := existing.DeepCopy()
-	toUpdate.Spec = expected.Spec
-	if toUpdate.Labels == nil {
-		toUpdate.Labels = make(map[string]string, len(expected.Labels))
-	}
-	for key, value := range expected.Labels {
-		toUpdate.Labels[key] = value
+	toUpdate, err := mergeFilterDeployment(existing, expected)
+	if err != nil {
+		return err
 	}
 
-	// Update if needed. Existing extra metadata labels are preserved while
-	// controller-owned and current template labels are repaired.
-	if !equality.Semantic.DeepEqual(toUpdate.Spec, existing.Spec) || !equality.Semantic.DeepEqual(toUpdate.Labels, existing.Labels) {
+	if !equality.Semantic.DeepEqual(toUpdate, existing) {
 		_, err = r.kubeClientSet.AppsV1().Deployments(b.Namespace).Update(ctx, toUpdate, metav1.UpdateOptions{})
 		if err != nil {
 			logger.Errorw("Failed to update filter deployment", zap.Error(err))
@@ -604,12 +608,15 @@ func (r *Reconciler) reconcileFilterService(ctx context.Context, b *eventingv1.B
 		return nil, fmt.Errorf("failed to get filter service: %w", err)
 	}
 
-	// Update ClusterIP from existing service (immutable field)
-	expected.Spec.ClusterIP = existing.Spec.ClusterIP
+	if !metav1.IsControlledBy(existing, b) {
+		return nil, fmt.Errorf("%w: %s/%s", errFilterServiceNotOwned, b.Namespace, name)
+	}
 
-	if !equality.Semantic.DeepEqual(expected.Spec, existing.Spec) {
-		toUpdate := existing.DeepCopy()
-		toUpdate.Spec = expected.Spec
+	toUpdate, err := mergeFilterService(existing, expected)
+	if err != nil {
+		return nil, err
+	}
+	if !equality.Semantic.DeepEqual(toUpdate, existing) {
 		svc, err := r.kubeClientSet.CoreV1().Services(b.Namespace).Update(ctx, toUpdate, metav1.UpdateOptions{})
 		if err != nil {
 			logger.Errorw("Failed to update filter service", zap.Error(err))
@@ -632,6 +639,26 @@ func (r *Reconciler) listTriggers(b *eventingv1.Broker) ([]*eventingv1.Trigger, 
 	for _, t := range triggers {
 		if t.Spec.Broker == b.Name {
 			result = append(result, t)
+		}
+	}
+	return result, nil
+}
+
+// listLiveTriggers closes the destructive cache-miss window before filter
+// teardown. Informers are eventually consistent, so an empty cached list is
+// not sufficient evidence that a newly-created Trigger does not exist.
+func (r *Reconciler) listLiveTriggers(ctx context.Context, b *eventingv1.Broker) ([]*eventingv1.Trigger, error) {
+	if r.eventingClient == nil {
+		return nil, errors.New("eventing client is unavailable")
+	}
+	list, err := r.eventingClient.EventingV1().Triggers(b.Namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	result := make([]*eventingv1.Trigger, 0, len(list.Items))
+	for index := range list.Items {
+		if list.Items[index].Spec.Broker == b.Name {
+			result = append(result, list.Items[index].DeepCopy())
 		}
 	}
 	return result, nil
@@ -698,23 +725,123 @@ func (r *Reconciler) reconcileAutoscalerFallback(ctx context.Context, b *eventin
 func (r *Reconciler) deleteFilter(ctx context.Context, b *eventingv1.Broker) pkgreconciler.Event {
 	logger := logging.FromContext(ctx)
 	name := resources.FilterName(b.Name)
+	if err := r.preflightFilterDeletion(ctx, b, name); err != nil {
+		return err
+	}
 	if err := r.deleteScaledObject(ctx, b, name); err != nil {
 		logger.Errorw("Failed to delete filter ScaledObject", zap.Error(err))
 		b.Status.MarkFilterFailed("ScaledObjectDeleteFailed", "Failed to delete filter ScaledObject: %v", err)
 		return fmt.Errorf("failed to delete filter ScaledObject: %w", err)
 	}
 
-	if err := r.kubeClientSet.AppsV1().Deployments(b.Namespace).Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !apierrs.IsNotFound(err) {
+	if err := r.deleteFilterDeployment(ctx, b, name); err != nil {
 		logger.Errorw("Failed to delete filter deployment", zap.Error(err))
 		b.Status.MarkFilterFailed("FilterDeploymentDeleteFailed", "Failed to delete filter deployment: %v", err)
 		return fmt.Errorf("failed to delete filter deployment: %w", err)
 	}
-	if err := r.kubeClientSet.CoreV1().Services(b.Namespace).Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !apierrs.IsNotFound(err) {
+	if err := r.deleteFilterService(ctx, b, name); err != nil {
 		logger.Errorw("Failed to delete filter service", zap.Error(err))
 		b.Status.MarkFilterFailed("FilterServiceDeleteFailed", "Failed to delete filter service: %v", err)
 		return fmt.Errorf("failed to delete filter service: %w", err)
 	}
 	return nil
+}
+
+// preflightFilterDeletion validates every same-name child before mutating any
+// of them. This prevents a foreign collision in one kind from causing partial
+// deletion of the Broker-owned children in the other kinds.
+func (r *Reconciler) preflightFilterDeletion(ctx context.Context, b *eventingv1.Broker, name string) error {
+	if err := r.preflightScaledObjectDeletion(ctx, b, name); err != nil {
+		return err
+	}
+	deployment, err := r.kubeClientSet.AppsV1().Deployments(b.Namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil && !apierrs.IsNotFound(err) {
+		return fmt.Errorf("failed to get filter deployment before deletion: %w", err)
+	}
+	if err == nil && !metav1.IsControlledBy(deployment, b) {
+		return fmt.Errorf("%w: %s/%s", errFilterDeploymentNotOwned, b.Namespace, name)
+	}
+	service, err := r.kubeClientSet.CoreV1().Services(b.Namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil && !apierrs.IsNotFound(err) {
+		return fmt.Errorf("failed to get filter service before deletion: %w", err)
+	}
+	if err == nil && !metav1.IsControlledBy(service, b) {
+		return fmt.Errorf("%w: %s/%s", errFilterServiceNotOwned, b.Namespace, name)
+	}
+	return nil
+}
+
+func objectDeleteOptions(object metav1.Object, propagation *metav1.DeletionPropagation) metav1.DeleteOptions {
+	uid := object.GetUID()
+	resourceVersion := object.GetResourceVersion()
+	return metav1.DeleteOptions{
+		PropagationPolicy: propagation,
+		Preconditions: &metav1.Preconditions{
+			UID:             &uid,
+			ResourceVersion: &resourceVersion,
+		},
+	}
+}
+
+func (r *Reconciler) deleteFilterDeployment(ctx context.Context, b *eventingv1.Broker, name string) error {
+	client := r.kubeClientSet.AppsV1().Deployments(b.Namespace)
+	existing, err := client.Get(ctx, name, metav1.GetOptions{})
+	if apierrs.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !metav1.IsControlledBy(existing, b) {
+		return fmt.Errorf("%w: %s/%s", errFilterDeploymentNotOwned, b.Namespace, name)
+	}
+	if existing.DeletionTimestamp == nil {
+		foreground := metav1.DeletePropagationForeground
+		if err := client.Delete(ctx, name, objectDeleteOptions(existing, &foreground)); err != nil && !apierrs.IsNotFound(err) {
+			return err
+		}
+	}
+	remaining, err := client.Get(ctx, name, metav1.GetOptions{})
+	if apierrs.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if remaining.UID != existing.UID || !metav1.IsControlledBy(remaining, b) {
+		return fmt.Errorf("%w: %s/%s changed while being deleted", errFilterDeploymentNotOwned, b.Namespace, name)
+	}
+	return controller.NewRequeueAfter(time.Second)
+}
+
+func (r *Reconciler) deleteFilterService(ctx context.Context, b *eventingv1.Broker, name string) error {
+	client := r.kubeClientSet.CoreV1().Services(b.Namespace)
+	existing, err := client.Get(ctx, name, metav1.GetOptions{})
+	if apierrs.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !metav1.IsControlledBy(existing, b) {
+		return fmt.Errorf("%w: %s/%s", errFilterServiceNotOwned, b.Namespace, name)
+	}
+	if existing.DeletionTimestamp == nil {
+		if err := client.Delete(ctx, name, objectDeleteOptions(existing, nil)); err != nil && !apierrs.IsNotFound(err) {
+			return err
+		}
+	}
+	remaining, err := client.Get(ctx, name, metav1.GetOptions{})
+	if apierrs.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if remaining.UID != existing.UID || !metav1.IsControlledBy(remaining, b) {
+		return fmt.Errorf("%w: %s/%s changed while being deleted", errFilterServiceNotOwned, b.Namespace, name)
+	}
+	return controller.NewRequeueAfter(time.Second)
 }
 
 // FinalizeKind cleans up resources when the broker is deleted

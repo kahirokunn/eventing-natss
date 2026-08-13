@@ -146,11 +146,7 @@ func (r *Reconciler) deleteScaledObject(ctx context.Context, broker *eventingv1.
 	}
 	if existing.GetDeletionTimestamp() == nil {
 		foreground := metav1.DeletePropagationForeground
-		uid := existing.GetUID()
-		options := metav1.DeleteOptions{
-			PropagationPolicy: &foreground,
-			Preconditions:     &metav1.Preconditions{UID: &uid},
-		}
+		options := objectDeleteOptions(existing, &foreground)
 		if err := resources.Delete(ctx, name, options); err != nil && !apierrs.IsNotFound(err) {
 			return fmt.Errorf("failed to delete ScaledObject %s/%s: %w", broker.Namespace, name, err)
 		}
@@ -170,6 +166,24 @@ func (r *Reconciler) deleteScaledObject(ctx context.Context, broker *eventingv1.
 		}
 	}
 	return controller.NewRequeueAfter(30 * time.Second)
+}
+
+func (r *Reconciler) preflightScaledObjectDeletion(ctx context.Context, broker *eventingv1.Broker, targetName string) error {
+	if r.dynamicClient == nil {
+		return nil
+	}
+	name := autoscaler.ScaledObjectName(targetName)
+	existing, err := r.dynamicClient.Resource(autoscaler.ScaledObjectGVR).Namespace(broker.Namespace).Get(ctx, name, metav1.GetOptions{})
+	if apierrs.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to get ScaledObject %s/%s before filter deletion: %w", broker.Namespace, name, err)
+	}
+	if !metav1.IsControlledBy(existing, broker) {
+		return fmt.Errorf("%w: %s/%s", errScaledObjectNotOwned, broker.Namespace, name)
+	}
+	return nil
 }
 
 // rejectForeignScaledObject checks whether the well-known ScaledObject name is

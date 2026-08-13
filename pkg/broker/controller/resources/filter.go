@@ -19,6 +19,7 @@ package resources
 import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
@@ -69,7 +70,7 @@ func MakeFilterDeployment(args *FilterArgs) *appsv1.Deployment {
 	// Pod spec customization
 	var nodeSelector map[string]string
 	var affinity *corev1.Affinity
-	var resources corev1.ResourceRequirements
+	resources := defaultFilterResources()
 
 	// Apply template if provided
 	if args.Template != nil {
@@ -94,7 +95,9 @@ func MakeFilterDeployment(args *FilterArgs) *appsv1.Deployment {
 		if args.Template.Affinity != nil {
 			affinity = args.Template.Affinity
 		}
-		resources = args.Template.Resources
+		if hasResourceRequirements(args.Template.Resources) {
+			resources = *args.Template.Resources.DeepCopy()
+		}
 	}
 
 	return &appsv1.Deployment{
@@ -126,6 +129,15 @@ func MakeFilterDeployment(args *FilterArgs) *appsv1.Deployment {
 							Image:     args.Image,
 							Env:       makeFilterEnv(args),
 							Resources: resources,
+							SecurityContext: &corev1.SecurityContext{
+								AllowPrivilegeEscalation: ptr.To(false),
+								ReadOnlyRootFilesystem:   ptr.To(true),
+								RunAsNonRoot:             ptr.To(true),
+								Capabilities: &corev1.Capabilities{
+									Drop: []corev1.Capability{"ALL"},
+								},
+								SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+							},
 							Ports: []corev1.ContainerPort{
 								{
 									Name:          IngressPortName,
@@ -164,6 +176,23 @@ func MakeFilterDeployment(args *FilterArgs) *appsv1.Deployment {
 			},
 		},
 	}
+}
+
+func defaultFilterResources() corev1.ResourceRequirements {
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("100m"),
+			corev1.ResourceMemory: resource.MustParse("64Mi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("500m"),
+			corev1.ResourceMemory: resource.MustParse("256Mi"),
+		},
+	}
+}
+
+func hasResourceRequirements(resources corev1.ResourceRequirements) bool {
+	return len(resources.Requests) > 0 || len(resources.Limits) > 0 || len(resources.Claims) > 0
 }
 
 // MakeFilterService creates a Service for the broker filter

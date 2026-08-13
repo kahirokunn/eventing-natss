@@ -166,6 +166,13 @@ spec:
 
 ## Configuration
 
+Generated filter Pods run as non-root with a read-only root filesystem,
+RuntimeDefault seccomp, no privilege escalation, and all Linux capabilities
+dropped. Unless a non-empty `filter.resources` template is supplied, each
+filter container requests `100m` CPU and `64Mi` memory and is limited to `500m`
+CPU and `256Mi` memory. A non-empty partial resources template is honored
+exactly; omitted fields are not backfilled.
+
 ### Configure NATS authentication and TLS
 
 The Broker controller, Trigger controller, ingress, and generated filters use

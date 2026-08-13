@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -251,6 +252,95 @@ func TestMakeFilterDeploymentTerminationGracePeriod(t *testing.T) {
 	}
 	if *got != 45 {
 		t.Errorf("terminationGracePeriodSeconds = %d, want 45", *got)
+	}
+}
+
+func TestMakeFilterDeploymentDefaultsResourcesAndSecurity(t *testing.T) {
+	broker := &eventingv1.Broker{ObjectMeta: metav1.ObjectMeta{
+		Name: "test-broker", Namespace: "test-namespace", UID: "test-uid",
+	}}
+	deployment := MakeFilterDeployment(&FilterArgs{
+		Broker: broker, Image: "filter:latest", ServiceAccountName: "filter-sa",
+		StreamName: "TEST_STREAM", NatsURL: "nats://nats:4222",
+	})
+
+	filter := deployment.Spec.Template.Spec.Containers[0]
+	assertDefaultFilterResources(t, filter.Resources)
+	assertDefaultFilterSecurityContext(t, filter.SecurityContext)
+}
+
+func TestMakeFilterDeploymentExplicitResourcesAreExact(t *testing.T) {
+	broker := &eventingv1.Broker{ObjectMeta: metav1.ObjectMeta{
+		Name: "test-broker", Namespace: "test-namespace", UID: "test-uid",
+	}}
+	want := corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("225m")},
+		Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("384Mi")},
+	}
+	deployment := MakeFilterDeployment(&FilterArgs{
+		Broker: broker, Image: "filter:latest", ServiceAccountName: "filter-sa",
+		StreamName: "TEST_STREAM", NatsURL: "nats://nats:4222",
+		Template: &brokerconfig.DeploymentTemplate{Resources: want},
+	})
+
+	got := deployment.Spec.Template.Spec.Containers[0].Resources
+	if !apiequality.Semantic.DeepEqual(got, want) {
+		t.Errorf("explicit resources = %#v, want exact template %#v", got, want)
+	}
+}
+
+func TestMakeFilterDeploymentEmptyResourcesUseSafeDefaults(t *testing.T) {
+	broker := &eventingv1.Broker{ObjectMeta: metav1.ObjectMeta{
+		Name: "test-broker", Namespace: "test-namespace", UID: "test-uid",
+	}}
+	deployment := MakeFilterDeployment(&FilterArgs{
+		Broker: broker, Image: "filter:latest", ServiceAccountName: "filter-sa",
+		StreamName: "TEST_STREAM", NatsURL: "nats://nats:4222",
+		Template: &brokerconfig.DeploymentTemplate{
+			Annotations: map[string]string{"custom.example/enabled": "true"},
+			Resources:   corev1.ResourceRequirements{},
+		},
+	})
+
+	assertDefaultFilterResources(t, deployment.Spec.Template.Spec.Containers[0].Resources)
+}
+
+func assertDefaultFilterResources(t *testing.T, got corev1.ResourceRequirements) {
+	t.Helper()
+	want := corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("100m"),
+			corev1.ResourceMemory: resource.MustParse("64Mi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("500m"),
+			corev1.ResourceMemory: resource.MustParse("256Mi"),
+		},
+	}
+	if !apiequality.Semantic.DeepEqual(got, want) {
+		t.Errorf("default filter resources = %#v, want %#v", got, want)
+	}
+}
+
+func assertDefaultFilterSecurityContext(t *testing.T, got *corev1.SecurityContext) {
+	t.Helper()
+	if got == nil {
+		t.Fatal("filter securityContext is nil")
+	}
+	if got.RunAsNonRoot == nil || !*got.RunAsNonRoot {
+		t.Errorf("runAsNonRoot = %v, want true", got.RunAsNonRoot)
+	}
+	if got.AllowPrivilegeEscalation == nil || *got.AllowPrivilegeEscalation {
+		t.Errorf("allowPrivilegeEscalation = %v, want false", got.AllowPrivilegeEscalation)
+	}
+	if got.ReadOnlyRootFilesystem == nil || !*got.ReadOnlyRootFilesystem {
+		t.Errorf("readOnlyRootFilesystem = %v, want true", got.ReadOnlyRootFilesystem)
+	}
+	if got.Capabilities == nil || len(got.Capabilities.Add) != 0 || !apiequality.Semantic.DeepEqual(got.Capabilities.Drop, []corev1.Capability{"ALL"}) {
+		t.Errorf("capabilities = %#v, want drop ALL with no additions", got.Capabilities)
+	}
+	if got.SeccompProfile == nil || got.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault || got.SeccompProfile.LocalhostProfile != nil {
+		t.Errorf("seccompProfile = %#v, want RuntimeDefault", got.SeccompProfile)
 	}
 }
 

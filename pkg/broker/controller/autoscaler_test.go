@@ -145,6 +145,7 @@ func TestDeleteScaledObjectUsesUIDPreconditionAndForegroundPropagation(t *testin
 	broker := autoscaledBroker()
 	object := expectedScaledObject(t, broker)
 	object.SetUID(types.UID("scaledobject-uid"))
+	object.SetResourceVersion("scaledobject-rv")
 	client := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), object)
 	r := &Reconciler{dynamicClient: client}
 
@@ -170,6 +171,9 @@ func TestDeleteScaledObjectUsesUIDPreconditionAndForegroundPropagation(t *testin
 	}
 	if options.Preconditions == nil || options.Preconditions.UID == nil || *options.Preconditions.UID != object.GetUID() {
 		t.Fatalf("UID precondition = %#v, want %q", options.Preconditions, object.GetUID())
+	}
+	if options.Preconditions.ResourceVersion == nil || *options.Preconditions.ResourceVersion != object.GetResourceVersion() {
+		t.Fatalf("resourceVersion precondition = %#v, want %q", options.Preconditions, object.GetResourceVersion())
 	}
 	if options.PropagationPolicy == nil || *options.PropagationPolicy != metav1.DeletePropagationForeground {
 		t.Fatalf("propagation policy = %v, want %q", options.PropagationPolicy, metav1.DeletePropagationForeground)
@@ -1136,7 +1140,10 @@ func TestReconcileAutoscalerDisabledRestoresStaticReplicasBeforeDeletingFinalize
 			if reconcileErr != nil {
 				t.Fatalf("replica reconciliation failed: %v", reconcileErr)
 			}
-			wantActions := []string{"deployment-update", "scaledobject-delete"}
+			wantActions := []string{"scaledobject-delete"}
+			if tc.wantReplicas != 0 {
+				wantActions = []string{"deployment-update", "scaledobject-delete"}
+			}
 			if fmt.Sprint(actions) != fmt.Sprint(wantActions) {
 				t.Fatalf("mutation order = %v, want %v", actions, wantActions)
 			}

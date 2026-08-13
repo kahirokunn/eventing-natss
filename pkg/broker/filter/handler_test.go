@@ -558,23 +558,27 @@ func TestNewTriggerHandler(t *testing.T) {
 	if handler == nil {
 		t.Fatal("NewTriggerHandler() returned nil handler")
 	}
-	if handler.trigger != trigger {
-		t.Error("handler.trigger not set correctly")
+	config := snapshotHandlerConfig(t, handler)
+	if config.trigger == trigger {
+		t.Error("handler trigger should be stored as a defensive copy")
 	}
-	if handler.subscriber.URL.String() != subscriber.URL.String() {
-		t.Errorf("handler.subscriber URL = %v, want %v", handler.subscriber.URL, subscriber.URL)
+	if config.trigger.Name != trigger.Name || config.trigger.Namespace != trigger.Namespace || config.trigger.Spec.Broker != trigger.Spec.Broker {
+		t.Errorf("handler trigger = %s/%s (broker %q), want %s/%s (broker %q)", config.trigger.Namespace, config.trigger.Name, config.trigger.Spec.Broker, trigger.Namespace, trigger.Name, trigger.Spec.Broker)
 	}
-	if handler.filter != nil {
-		t.Error("handler.filter should be nil for trigger without filter")
+	if config.subscriber.URL.String() != subscriber.URL.String() {
+		t.Errorf("handler subscriber URL = %v, want %v", config.subscriber.URL, subscriber.URL)
 	}
-	if handler.brokerIngressURL != nil {
-		t.Error("handler.brokerIngressURL should be nil when not provided")
+	if config.filter != nil {
+		t.Error("handler filter should be nil for trigger without filter")
 	}
-	if handler.deadLetterSink != nil {
-		t.Error("handler.deadLetterSink should be nil when not provided")
+	if config.brokerIngressURL != nil {
+		t.Error("handler brokerIngressURL should be nil when not provided")
 	}
-	if handler.retryConfig != nil {
-		t.Error("handler.retryConfig should be nil when not provided")
+	if config.deadLetterSink != nil {
+		t.Error("handler deadLetterSink should be nil when not provided")
+	}
+	if config.retryConfig != nil {
+		t.Error("handler retryConfig should be nil when not provided")
 	}
 }
 
@@ -607,21 +611,32 @@ func TestNewTriggerHandler_WithOptionalParams(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewTriggerHandler() unexpected error: %v", err)
 	}
-	if handler.filter == nil {
-		t.Error("handler.filter should not be nil for trigger with filter")
+	config := snapshotHandlerConfig(t, handler)
+	if config.filter == nil {
+		t.Error("handler filter should not be nil for trigger with filter")
 	}
-	if handler.brokerIngressURL != brokerIngress {
-		t.Error("handler.brokerIngressURL not set correctly")
+	if config.brokerIngressURL == brokerIngress || config.brokerIngressURL.URL.String() != brokerIngress.URL.String() {
+		t.Error("handler brokerIngressURL should be an equivalent defensive copy")
 	}
-	if handler.deadLetterSink != dls {
-		t.Error("handler.deadLetterSink not set correctly")
+	if config.deadLetterSink == dls || config.deadLetterSink.URL.String() != dls.URL.String() {
+		t.Error("handler deadLetterSink should be an equivalent defensive copy")
 	}
-	if handler.retryConfig != retryConfig {
-		t.Error("handler.retryConfig not set correctly")
+	if config.retryConfig == retryConfig || config.retryConfig.RetryMax != retryConfig.RetryMax {
+		t.Error("handler retryConfig should be an equivalent defensive copy")
 	}
-	if handler.noRetryConfig != noRetryConfig {
-		t.Error("handler.noRetryConfig not set correctly")
+	if config.noRetryConfig == noRetryConfig || config.noRetryConfig.RetryMax != noRetryConfig.RetryMax {
+		t.Error("handler noRetryConfig should be an equivalent defensive copy")
 	}
+}
+
+func snapshotHandlerConfig(t *testing.T, handler *TriggerHandler) handlerConfig {
+	t.Helper()
+	handler.configMu.RLock()
+	defer handler.configMu.RUnlock()
+	if handler.config == nil {
+		t.Fatal("handler config is nil")
+	}
+	return *handler.config
 }
 
 func TestTriggerHandlerCleanup(t *testing.T) {
@@ -642,7 +657,7 @@ func TestTriggerHandlerCleanup(t *testing.T) {
 			},
 		}
 		f := buildTriggerFilter(logger, trigger)
-		h := &TriggerHandler{filter: f}
+		h := &TriggerHandler{config: &handlerConfig{filter: f}}
 		h.Cleanup() // should call f.Cleanup() without error
 	})
 }

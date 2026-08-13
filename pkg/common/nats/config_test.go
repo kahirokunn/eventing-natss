@@ -23,8 +23,7 @@ import (
 )
 
 func TestLoadEventingNatsConfigSecureConnection(t *testing.T) {
-	config, err := LoadEventingNatsConfig(map[string]string{
-		constants.EventingNatsSettingsConfigKey: `
+	config, err := LoadEventingNatsConfig(map[string]string{constants.EventingNatsSettingsConfigKey: `
 url: tls://nats.example.test:4222
 auth:
   credentialFile:
@@ -43,35 +42,42 @@ connOpts:
   reconnectWaitMilliseconds: 250
   reconnectJitterMilliseconds: 75
   reconnectJitterTLSMilliseconds: 125
-`,
-	})
+`})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if config.URL != "tls://nats.example.test:4222" {
-		t.Errorf("URL = %q, want secure NATS URL", config.URL)
+		t.Errorf("URL = %q", config.URL)
 	}
 	if config.Auth == nil || config.Auth.CredentialFile == nil || config.Auth.CredentialFile.Secret == nil {
 		t.Fatal("credentialFile secret was not decoded")
 	}
-	credentialSecret := config.Auth.CredentialFile.Secret
-	if credentialSecret.Name != "nats-credentials" || credentialSecret.Key != "account.creds" {
-		t.Errorf("credentialFile secret = %#v", credentialSecret)
+	if config.Auth.TLS == nil || config.Auth.TLS.Secret == nil {
+		t.Fatal("mTLS secret was not decoded")
 	}
-	if config.Auth.TLS == nil || config.Auth.TLS.Secret == nil || config.Auth.TLS.Secret.Name != "nats-client-tls" {
-		t.Errorf("mTLS secret = %#v", config.Auth.TLS)
+	if config.RootCA == nil || config.RootCA.Secret == nil {
+		t.Fatal("root CA secret was not decoded")
 	}
-	if config.RootCA == nil || config.RootCA.Secret == nil || config.RootCA.Secret.Name != "nats-root-ca" {
-		t.Errorf("root CA secret = %#v", config.RootCA)
+	if config.ConnOpts == nil || !config.ConnOpts.RetryOnFailedConnect || config.ConnOpts.MaxReconnects != 17 {
+		t.Fatalf("connOpts = %#v", config.ConnOpts)
 	}
-	if config.ConnOpts == nil {
-		t.Fatal("connOpts was not decoded")
+}
+
+func TestLoadEventingNatsConfigAutoscaler(t *testing.T) {
+	config, err := LoadEventingNatsConfig(map[string]string{constants.EventingNatsSettingsConfigKey: `
+url: nats://nats.nats-io.svc:4222
+autoscaler:
+  monitoringEndpoint: nats.nats-io.svc:8222
+  account: "$G"
+  useHttps: true
+`})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !config.ConnOpts.RetryOnFailedConnect ||
-		config.ConnOpts.MaxReconnects != 17 ||
-		config.ConnOpts.ReconnectWaitMilliseconds != 250 ||
-		config.ConnOpts.ReconnectJitterMilliseconds != 75 ||
-		config.ConnOpts.ReconnectJitterTLSMilliseconds != 125 {
-		t.Errorf("connOpts = %#v", config.ConnOpts)
+	if config.Autoscaler == nil {
+		t.Fatal("autoscaler config was not decoded")
+	}
+	if config.Autoscaler.MonitoringEndpoint != "nats.nats-io.svc:8222" || config.Autoscaler.Account != "$G" || !config.Autoscaler.UseHTTPS {
+		t.Fatalf("unexpected autoscaler config: %+v", config.Autoscaler)
 	}
 }

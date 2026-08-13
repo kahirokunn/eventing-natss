@@ -34,6 +34,7 @@ import (
 	"knative.dev/pkg/resolver"
 
 	eventingv1 "knative.dev/eventing/pkg/apis/eventing/v1"
+	eventingclient "knative.dev/eventing/pkg/client/injection/client"
 	"knative.dev/eventing/pkg/client/injection/reconciler/eventing/v1/broker"
 
 	brokerinformer "knative.dev/eventing/pkg/client/injection/informers/eventing/v1/broker"
@@ -56,7 +57,9 @@ const (
 // envConfig holds configuration from environment variables
 type envConfig struct {
 	// Filter image for per-broker filter deployments
-	FilterImage          string `envconfig:"BROKER_FILTER_IMAGE" required:"true"`
+	FilterImage string `envconfig:"BROKER_FILTER_IMAGE" required:"true"`
+	// FilterServiceAccount is accepted for configuration compatibility. Filters
+	// always use a controller-owned Broker-UID-scoped ServiceAccount.
 	FilterServiceAccount string `envconfig:"BROKER_FILTER_SERVICE_ACCOUNT" default:"natsjetstream-broker-dataplane"`
 
 	// Shared ingress service configuration
@@ -79,7 +82,7 @@ func NewController(
 
 	logger.Infow("Broker controller configuration",
 		zap.String("filter_image", env.FilterImage),
-		zap.String("filter_service_account", env.FilterServiceAccount),
+		zap.String("legacy_filter_service_account", env.FilterServiceAccount),
 		zap.String("ingress_service_name", env.IngressServiceName),
 		zap.String("ingress_namespace", env.IngressNamespace),
 	)
@@ -135,11 +138,13 @@ func NewController(
 
 	// Create reconciler
 	r := &Reconciler{
-		kubeClientSet: kubeclient.Get(ctx),
-		dynamicClient: dynamicclient.Get(ctx),
+		kubeClientSet:  kubeclient.Get(ctx),
+		eventingClient: eventingclient.Get(ctx),
+		dynamicClient:  dynamicclient.Get(ctx),
 
 		deploymentLister: deploymentInformer.Lister(),
 		serviceLister:    serviceInformer.Lister(),
+		brokerLister:     brokerInformer.Lister(),
 		triggerLister:    triggerInformer.Lister(),
 
 		contractManager: contractManager,
@@ -156,6 +161,14 @@ func NewController(
 		ingressServiceName: env.IngressServiceName,
 		ingressNamespace:   env.IngressNamespace,
 	}
+	secretNames, err := r.natsSecretNames()
+	if err != nil {
+		logger.Fatalw("Failed to resolve NATS credential references", zap.Error(err))
+	}
+	if err := r.reconcileNATSSecretRole(ctx, secretNames); err != nil {
+		logger.Fatalw("Failed to reconcile exact NATS Secret access", zap.Error(err))
+	}
+	go r.runDataplaneRBACSweeper(ctx, brokerInformer.Informer().HasSynced)
 
 	// Create controller implementation
 	impl := broker.NewImpl(ctx, r, constants.BrokerClassName)

@@ -42,3 +42,18 @@ rules:
       - secrets
     verbs:
       - get
+  # Manage exact-secret Roles and the system-namespace bindings used by each
+  # Broker filter. These permissions never leave knative-eventing.
+  - apiGroups:
+      - rbac.authorization.k8s.io
+    resources:
+      - roles
+      - rolebindings
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete

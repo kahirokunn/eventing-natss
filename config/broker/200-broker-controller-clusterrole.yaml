@@ -150,17 +150,23 @@ rules:
       - list
       - watch
       - create
-  # Manage cluster role bindings for dataplane components
+      - update
+      - patch
+      - delete
+  # Manage per-Broker bindings in user namespaces.
   - apiGroups:
       - rbac.authorization.k8s.io
     resources:
-      - clusterrolebindings
+      - rolebindings
     verbs:
       - get
       - list
       - watch
       - create
-  # Bind the dataplane ClusterRole when creating per-namespace ClusterRoleBindings.
+      - update
+      - patch
+      - delete
+  # Bind only the namespaced filter reader ClusterRole.
   # The `bind` verb allows creating bindings to this specific role without the
   # controller needing to hold every permission the role contains (prevents escalation).
   - apiGroups:
@@ -168,6 +174,6 @@ rules:
     resources:
       - clusterroles
     resourceNames:
-      - natsjetstream-broker-dataplane
+      - natsjetstream-broker-filter-reader
     verbs:
       - bind

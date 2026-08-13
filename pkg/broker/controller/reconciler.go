@@ -25,7 +25,6 @@ import (
 	"github.com/nats-io/nats.go"
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
-	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -46,6 +45,7 @@ import (
 
 	eventingduckv1 "knative.dev/eventing/pkg/apis/duck/v1"
 	eventingv1 "knative.dev/eventing/pkg/apis/eventing/v1"
+	eventingclientset "knative.dev/eventing/pkg/client/clientset/versioned"
 	eventinglisters "knative.dev/eventing/pkg/client/listers/eventing/v1"
 
 	"knative.dev/eventing-natss/pkg/broker/autoscaler"
@@ -72,22 +72,28 @@ const (
 	ReasonAutoscalerFailed        = "AutoscalerReconcileFailed"
 	ReasonAutoscalerSafetyWakeup  = "AutoscalerSafetyWakeup"
 
-	// DataplaneClusterRoleName is the name of the ClusterRole for dataplane components
+	// DataplaneClusterRoleName is retained for compatibility and names the
+	// permanently empty legacy role. New filters never bind it.
 	DataplaneClusterRoleName = "natsjetstream-broker-dataplane"
+	// FilterReaderClusterRoleName is the namespace-scoped reader role bound to
+	// each per-Broker filter ServiceAccount.
+	FilterReaderClusterRoleName = "natsjetstream-broker-filter-reader"
 )
 
 var errFilterDeploymentNotOwned = errors.New("filter deployment is not owned by broker")
 
 // Reconciler implements controller.Reconciler for Broker resources.
 type Reconciler struct {
-	kubeClientSet kubernetes.Interface
-	dynamicClient dynamic.Interface
+	kubeClientSet  kubernetes.Interface
+	eventingClient eventingclientset.Interface
+	dynamicClient  dynamic.Interface
 
 	// Listers for Kubernetes resources
 	deploymentLister appsv1listers.DeploymentLister
 	serviceLister    corev1listers.ServiceLister
 
 	// Lister for Triggers, used to decide whether a broker needs a filter
+	brokerLister  eventinglisters.BrokerLister
 	triggerLister eventinglisters.TriggerLister
 
 	// Contract manager for updating shared ingress configuration
@@ -130,12 +136,7 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, b *eventingv1.Broker) pk
 		return fmt.Errorf("failed to get broker config: %w", err)
 	}
 
-	// Step 1: Reconcile dataplane RBAC (service account and role binding for filter)
-	if err := r.reconcileDataplaneRBAC(ctx, b); err != nil {
-		return err
-	}
-
-	// Step 2: Reconcile JetStream stream
+	// Step 1: Reconcile JetStream stream
 	if err := r.reconcileStream(ctx, b, streamName, publishSubject, brokerCfg); err != nil {
 		return err
 	}
@@ -183,6 +184,12 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, b *eventingv1.Broker) pk
 	autoscalerConfigured := false
 	var autoscalerCleanupErr error
 	if len(triggers) > 0 {
+		// Grant the filter only the namespaced and exact-secret access it needs.
+		// Complete RBAC before creating or updating a Pod that uses the account.
+		if err := r.reconcileDataplaneRBAC(ctx, b); err != nil {
+			return err
+		}
+
 		filterMode := filterAvailabilityStatic
 		settings, settingsErr := autoscaler.ResolveSettings(b.Annotations)
 		autoscalingRequested := b.Annotations[autoscaler.ClassAnnotation] == autoscaler.KEDAClass
@@ -265,7 +272,9 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, b *eventingv1.Broker) pk
 		// No triggers reference this broker: tear down the filter if present and
 		// mark the condition ready so the broker still becomes Ready (required
 		// before any trigger can be created against it).
-		if err := r.deleteFilter(ctx, b); err != nil {
+		filterErr := r.deleteFilter(ctx, b)
+		rbacErr := r.deleteDataplaneRBAC(ctx, b)
+		if err := errors.Join(filterErr, rbacErr); err != nil {
 			return err
 		}
 		b.Status.GetConditionSet().Manage(&b.Status).MarkTrueWithReason(eventingv1.BrokerConditionFilter, "NoTriggers", "No triggers reference this broker")
@@ -503,7 +512,7 @@ func (r *Reconciler) reconcileFilterDeployment(ctx context.Context, b *eventingv
 	expected := resources.MakeFilterDeployment(&resources.FilterArgs{
 		Broker:             b,
 		Image:              r.filterImage,
-		ServiceAccountName: r.filterServiceAccount,
+		ServiceAccountName: r.dataplaneIdentity(b),
 		StreamName:         streamName,
 		NatsURL:            r.natsURL,
 		NatsConfigJSON:     r.natsConfigJSON,
@@ -713,6 +722,13 @@ func (r *Reconciler) FinalizeKind(ctx context.Context, b *eventingv1.Broker) pkg
 	logger := logging.FromContext(ctx)
 	logger.Infow("Finalizing broker", zap.String("broker", b.Name))
 
+	// Revoke cross-namespace access before performing external cleanup. Keeping
+	// the finalizer on failure prevents a partially removed Broker from leaving
+	// credentials reachable through a stale binding.
+	if err := r.deleteDataplaneRBAC(ctx, b); err != nil {
+		return err
+	}
+
 	// Delete from contract ConfigMap
 	if err := r.contractManager.DeleteBroker(ctx, b.Namespace, b.Name); err != nil {
 		logger.Errorw("Failed to delete broker from contract", zap.Error(err))
@@ -729,77 +745,5 @@ func (r *Reconciler) FinalizeKind(ctx context.Context, b *eventingv1.Broker) pkg
 	}
 
 	logger.Infow("Broker finalization completed", zap.String("broker", b.Name))
-	return nil
-}
-
-// reconcileDataplaneRBAC ensures the service account and cluster role binding exist
-// for the dataplane components (filter) in the broker's namespace.
-func (r *Reconciler) reconcileDataplaneRBAC(ctx context.Context, b *eventingv1.Broker) pkgreconciler.Event {
-	logger := logging.FromContext(ctx)
-
-	// Create the service account if it doesn't exist
-	saName := r.filterServiceAccount
-	_, err := r.kubeClientSet.CoreV1().ServiceAccounts(b.Namespace).Get(ctx, saName, metav1.GetOptions{})
-	if err != nil {
-		if apierrs.IsNotFound(err) {
-			sa := &corev1.ServiceAccount{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      saName,
-					Namespace: b.Namespace,
-					Labels: map[string]string{
-						"nats.eventing.knative.dev/release": "devel",
-					},
-				},
-			}
-			_, err = r.kubeClientSet.CoreV1().ServiceAccounts(b.Namespace).Create(ctx, sa, metav1.CreateOptions{})
-			if err != nil && !apierrs.IsAlreadyExists(err) {
-				logger.Errorw("Failed to create dataplane service account", zap.Error(err))
-				return fmt.Errorf("failed to create dataplane service account: %w", err)
-			}
-			logger.Infow("Created dataplane service account", zap.String("name", saName), zap.String("namespace", b.Namespace))
-		} else {
-			logger.Errorw("Failed to get dataplane service account", zap.Error(err))
-			return fmt.Errorf("failed to get dataplane service account: %w", err)
-		}
-	}
-
-	// Create the cluster role binding if it doesn't exist
-	// Each namespace gets its own ClusterRoleBinding
-	crbName := fmt.Sprintf("%s-%s", DataplaneClusterRoleName, b.Namespace)
-	_, err = r.kubeClientSet.RbacV1().ClusterRoleBindings().Get(ctx, crbName, metav1.GetOptions{})
-	if err != nil {
-		if apierrs.IsNotFound(err) {
-			crb := &rbacv1.ClusterRoleBinding{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: crbName,
-					Labels: map[string]string{
-						"nats.eventing.knative.dev/release": "devel",
-					},
-				},
-				Subjects: []rbacv1.Subject{
-					{
-						Kind:      "ServiceAccount",
-						Name:      saName,
-						Namespace: b.Namespace,
-					},
-				},
-				RoleRef: rbacv1.RoleRef{
-					APIGroup: "rbac.authorization.k8s.io",
-					Kind:     "ClusterRole",
-					Name:     DataplaneClusterRoleName,
-				},
-			}
-			_, err = r.kubeClientSet.RbacV1().ClusterRoleBindings().Create(ctx, crb, metav1.CreateOptions{})
-			if err != nil && !apierrs.IsAlreadyExists(err) {
-				logger.Errorw("Failed to create dataplane cluster role binding", zap.Error(err))
-				return fmt.Errorf("failed to create dataplane cluster role binding: %w", err)
-			}
-			logger.Infow("Created dataplane cluster role binding", zap.String("name", crbName))
-		} else {
-			logger.Errorw("Failed to get dataplane cluster role binding", zap.Error(err))
-			return fmt.Errorf("failed to get dataplane cluster role binding: %w", err)
-		}
-	}
-
 	return nil
 }

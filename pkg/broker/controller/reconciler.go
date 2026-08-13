@@ -29,6 +29,7 @@ import (
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	appsv1listers "k8s.io/client-go/listers/apps/v1"
 	corev1listers "k8s.io/client-go/listers/core/v1"
@@ -47,10 +48,12 @@ import (
 	eventingclientset "knative.dev/eventing/pkg/client/clientset/versioned"
 	eventinglisters "knative.dev/eventing/pkg/client/listers/eventing/v1"
 
+	"knative.dev/eventing-natss/pkg/broker/autoscaler"
 	brokerconfig "knative.dev/eventing-natss/pkg/broker/config"
 	"knative.dev/eventing-natss/pkg/broker/contract"
 	"knative.dev/eventing-natss/pkg/broker/controller/resources"
 	brokerutils "knative.dev/eventing-natss/pkg/broker/utils"
+	commonconfig "knative.dev/eventing-natss/pkg/common/config"
 )
 
 const (
@@ -64,6 +67,10 @@ const (
 	ReasonFilterServiceFailed     = "FilterServiceFailed"
 	ReasonStreamCreated           = "JetStreamStreamCreated"
 	ReasonStreamFailed            = "JetStreamStreamFailed"
+	ReasonAutoscalerConfigured    = "AutoscalerConfigured"
+	ReasonAutoscalerFallback      = "AutoscalerUnavailableFallback"
+	ReasonAutoscalerFailed        = "AutoscalerReconcileFailed"
+	ReasonAutoscalerSafetyWakeup  = "AutoscalerSafetyWakeup"
 
 	// DataplaneClusterRoleName is retained for compatibility and names the
 	// permanently empty legacy role. New filters never bind it.
@@ -82,6 +89,7 @@ var (
 type Reconciler struct {
 	kubeClientSet  kubernetes.Interface
 	eventingClient eventingclientset.Interface
+	dynamicClient  dynamic.Interface
 
 	// Listers for Kubernetes resources
 	deploymentLister appsv1listers.DeploymentLister
@@ -101,8 +109,9 @@ type Reconciler struct {
 	uriResolver *resolver.URIResolver
 
 	// NATS URL for data plane components
-	natsURL        string
-	natsConfigJSON string
+	natsURL          string
+	natsConfigJSON   string
+	autoscalerConfig *commonconfig.NatsAutoscalerConfig
 
 	// Image configuration
 	filterImage          string
@@ -130,12 +139,7 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, b *eventingv1.Broker) pk
 		return fmt.Errorf("failed to get broker config: %w", err)
 	}
 
-	// Step 1: Reconcile dataplane RBAC (service account and role binding for filter)
-	if err := r.reconcileDataplaneRBAC(ctx, b); err != nil {
-		return err
-	}
-
-	// Step 2: Reconcile JetStream stream
+	// Step 1: Reconcile JetStream stream
 	if err := r.reconcileStream(ctx, b, streamName, publishSubject, brokerCfg); err != nil {
 		return err
 	}
@@ -152,14 +156,17 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, b *eventingv1.Broker) pk
 	}
 
 	// Step 4: Reconcile ingress service
-	if err := r.contractManager.UpdateBroker(ctx, brokerContract); err != nil {
+	contractUpdated, err := r.contractManager.UpdateBrokerIfChanged(ctx, brokerContract)
+	if err != nil {
 		logger.Errorw("Failed to update contract", zap.Error(err))
 		controller.GetEventRecorder(ctx).Event(b, corev1.EventTypeWarning, ReasonContractFailed, err.Error())
 		b.Status.MarkIngressFailed("ContractUpdateFailed", "Failed to update contract ConfigMap: %v", err)
 		return fmt.Errorf("failed to update contract: %w", err)
 	}
 
-	controller.GetEventRecorder(ctx).Event(b, corev1.EventTypeNormal, ReasonContractUpdated, "Contract updated")
+	if contractUpdated {
+		controller.GetEventRecorder(ctx).Event(b, corev1.EventTypeNormal, ReasonContractUpdated, "Contract updated")
+	}
 
 	// Step 4: Check shared ingress deployment readiness
 	if err := r.propagateIngressAvailability(ctx, b); err != nil {
@@ -171,33 +178,104 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, b *eventingv1.Broker) pk
 	// JetStream stream (steps 2-4) are always reconciled, so events are still
 	// received and stored regardless of triggers — a filter created later
 	// consumes the buffered messages.
-	hasTriggers, err := r.hasTriggers(b)
+	triggers, err := r.listTriggers(b)
 	if err != nil {
 		b.Status.MarkFilterFailed("TriggerListFailed", "Failed to list triggers: %v", err)
 		return fmt.Errorf("failed to list triggers: %w", err)
 	}
-	if !hasTriggers {
-		liveTriggers, err := r.listLiveTriggers(ctx, b)
+	if len(triggers) == 0 {
+		triggers, err = r.listLiveTriggers(ctx, b)
 		if err != nil {
 			b.Status.MarkFilterFailed("TriggerListFailed", "Failed to confirm the live trigger list: %v", err)
 			return fmt.Errorf("failed to confirm live triggers before filter cleanup: %w", err)
 		}
-		hasTriggers = len(liveTriggers) > 0
 	}
-	if hasTriggers {
+	autoscalerFallback := false
+	autoscalerConfigured := false
+	var autoscalerCleanupErr error
+	if len(triggers) > 0 {
 		// Grant the filter only the namespaced and exact-secret access it needs.
 		// Complete RBAC before creating or updating a Pod that uses the account.
 		if err := r.reconcileDataplaneRBAC(ctx, b); err != nil {
 			return err
 		}
-		if err := r.reconcileFilterDeployment(ctx, b, streamName, brokerCfg); err != nil {
-			return err
+
+		filterMode := filterAvailabilityStatic
+		settings, settingsErr := autoscaler.ResolveSettings(b.Annotations)
+		autoscalingRequested := b.Annotations[autoscaler.ClassAnnotation] == autoscaler.KEDAClass
+
+		switch {
+		case !autoscalingRequested:
+			cleanupErr, err := r.reconcileAutoscalerDisabled(ctx, b, streamName, brokerCfg)
+			if err != nil {
+				b.Status.MarkFilterFailed(ReasonAutoscalerFailed, "Failed to disable autoscaler: %v", err)
+				return err
+			}
+			autoscalerCleanupErr = cleanupErr
+
+		case settingsErr != nil:
+			autoscalerFallback = true
+			filterMode = filterAvailabilityFallback
+			cleanupErr, err := r.reconcileAutoscalerFallback(ctx, b, streamName, brokerCfg, int32(autoscaler.FallbackReplicaCountFromAnnotations(b.Annotations)), settingsErr)
+			if err != nil {
+				b.Status.MarkFilterFailed(ReasonAutoscalerFailed, "Failed to activate autoscaler fallback: %v", err)
+				return err
+			}
+			autoscalerCleanupErr = cleanupErr
+
+		default:
+			monitoring, err := r.monitoringConfig()
+			if err != nil {
+				autoscalerFallback = true
+				filterMode = filterAvailabilityFallback
+				cleanupErr, fallbackErr := r.reconcileAutoscalerFallback(ctx, b, streamName, brokerCfg, int32(autoscaler.FallbackReplicaCount(settings.MinScale)), err)
+				if fallbackErr != nil {
+					b.Status.MarkFilterFailed(ReasonAutoscalerFailed, "Failed to activate autoscaler fallback: %v", fallbackErr)
+					return fallbackErr
+				}
+				autoscalerCleanupErr = cleanupErr
+				break
+			}
+
+			// Create the target at the safety floor on first use, then preserve
+			// the scale subresource value managed by KEDA.
+			if err := r.reconcileFilterDeployment(ctx, b, streamName, brokerCfg, autoscaledReplicaPolicy(settings)); err != nil {
+				return err
+			}
+			expected, err := autoscaler.MakeScaledObject(b, triggers, resources.FilterName(b.Name), settings, monitoring)
+			if err == nil {
+				err = r.reconcileScaledObject(ctx, expected, b)
+			}
+			if err != nil {
+				if errors.Is(err, errScaledObjectNotOwned) {
+					b.Status.MarkFilterFailed(ReasonAutoscalerFailed, "Cannot manage autoscaler: %v", err)
+					controller.GetEventRecorder(ctx).Event(b, corev1.EventTypeWarning, ReasonAutoscalerFailed, err.Error())
+					return err
+				}
+				autoscalerFallback = true
+				filterMode = filterAvailabilityFallback
+				cleanupErr, fallbackErr := r.reconcileAutoscalerFallback(ctx, b, streamName, brokerCfg, int32(autoscaler.FallbackReplicaCount(settings.MinScale)), err)
+				if fallbackErr != nil {
+					b.Status.MarkFilterFailed(ReasonAutoscalerFailed, "Failed to activate autoscaler fallback: %v", fallbackErr)
+					return fallbackErr
+				}
+				autoscalerCleanupErr = cleanupErr
+			} else {
+				if err := r.reconcileAutoscalerSafetyWakeup(ctx, b, triggers, streamName, settings); err != nil {
+					b.Status.MarkFilterFailed(ReasonAutoscalerFailed, "Failed autoscaler safety check: %v", err)
+					return err
+				}
+				filterMode = filterAvailabilityAutoscaled
+				autoscalerConfigured = true
+				controller.GetEventRecorder(ctx).Event(b, corev1.EventTypeNormal, ReasonAutoscalerConfigured, "KEDA autoscaler configured")
+			}
 		}
+
 		filterService, err := r.reconcileFilterService(ctx, b)
 		if err != nil {
 			return err
 		}
-		if err := r.propagateFilterAvailability(ctx, b, filterService); err != nil {
+		if err := r.propagateFilterAvailability(ctx, b, filterService, filterMode); err != nil {
 			return err
 		}
 	} else {
@@ -241,7 +319,16 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, b *eventingv1.Broker) pk
 	// Step 11: Mark EventPolicies as ready (not using OIDC authentication)
 	b.Status.MarkEventPoliciesTrueWithReason("EventPoliciesSkipped", "Feature %q is disabled", "OIDC")
 
+	if autoscalerCleanupErr != nil {
+		return autoscalerCleanupErr
+	}
 	logger.Infow("Broker reconciliation completed successfully", zap.String("broker", b.Name))
+	// ScaledObject status is not a KEDA heartbeat. Poll while autoscaling is
+	// active so the live JetStream safety check can wake a filter if KEDA stops,
+	// and so static fallback cleanup can be retried after KEDA recovers.
+	if autoscalerFallback || autoscalerConfigured {
+		return controller.NewRequeueAfter(30 * time.Second)
+	}
 	return nil
 }
 
@@ -353,9 +440,40 @@ func (r *Reconciler) propagateIngressAvailability(ctx context.Context, b *eventi
 	return nil
 }
 
-// propagateFilterAvailability checks if the filter deployment is available
-func (r *Reconciler) propagateFilterAvailability(ctx context.Context, b *eventingv1.Broker, svc *corev1.Service) pkgreconciler.Event {
+type filterAvailabilityMode int
+
+const (
+	filterAvailabilityStatic filterAvailabilityMode = iota
+	filterAvailabilityAutoscaled
+	filterAvailabilityFallback
+)
+
+type filterReplicaPolicy struct {
+	desiredReplicas  *int32
+	preserveExisting bool
+}
+
+var filterReplicaStatic = filterReplicaPolicy{}
+
+func autoscaledReplicaPolicy(settings autoscaler.Settings) filterReplicaPolicy {
+	return filterReplicaPolicy{
+		desiredReplicas:  ptr.To(int32(autoscaler.FallbackReplicaCount(settings.MinScale))),
+		preserveExisting: true,
+	}
+}
+
+func fallbackReplicaPolicy(replicas int32) filterReplicaPolicy {
+	return filterReplicaPolicy{desiredReplicas: ptr.To(replicas)}
+}
+
+// propagateFilterAvailability checks if the filter deployment is available.
+// A KEDA-managed desired replica count of zero is healthy, not an outage.
+func (r *Reconciler) propagateFilterAvailability(ctx context.Context, b *eventingv1.Broker, svc *corev1.Service, modes ...filterAvailabilityMode) pkgreconciler.Event {
 	logger := logging.FromContext(ctx)
+	mode := filterAvailabilityStatic
+	if len(modes) > 0 {
+		mode = modes[0]
+	}
 
 	deploymentName := resources.FilterName(b.Name)
 	deployment, err := r.deploymentLister.Deployments(b.Namespace).Get(deploymentName)
@@ -369,19 +487,31 @@ func (r *Reconciler) propagateFilterAvailability(ctx context.Context, b *eventin
 		return fmt.Errorf("failed to get filter deployment: %w", err)
 	}
 
+	if mode == filterAvailabilityAutoscaled && deployment.Spec.Replicas != nil && *deployment.Spec.Replicas == 0 {
+		b.Status.GetConditionSet().Manage(&b.Status).MarkTrueWithReason(eventingv1.BrokerConditionFilter, "ScaledToZero", "KEDA scaled the filter deployment to zero")
+		return nil
+	}
+
 	if deployment.Status.ReadyReplicas == 0 {
 		b.Status.MarkFilterFailed("DeploymentNotReady", "Filter deployment has no ready replicas")
 		return nil // Don't return error, let controller requeue
 	}
 
-	// Mark filter as ready using condition set manager
-	b.Status.GetConditionSet().Manage(&b.Status).MarkTrue(eventingv1.BrokerConditionFilter)
+	if mode == filterAvailabilityFallback {
+		b.Status.GetConditionSet().Manage(&b.Status).MarkTrueWithReason(eventingv1.BrokerConditionFilter, ReasonAutoscalerFallback, "KEDA is unavailable; using static filter replicas")
+	} else {
+		b.Status.GetConditionSet().Manage(&b.Status).MarkTrue(eventingv1.BrokerConditionFilter)
+	}
 	return nil
 }
 
 // reconcileFilterDeployment ensures the filter deployment exists
-func (r *Reconciler) reconcileFilterDeployment(ctx context.Context, b *eventingv1.Broker, streamName string, brokerCfg *brokerconfig.NatsJetStreamBrokerConfig) pkgreconciler.Event {
+func (r *Reconciler) reconcileFilterDeployment(ctx context.Context, b *eventingv1.Broker, streamName string, brokerCfg *brokerconfig.NatsJetStreamBrokerConfig, policies ...filterReplicaPolicy) pkgreconciler.Event {
 	logger := logging.FromContext(ctx)
+	policy := filterReplicaStatic
+	if len(policies) > 0 {
+		policy = policies[0]
+	}
 
 	// Get filter deployment template if configured
 	var filterTemplate *brokerconfig.DeploymentTemplate
@@ -398,23 +528,42 @@ func (r *Reconciler) reconcileFilterDeployment(ctx context.Context, b *eventingv
 		NatsConfigJSON:     r.natsConfigJSON,
 		Template:           filterTemplate,
 	})
+	if policy.desiredReplicas != nil {
+		expected.Spec.Replicas = ptr.To(*policy.desiredReplicas)
+	}
 
 	name := resources.FilterName(b.Name)
 	existing, err := r.deploymentLister.Deployments(b.Namespace).Get(name)
 	if err != nil {
 		if apierrs.IsNotFound(err) {
 			_, err = r.kubeClientSet.AppsV1().Deployments(b.Namespace).Create(ctx, expected, metav1.CreateOptions{})
-			if err != nil {
+			if err == nil {
+				controller.GetEventRecorder(ctx).Event(b, corev1.EventTypeNormal, ReasonFilterDeploymentCreated, "Filter deployment created")
+				return nil
+			}
+			if !apierrs.IsAlreadyExists(err) {
 				logger.Errorw("Failed to create filter deployment", zap.Error(err))
 				b.Status.MarkFilterFailed("FilterDeploymentFailed", "Failed to create filter deployment: %v", err)
 				return fmt.Errorf("failed to create filter deployment: %w", err)
 			}
-			controller.GetEventRecorder(ctx).Event(b, corev1.EventTypeNormal, ReasonFilterDeploymentCreated, "Filter deployment created")
-			return nil
+			// The informer can remain stale within one reconciliation when an
+			// autoscaler failure changes the desired replica policy. Read the
+			// just-created object directly so fallback can be applied safely.
+			existing, err = r.kubeClientSet.AppsV1().Deployments(b.Namespace).Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to get existing filter deployment after create conflict: %w", err)
+			}
+		} else {
+			logger.Errorw("Failed to get filter deployment", zap.Error(err))
+			b.Status.MarkFilterFailed("FilterDeploymentFailed", "Failed to get filter deployment: %v", err)
+			return fmt.Errorf("failed to get filter deployment: %w", err)
 		}
-		logger.Errorw("Failed to get filter deployment", zap.Error(err))
-		b.Status.MarkFilterFailed("FilterDeploymentFailed", "Failed to get filter deployment: %v", err)
-		return fmt.Errorf("failed to get filter deployment: %w", err)
+	}
+	if !metav1.IsControlledBy(existing, b) {
+		return fmt.Errorf("%w: %s/%s", errFilterDeploymentNotOwned, b.Namespace, name)
+	}
+	if policy.preserveExisting && existing.Spec.Replicas != nil {
+		expected.Spec.Replicas = ptr.To(*existing.Spec.Replicas)
 	}
 
 	toUpdate, err := mergeFilterDeployment(existing, expected)
@@ -422,8 +571,6 @@ func (r *Reconciler) reconcileFilterDeployment(ctx context.Context, b *eventingv
 		return err
 	}
 
-	// Update if needed. Existing extra metadata labels are preserved while
-	// controller-owned and current template labels are repaired.
 	if !equality.Semantic.DeepEqual(toUpdate, existing) {
 		_, err = r.kubeClientSet.AppsV1().Deployments(b.Namespace).Update(ctx, toUpdate, metav1.UpdateOptions{})
 		if err != nil {
@@ -464,6 +611,7 @@ func (r *Reconciler) reconcileFilterService(ctx context.Context, b *eventingv1.B
 	if !metav1.IsControlledBy(existing, b) {
 		return nil, fmt.Errorf("%w: %s/%s", errFilterServiceNotOwned, b.Namespace, name)
 	}
+
 	toUpdate, err := mergeFilterService(existing, expected)
 	if err != nil {
 		return nil, err
@@ -481,20 +629,24 @@ func (r *Reconciler) reconcileFilterService(ctx context.Context, b *eventingv1.B
 	return existing, nil
 }
 
-// hasTriggers reports whether any Trigger in the broker's namespace references it.
-func (r *Reconciler) hasTriggers(b *eventingv1.Broker) (bool, error) {
+// listTriggers returns only Triggers owned by this Broker.
+func (r *Reconciler) listTriggers(b *eventingv1.Broker) ([]*eventingv1.Trigger, error) {
 	triggers, err := r.triggerLister.Triggers(b.Namespace).List(labels.Everything())
 	if err != nil {
-		return false, err
+		return nil, err
 	}
+	result := make([]*eventingv1.Trigger, 0, len(triggers))
 	for _, t := range triggers {
 		if t.Spec.Broker == b.Name {
-			return true, nil
+			result = append(result, t)
 		}
 	}
-	return false, nil
+	return result, nil
 }
 
+// listLiveTriggers closes the destructive cache-miss window before filter
+// teardown. Informers are eventually consistent, so an empty cached list is
+// not sufficient evidence that a newly-created Trigger does not exist.
 func (r *Reconciler) listLiveTriggers(ctx context.Context, b *eventingv1.Broker) ([]*eventingv1.Trigger, error) {
 	if r.eventingClient == nil {
 		return nil, errors.New("eventing client is unavailable")
@@ -504,12 +656,68 @@ func (r *Reconciler) listLiveTriggers(ctx context.Context, b *eventingv1.Broker)
 		return nil, err
 	}
 	result := make([]*eventingv1.Trigger, 0, len(list.Items))
-	for i := range list.Items {
-		if list.Items[i].Spec.Broker == b.Name {
-			result = append(result, list.Items[i].DeepCopy())
+	for index := range list.Items {
+		if list.Items[index].Spec.Broker == b.Name {
+			result = append(result, list.Items[index].DeepCopy())
 		}
 	}
 	return result, nil
+}
+
+// hasTriggers is retained as a small query helper for callers and tests.
+func (r *Reconciler) hasTriggers(b *eventingv1.Broker) (bool, error) {
+	triggers, err := r.listTriggers(b)
+	return len(triggers) > 0, err
+}
+
+func (r *Reconciler) monitoringConfig() (autoscaler.MonitoringConfig, error) {
+	if r.autoscalerConfig == nil {
+		return autoscaler.MonitoringConfig{}, fmt.Errorf("autoscaler configuration is missing from config-nats-broker")
+	}
+	return autoscaler.ValidateMonitoringConfig(
+		r.autoscalerConfig.MonitoringEndpoint,
+		r.autoscalerConfig.Account,
+		r.autoscalerConfig.UseHTTPS,
+	)
+}
+
+func (r *Reconciler) reconcileAutoscalerDisabled(ctx context.Context, b *eventingv1.Broker, streamName string, brokerCfg *brokerconfig.NatsJetStreamBrokerConfig) (cleanupErr, reconcileErr error) {
+	targetName := resources.FilterName(b.Name)
+	if err := r.rejectForeignScaledObject(ctx, b, targetName); err != nil {
+		return nil, err
+	}
+	if err := r.reconcileFilterDeployment(ctx, b, streamName, brokerCfg, filterReplicaStatic); err != nil {
+		return nil, err
+	}
+	return r.deleteScaledObject(ctx, b, targetName), nil
+}
+
+func (r *Reconciler) activateAutoscalerFallback(ctx context.Context, b *eventingv1.Broker, replicas int32, cause error) error {
+	logger := logging.FromContext(ctx)
+	logger.Warnw("KEDA autoscaler is unavailable; using static filter replicas", zap.Error(cause), zap.Int32("replicas", replicas))
+	controller.GetEventRecorder(ctx).Event(b, corev1.EventTypeWarning, ReasonAutoscalerFallback, cause.Error())
+
+	// The target Deployment has already been restored before cleanup starts, so
+	// a KEDA finalizer cannot leave the Broker scaled to zero indefinitely.
+	if err := r.deleteScaledObject(ctx, b, resources.FilterName(b.Name)); err != nil {
+		return fmt.Errorf("failed to remove ScaledObject while activating fallback: %w", err)
+	}
+	return nil
+}
+
+// reconcileAutoscalerFallback restores the safety replica even when cleanup
+// of an existing ScaledObject fails. Returning the cleanup error afterwards
+// keeps reconciliation retrying and reasserting the replica until KEDA and its
+// generated HPA no longer race the static fallback.
+func (r *Reconciler) reconcileAutoscalerFallback(ctx context.Context, b *eventingv1.Broker, streamName string, brokerCfg *brokerconfig.NatsJetStreamBrokerConfig, replicas int32, cause error) (cleanupErr, reconcileErr error) {
+	targetName := resources.FilterName(b.Name)
+	if err := r.rejectForeignScaledObject(ctx, b, targetName); err != nil {
+		return nil, err
+	}
+	if err := r.reconcileFilterDeployment(ctx, b, streamName, brokerCfg, fallbackReplicaPolicy(replicas)); err != nil {
+		return nil, err
+	}
+	return r.activateAutoscalerFallback(ctx, b, replicas, cause), nil
 }
 
 // deleteFilter removes the filter deployment and service for a broker with no
@@ -519,6 +727,11 @@ func (r *Reconciler) deleteFilter(ctx context.Context, b *eventingv1.Broker) pkg
 	name := resources.FilterName(b.Name)
 	if err := r.preflightFilterDeletion(ctx, b, name); err != nil {
 		return err
+	}
+	if err := r.deleteScaledObject(ctx, b, name); err != nil {
+		logger.Errorw("Failed to delete filter ScaledObject", zap.Error(err))
+		b.Status.MarkFilterFailed("ScaledObjectDeleteFailed", "Failed to delete filter ScaledObject: %v", err)
+		return fmt.Errorf("failed to delete filter ScaledObject: %w", err)
 	}
 
 	if err := r.deleteFilterDeployment(ctx, b, name); err != nil {
@@ -534,27 +747,40 @@ func (r *Reconciler) deleteFilter(ctx context.Context, b *eventingv1.Broker) pkg
 	return nil
 }
 
-func objectDeleteOptions(object metav1.Object, propagation *metav1.DeletionPropagation) metav1.DeleteOptions {
-	uid, rv := object.GetUID(), object.GetResourceVersion()
-	return metav1.DeleteOptions{PropagationPolicy: propagation, Preconditions: &metav1.Preconditions{UID: &uid, ResourceVersion: &rv}}
-}
-
+// preflightFilterDeletion validates every same-name child before mutating any
+// of them. This prevents a foreign collision in one kind from causing partial
+// deletion of the Broker-owned children in the other kinds.
 func (r *Reconciler) preflightFilterDeletion(ctx context.Context, b *eventingv1.Broker, name string) error {
+	if err := r.preflightScaledObjectDeletion(ctx, b, name); err != nil {
+		return err
+	}
 	deployment, err := r.kubeClientSet.AppsV1().Deployments(b.Namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil && !apierrs.IsNotFound(err) {
-		return err
+		return fmt.Errorf("failed to get filter deployment before deletion: %w", err)
 	}
 	if err == nil && !metav1.IsControlledBy(deployment, b) {
 		return fmt.Errorf("%w: %s/%s", errFilterDeploymentNotOwned, b.Namespace, name)
 	}
 	service, err := r.kubeClientSet.CoreV1().Services(b.Namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil && !apierrs.IsNotFound(err) {
-		return err
+		return fmt.Errorf("failed to get filter service before deletion: %w", err)
 	}
 	if err == nil && !metav1.IsControlledBy(service, b) {
 		return fmt.Errorf("%w: %s/%s", errFilterServiceNotOwned, b.Namespace, name)
 	}
 	return nil
+}
+
+func objectDeleteOptions(object metav1.Object, propagation *metav1.DeletionPropagation) metav1.DeleteOptions {
+	uid := object.GetUID()
+	resourceVersion := object.GetResourceVersion()
+	return metav1.DeleteOptions{
+		PropagationPolicy: propagation,
+		Preconditions: &metav1.Preconditions{
+			UID:             &uid,
+			ResourceVersion: &resourceVersion,
+		},
+	}
 }
 
 func (r *Reconciler) deleteFilterDeployment(ctx context.Context, b *eventingv1.Broker, name string) error {
@@ -583,7 +809,7 @@ func (r *Reconciler) deleteFilterDeployment(ctx context.Context, b *eventingv1.B
 		return err
 	}
 	if remaining.UID != existing.UID || !metav1.IsControlledBy(remaining, b) {
-		return fmt.Errorf("%w: %s/%s changed during deletion", errFilterDeploymentNotOwned, b.Namespace, name)
+		return fmt.Errorf("%w: %s/%s changed while being deleted", errFilterDeploymentNotOwned, b.Namespace, name)
 	}
 	return controller.NewRequeueAfter(time.Second)
 }
@@ -613,7 +839,7 @@ func (r *Reconciler) deleteFilterService(ctx context.Context, b *eventingv1.Brok
 		return err
 	}
 	if remaining.UID != existing.UID || !metav1.IsControlledBy(remaining, b) {
-		return fmt.Errorf("%w: %s/%s changed during deletion", errFilterServiceNotOwned, b.Namespace, name)
+		return fmt.Errorf("%w: %s/%s changed while being deleted", errFilterServiceNotOwned, b.Namespace, name)
 	}
 	return controller.NewRequeueAfter(time.Second)
 }

@@ -43,13 +43,16 @@ import (
 )
 
 type envConfig struct {
-	PodName        string        `envconfig:"POD_NAME" required:"true"`
-	ContainerName  string        `envconfig:"CONTAINER_NAME" required:"true"`
-	NatsURL        string        `envconfig:"NATS_URL"`
-	NatsConfig     string        `envconfig:"NATS_CONFIG"`
-	FetchBatchSize int           `envconfig:"CONSUMER_FETCH_BATCH_SIZE" default:"0"`
-	FetchTimeout   time.Duration `envconfig:"CONSUMER_FETCH_TIMEOUT" default:"0"`
-	MaxConcurrency int           `envconfig:"CONSUMER_MAX_CONCURRENCY" default:"0"`
+	PodName         string        `envconfig:"POD_NAME" required:"true"`
+	ContainerName   string        `envconfig:"CONTAINER_NAME" required:"true"`
+	BrokerName      string        `envconfig:"BROKER_NAME" required:"true"`
+	BrokerNamespace string        `envconfig:"BROKER_NAMESPACE" required:"true"`
+	StreamName      string        `envconfig:"STREAM_NAME" required:"true"`
+	NatsURL         string        `envconfig:"NATS_URL"`
+	NatsConfig      string        `envconfig:"NATS_CONFIG"`
+	FetchBatchSize  int           `envconfig:"CONSUMER_FETCH_BATCH_SIZE" default:"0"`
+	FetchTimeout    time.Duration `envconfig:"CONSUMER_FETCH_TIMEOUT" default:"0"`
+	MaxConcurrency  int           `envconfig:"CONSUMER_MAX_CONCURRENCY" default:"0"`
 }
 
 // NewController creates a new filter controller
@@ -91,6 +94,7 @@ func newController(ctx context.Context, _ configmap.Watcher, runtime *Runtime) *
 		FetchBatchSize: env.FetchBatchSize,
 		FetchTimeout:   env.FetchTimeout,
 		MaxConcurrency: env.MaxConcurrency,
+		StreamName:     env.StreamName,
 	}
 	consumerCtx := ctx
 	if runtime != nil {
@@ -107,6 +111,8 @@ func newController(ctx context.Context, _ configmap.Watcher, runtime *Runtime) *
 		triggerInformer.Lister(),
 		brokerInformer.Lister(),
 		consumerManager,
+		env.BrokerNamespace,
+		env.BrokerName,
 	)
 
 	// Create controller using the filter reconciler which implements
@@ -121,7 +127,7 @@ func newController(ctx context.Context, _ configmap.Watcher, runtime *Runtime) *
 	// FilterReconciler.Reconcile, giving us rate limiting, dedup,
 	// per-key serialization, and backoff on errors.
 	triggerInformer.Informer().AddEventHandler(cache.FilteringResourceEventHandler{
-		FilterFunc: filterTriggersByBrokerClass(brokerInformer.Lister()),
+		FilterFunc: filterTriggersForBroker(brokerInformer.Lister(), env.BrokerNamespace, env.BrokerName),
 		Handler:    controller.HandleAll(impl.Enqueue),
 	})
 
@@ -154,7 +160,7 @@ func connectFilterNATS(ctx context.Context, env *envConfig) (*nats.Conn, error) 
 		return nil, err
 	}
 	// Resolve every credential reference in the system namespace. The filter's
-	// informer scope may be its Broker namespace and must not affect Secret lookup.
+	// informer scope is its Broker namespace and must not affect Secret lookup.
 	return commonnats.NewNatsConnWithSecrets(ctx, config,
 		kubeclient.Get(ctx).CoreV1().Secrets(system.Namespace()), filterNATSOptions(ctx, config)...)
 }
@@ -187,17 +193,20 @@ func filterNATSOptions(ctx context.Context, config commonconfig.EventingNatsConf
 	return options
 }
 
-// filterTriggersByBrokerClass returns a filter function that only passes triggers
-// referencing brokers of class NatsJetStreamBroker
-func filterTriggersByBrokerClass(brokerLister eventinglisters.BrokerLister) func(obj interface{}) bool {
+// filterTriggersForBroker returns a filter function that only passes Triggers
+// belonging to this filter process's Broker.
+func filterTriggersForBroker(brokerLister eventinglisters.BrokerLister, brokerNamespace, brokerName string) func(obj interface{}) bool {
 	return func(obj interface{}) bool {
+		if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+			obj = tombstone.Obj
+		}
 		trigger, ok := obj.(*eventingv1.Trigger)
-		if !ok {
+		if !ok || trigger.Namespace != brokerNamespace || trigger.Spec.Broker != brokerName {
 			return false
 		}
 
 		// Get the broker referenced by this trigger
-		broker, err := brokerLister.Brokers(trigger.Namespace).Get(trigger.Spec.Broker)
+		broker, err := brokerLister.Brokers(brokerNamespace).Get(brokerName)
 		if err != nil {
 			// If we can't get the broker, include the trigger anyway
 			// and let the reconciler handle the error

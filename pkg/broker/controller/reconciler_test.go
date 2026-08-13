@@ -19,33 +19,40 @@ package controller
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/nats-io/nats.go"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 	kubefake "k8s.io/client-go/kubernetes/fake"
 	appsv1listers "k8s.io/client-go/listers/apps/v1"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	clienttesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/ptr"
 
 	"go.uber.org/zap"
 	"knative.dev/pkg/controller"
-	"knative.dev/pkg/kmeta"
 	"knative.dev/pkg/logging"
 
 	eventingv1 "knative.dev/eventing/pkg/apis/eventing/v1"
 	eventingfake "knative.dev/eventing/pkg/client/clientset/versioned/fake"
 	eventinglisters "knative.dev/eventing/pkg/client/listers/eventing/v1"
 
+	"knative.dev/eventing-natss/pkg/broker/autoscaler"
 	brokerconfig "knative.dev/eventing-natss/pkg/broker/config"
 	"knative.dev/eventing-natss/pkg/broker/contract"
 	"knative.dev/eventing-natss/pkg/broker/controller/resources"
@@ -59,11 +66,20 @@ const (
 )
 
 func testBroker(ns, name string) *eventingv1.Broker {
-	return &eventingv1.Broker{ObjectMeta: metav1.ObjectMeta{
-		Namespace: ns,
-		Name:      name,
-		UID:       types.UID(name + "-uid"),
-	}}
+	return &eventingv1.Broker{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name, UID: types.UID(name + "-uid")}}
+}
+
+func ownedFilterDeployment(broker *eventingv1.Broker, replicas int32) *appsv1.Deployment {
+	deployment := resources.MakeFilterDeployment(&resources.FilterArgs{
+		Broker:             broker,
+		Image:              "filter:latest",
+		ServiceAccountName: (&Reconciler{}).dataplaneIdentity(broker),
+		StreamName:         "TEST_STREAM",
+		NatsURL:            "nats://localhost:4222",
+	})
+	deployment.Spec.Replicas = ptr.To(replicas)
+	defaultFilterDeploymentAsAPIServer(deployment)
+	return deployment
 }
 
 func testTrigger(ns, name, brokerName string) *eventingv1.Trigger {
@@ -71,6 +87,14 @@ func testTrigger(ns, name, brokerName string) *eventingv1.Trigger {
 		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
 		Spec:       eventingv1.TriggerSpec{Broker: brokerName},
 	}
+}
+
+func triggerObjects(triggers ...*eventingv1.Trigger) []runtime.Object {
+	objects := make([]runtime.Object, len(triggers))
+	for index := range triggers {
+		objects[index] = triggers[index]
+	}
+	return objects
 }
 
 func TestHasTriggers(t *testing.T) {
@@ -120,15 +144,21 @@ func TestDeleteFilter(t *testing.T) {
 	name := resources.FilterName(testBrokerName)
 
 	t.Run("deletes existing filter deployment and service", func(t *testing.T) {
-		b := testBroker(testNamespace, testBrokerName)
+		broker := testBroker(testNamespace, testBrokerName)
+		deployment := ownedFilterDeployment(broker, 1)
+		deployment.UID = "deployment-uid"
+		deployment.ResourceVersion = "deployment-rv"
+		service := resources.MakeFilterService(broker)
+		service.UID = "service-uid"
+		service.ResourceVersion = "service-rv"
 		kube := kubefake.NewSimpleClientset(
-			&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: name, UID: "deployment-uid", ResourceVersion: "1", OwnerReferences: []metav1.OwnerReference{*kmeta.NewControllerRef(b)}}},
-			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: name, UID: "service-uid", ResourceVersion: "1", OwnerReferences: []metav1.OwnerReference{*kmeta.NewControllerRef(b)}}},
+			deployment,
+			service,
 		)
 		r := &Reconciler{kubeClientSet: kube}
 		ctx := logging.WithLogger(context.Background(), zap.NewNop().Sugar())
 
-		if err := r.deleteFilter(ctx, b); err != nil {
+		if err := r.deleteFilter(ctx, broker); err != nil {
 			t.Fatalf("deleteFilter() error: %v", err)
 		}
 
@@ -137,6 +167,17 @@ func TestDeleteFilter(t *testing.T) {
 		}
 		if _, err := kube.CoreV1().Services(testNamespace).Get(ctx, name, metav1.GetOptions{}); !apierrs.IsNotFound(err) {
 			t.Errorf("service: expected NotFound, got %v", err)
+		}
+
+		kube.ClearActions()
+		if err := r.deleteFilter(ctx, broker); err != nil {
+			t.Fatalf("second deleteFilter() error: %v", err)
+		}
+		if got := countResourceActions(kube.Actions(), "delete", "deployments"); got != 0 {
+			t.Errorf("second-pass Deployment deletes = %d, want 0", got)
+		}
+		if got := countResourceActions(kube.Actions(), "delete", "services"); got != 0 {
+			t.Errorf("second-pass Service deletes = %d, want 0", got)
 		}
 	})
 
@@ -151,7 +192,9 @@ func TestDeleteFilter(t *testing.T) {
 
 	t.Run("surfaces a non-NotFound delete error and marks filter failed", func(t *testing.T) {
 		b := testBroker(testNamespace, testBrokerName)
-		deployment := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: name, UID: "deployment-uid", ResourceVersion: "1", OwnerReferences: []metav1.OwnerReference{*kmeta.NewControllerRef(b)}}}
+		deployment := ownedFilterDeployment(b, 1)
+		deployment.UID = "deployment-uid"
+		deployment.ResourceVersion = "deployment-rv"
 		kube := kubefake.NewSimpleClientset(deployment)
 		kube.PrependReactor("delete", "deployments", func(clienttesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("boom")
@@ -166,6 +209,292 @@ func TestDeleteFilter(t *testing.T) {
 			t.Errorf("expected BrokerConditionFilter to be marked failed, got %v", cond)
 		}
 	})
+}
+
+func TestDeleteFilterRejectsForeignResourcesBeforeMutation(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		foreignResource string
+		wantErr         error
+	}{
+		{name: "foreign Deployment", foreignResource: "deployment", wantErr: errFilterDeploymentNotOwned},
+		{name: "foreign Service", foreignResource: "service", wantErr: errFilterServiceNotOwned},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			broker := testBroker(testNamespace, testBrokerName)
+			deployment := ownedFilterDeployment(broker, 1)
+			deployment.UID = "deployment-uid"
+			deployment.ResourceVersion = "deployment-rv"
+			service := resources.MakeFilterService(broker)
+			service.UID = "service-uid"
+			service.ResourceVersion = "service-rv"
+			foreign := broker.DeepCopy()
+			foreign.UID = "foreign-broker-uid"
+			switch tc.foreignResource {
+			case "deployment":
+				deployment.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(foreign, eventingv1.SchemeGroupVersion.WithKind("Broker"))}
+			case "service":
+				service.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(foreign, eventingv1.SchemeGroupVersion.WithKind("Broker"))}
+			}
+			originalDeployment := deployment.DeepCopy()
+			originalService := service.DeepCopy()
+			kube := kubefake.NewSimpleClientset(deployment, service)
+			r := &Reconciler{kubeClientSet: kube}
+
+			err := r.deleteFilter(testContext(), broker)
+			if !errors.Is(err, tc.wantErr) {
+				t.Errorf("deleteFilter() error = %v, want %v", err, tc.wantErr)
+			}
+			if got := countResourceActions(kube.Actions(), "delete", "deployments"); got != 0 {
+				t.Errorf("Deployment delete actions = %d, want 0", got)
+			}
+			if got := countResourceActions(kube.Actions(), "delete", "services"); got != 0 {
+				t.Errorf("Service delete actions = %d, want 0", got)
+			}
+			storedDeployment, err := kube.AppsV1().Deployments(broker.Namespace).Get(context.Background(), deployment.Name, metav1.GetOptions{})
+			if err != nil {
+				t.Errorf("Deployment was deleted despite foreign collision: %v", err)
+			} else if !apiequality.Semantic.DeepEqual(storedDeployment, originalDeployment) {
+				t.Errorf("Deployment changed: got=%#v want=%#v", storedDeployment, originalDeployment)
+			}
+			storedService, err := kube.CoreV1().Services(broker.Namespace).Get(context.Background(), service.Name, metav1.GetOptions{})
+			if err != nil {
+				t.Errorf("Service was deleted despite foreign collision: %v", err)
+			} else if !apiequality.Semantic.DeepEqual(storedService, originalService) {
+				t.Errorf("Service changed: got=%#v want=%#v", storedService, originalService)
+			}
+		})
+	}
+}
+
+func TestDeleteFilterUsesUIDPreconditions(t *testing.T) {
+	broker := testBroker(testNamespace, testBrokerName)
+	deployment := ownedFilterDeployment(broker, 1)
+	deployment.UID = "deployment-uid"
+	deployment.ResourceVersion = "deployment-rv"
+	service := resources.MakeFilterService(broker)
+	service.UID = "service-uid"
+	service.ResourceVersion = "service-rv"
+	kube := kubefake.NewSimpleClientset(deployment, service)
+	r := &Reconciler{kubeClientSet: kube}
+
+	if err := r.deleteFilter(testContext(), broker); err != nil {
+		t.Fatal(err)
+	}
+	assertDeletePreconditions(t, kube.Actions(), "deployments", deployment.UID, deployment.ResourceVersion, ptr.To(metav1.DeletePropagationForeground))
+	assertDeletePreconditions(t, kube.Actions(), "services", service.UID, service.ResourceVersion, nil)
+}
+
+func TestDeleteFilterSkipsResourcesAlreadyDeleting(t *testing.T) {
+	broker := testBroker(testNamespace, testBrokerName)
+	deletionTime := metav1.Now()
+	deployment := ownedFilterDeployment(broker, 1)
+	deployment.UID = "deployment-uid"
+	deployment.ResourceVersion = "deployment-rv"
+	deployment.DeletionTimestamp = &deletionTime
+	deployment.Finalizers = []string{"example.test/deployment-hold"}
+	service := resources.MakeFilterService(broker)
+	service.UID = "service-uid"
+	service.ResourceVersion = "service-rv"
+	service.DeletionTimestamp = &deletionTime
+	service.Finalizers = []string{"example.test/service-hold"}
+	kube := kubefake.NewSimpleClientset(deployment, service)
+	r := &Reconciler{kubeClientSet: kube}
+
+	err := r.deleteFilter(testContext(), broker)
+	if requeue, after := controller.IsRequeueKey(err); !requeue || after != time.Second {
+		t.Fatalf("deleteFilter() = %v (requeue=%v after=%s), want 1s requeue barrier", err, requeue, after)
+	}
+	if got := countResourceActions(kube.Actions(), "delete", "deployments"); got != 0 {
+		t.Errorf("Deployment delete actions = %d, want 0", got)
+	}
+	if got := countResourceActions(kube.Actions(), "delete", "services"); got != 0 {
+		t.Errorf("Service delete actions = %d, want 0", got)
+	}
+}
+
+func TestDeleteFilterWaitsForScaledObjectFinalizerBeforeDeletingChildren(t *testing.T) {
+	broker := autoscaledBroker()
+	object := expectedScaledObject(t, broker)
+	object.SetUID("scaledobject-uid")
+	object.SetResourceVersion("scaledobject-rv")
+	deletionTime := metav1.Now()
+	object.SetDeletionTimestamp(&deletionTime)
+	object.SetFinalizers([]string{metav1.FinalizerDeleteDependents, "finalizer.keda.sh"})
+	deployment := ownedFilterDeployment(broker, 1)
+	deployment.UID = "deployment-uid"
+	deployment.ResourceVersion = "deployment-rv"
+	service := resources.MakeFilterService(broker)
+	service.UID = "service-uid"
+	service.ResourceVersion = "service-rv"
+	kube := kubefake.NewSimpleClientset(deployment, service)
+	dynamicClient := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), object)
+	r := &Reconciler{kubeClientSet: kube, dynamicClient: dynamicClient}
+
+	err := r.deleteFilter(testContext(), broker)
+	if requeue, after := controller.IsRequeueKey(err); !requeue || after != time.Second {
+		t.Fatalf("deleteFilter() = %v (requeue=%v after=%s), want 1s ScaledObject barrier", err, requeue, after)
+	}
+	if got := countResourceActions(kube.Actions(), "delete", "deployments"); got != 0 {
+		t.Errorf("Deployment deletes while ScaledObject finalizer remains = %d, want 0", got)
+	}
+	if got := countResourceActions(kube.Actions(), "delete", "services"); got != 0 {
+		t.Errorf("Service deletes while ScaledObject finalizer remains = %d, want 0", got)
+	}
+	if got := countResourceActions(dynamicClient.Actions(), "delete", "scaledobjects"); got != 0 {
+		t.Errorf("already-deleting ScaledObject delete actions = %d, want 0", got)
+	}
+}
+
+func TestDeleteFilterUIDPreconditionProtectsReplacement(t *testing.T) {
+	broker := testBroker(testNamespace, testBrokerName)
+	deployment := ownedFilterDeployment(broker, 1)
+	deployment.UID = "deployment-uid"
+	deployment.ResourceVersion = "deployment-rv"
+	service := resources.MakeFilterService(broker)
+	service.UID = "service-uid"
+	service.ResourceVersion = "service-rv"
+	foreign := broker.DeepCopy()
+	foreign.UID = "foreign-broker-uid"
+	replacement := deployment.DeepCopy()
+	replacement.UID = "replacement-deployment-uid"
+	replacement.ResourceVersion = "replacement-deployment-rv"
+	replacement.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(foreign, eventingv1.SchemeGroupVersion.WithKind("Broker"))}
+	kube := kubefake.NewSimpleClientset(deployment, service)
+	kube.PrependReactor("delete", "deployments", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		if err := kube.Tracker().Update(appsv1.SchemeGroupVersion.WithResource("deployments"), replacement, replacement.Namespace); err != nil {
+			t.Fatalf("replace Deployment in tracker: %v", err)
+		}
+		options := action.(clienttesting.DeleteAction).GetDeleteOptions()
+		if options.Preconditions != nil && options.Preconditions.UID != nil && *options.Preconditions.UID == deployment.UID {
+			return true, nil, apierrs.NewConflict(appsv1.Resource("deployments"), deployment.Name, errors.New("UID precondition failed"))
+		}
+		return false, nil, nil
+	})
+	r := &Reconciler{kubeClientSet: kube}
+
+	err := r.deleteFilter(testContext(), broker)
+	if err == nil || !errorChainHasConflict(err) {
+		t.Errorf("deleteFilter() error = %v, want wrapped UID precondition conflict", err)
+	}
+	stored, getErr := kube.AppsV1().Deployments(broker.Namespace).Get(context.Background(), replacement.Name, metav1.GetOptions{})
+	if getErr != nil {
+		t.Fatalf("replacement Deployment was deleted: %v", getErr)
+	}
+	if stored.UID != replacement.UID || metav1.IsControlledBy(stored, broker) {
+		t.Errorf("stored Deployment = UID %q owners %v, want preserved foreign replacement", stored.UID, stored.OwnerReferences)
+	}
+	if _, getErr := kube.CoreV1().Services(broker.Namespace).Get(context.Background(), service.Name, metav1.GetOptions{}); getErr != nil {
+		t.Errorf("Service was partially deleted after Deployment precondition failure: %v", getErr)
+	}
+}
+
+func TestDeleteFilterServiceUIDPreconditionProtectsReplacement(t *testing.T) {
+	broker := testBroker(testNamespace, testBrokerName)
+	deployment := ownedFilterDeployment(broker, 1)
+	deployment.UID = "deployment-uid"
+	deployment.ResourceVersion = "deployment-rv"
+	service := resources.MakeFilterService(broker)
+	service.UID = "service-uid"
+	service.ResourceVersion = "service-rv"
+	foreign := broker.DeepCopy()
+	foreign.UID = "foreign-broker-uid"
+	replacement := service.DeepCopy()
+	replacement.UID = "replacement-service-uid"
+	replacement.ResourceVersion = "replacement-service-rv"
+	replacement.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(foreign, eventingv1.SchemeGroupVersion.WithKind("Broker"))}
+	kube := kubefake.NewSimpleClientset(deployment, service)
+	kube.PrependReactor("delete", "services", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		if err := kube.Tracker().Update(corev1.SchemeGroupVersion.WithResource("services"), replacement, replacement.Namespace); err != nil {
+			t.Fatalf("replace Service in tracker: %v", err)
+		}
+		options := action.(clienttesting.DeleteAction).GetDeleteOptions()
+		if options.Preconditions != nil && options.Preconditions.UID != nil && *options.Preconditions.UID == service.UID {
+			return true, nil, apierrs.NewConflict(corev1.Resource("services"), service.Name, errors.New("UID precondition failed"))
+		}
+		return false, nil, nil
+	})
+	r := &Reconciler{kubeClientSet: kube}
+
+	err := r.deleteFilter(testContext(), broker)
+	if err == nil || !errorChainHasConflict(err) {
+		t.Errorf("deleteFilter() error = %v, want wrapped UID precondition conflict", err)
+	}
+	stored, getErr := kube.CoreV1().Services(broker.Namespace).Get(context.Background(), replacement.Name, metav1.GetOptions{})
+	if getErr != nil {
+		t.Fatalf("replacement Service was deleted: %v", getErr)
+	}
+	if stored.UID != replacement.UID || metav1.IsControlledBy(stored, broker) {
+		t.Errorf("stored Service = UID %q owners %v, want preserved foreign replacement", stored.UID, stored.OwnerReferences)
+	}
+}
+
+func TestDeleteFilterResourceVersionPreconditionProtectsSameUIDOwnerChange(t *testing.T) {
+	for _, resourceKind := range []string{"deployment", "service"} {
+		t.Run(resourceKind, func(t *testing.T) {
+			broker := testBroker(testNamespace, testBrokerName)
+			foreign := broker.DeepCopy()
+			foreign.UID = "foreign-broker-uid"
+			kube := kubefake.NewSimpleClientset()
+			var name string
+			switch resourceKind {
+			case "deployment":
+				existing := ownedFilterDeployment(broker, 1)
+				existing.UID = "stable-uid"
+				existing.ResourceVersion = "old-rv"
+				replacement := existing.DeepCopy()
+				replacement.ResourceVersion = "new-rv"
+				replacement.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(foreign, eventingv1.SchemeGroupVersion.WithKind("Broker"))}
+				name = existing.Name
+				if err := kube.Tracker().Add(existing); err != nil {
+					t.Fatal(err)
+				}
+				kube.PrependReactor("delete", "deployments", func(action clienttesting.Action) (bool, runtime.Object, error) {
+					if err := kube.Tracker().Update(appsv1.SchemeGroupVersion.WithResource("deployments"), replacement, replacement.Namespace); err != nil {
+						t.Fatalf("replace Deployment in tracker: %v", err)
+					}
+					assertDeleteOptionsValues(t, action.(clienttesting.DeleteAction).GetDeleteOptions(), existing.UID, existing.ResourceVersion, ptr.To(metav1.DeletePropagationForeground))
+					return true, nil, apierrs.NewConflict(appsv1.Resource("deployments"), existing.Name, errors.New("resourceVersion precondition failed"))
+				})
+			case "service":
+				existing := resources.MakeFilterService(broker)
+				existing.UID = "stable-uid"
+				existing.ResourceVersion = "old-rv"
+				replacement := existing.DeepCopy()
+				replacement.ResourceVersion = "new-rv"
+				replacement.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(foreign, eventingv1.SchemeGroupVersion.WithKind("Broker"))}
+				name = existing.Name
+				if err := kube.Tracker().Add(existing); err != nil {
+					t.Fatal(err)
+				}
+				kube.PrependReactor("delete", "services", func(action clienttesting.Action) (bool, runtime.Object, error) {
+					if err := kube.Tracker().Update(corev1.SchemeGroupVersion.WithResource("services"), replacement, replacement.Namespace); err != nil {
+						t.Fatalf("replace Service in tracker: %v", err)
+					}
+					assertDeleteOptionsValues(t, action.(clienttesting.DeleteAction).GetDeleteOptions(), existing.UID, existing.ResourceVersion, nil)
+					return true, nil, apierrs.NewConflict(corev1.Resource("services"), existing.Name, errors.New("resourceVersion precondition failed"))
+				})
+			}
+			r := &Reconciler{kubeClientSet: kube}
+
+			err := r.deleteFilter(testContext(), broker)
+			if err == nil || !errorChainHasConflict(err) {
+				t.Fatalf("deleteFilter() error = %v, want wrapped resourceVersion conflict", err)
+			}
+			switch resourceKind {
+			case "deployment":
+				stored, getErr := kube.AppsV1().Deployments(broker.Namespace).Get(context.Background(), name, metav1.GetOptions{})
+				if getErr != nil || stored.UID != "stable-uid" || stored.ResourceVersion != "new-rv" || metav1.IsControlledBy(stored, broker) {
+					t.Fatalf("same-UID replacement Deployment not preserved: object=%#v error=%v", stored, getErr)
+				}
+			case "service":
+				stored, getErr := kube.CoreV1().Services(broker.Namespace).Get(context.Background(), name, metav1.GetOptions{})
+				if getErr != nil || stored.UID != "stable-uid" || stored.ResourceVersion != "new-rv" || metav1.IsControlledBy(stored, broker) {
+					t.Fatalf("same-UID replacement Service not preserved: object=%#v error=%v", stored, getErr)
+				}
+			}
+		})
+	}
 }
 
 func testContext() context.Context {
@@ -486,13 +815,32 @@ func TestPropagateIngressAvailability(t *testing.T) {
 func TestPropagateFilterAvailability(t *testing.T) {
 	filterName := resources.FilterName(testBrokerName)
 	tests := []struct {
-		name      string
-		dep       *appsv1.Deployment
-		wantReady bool
+		name       string
+		dep        *appsv1.Deployment
+		mode       filterAvailabilityMode
+		wantReady  bool
+		wantReason string
 	}{
 		{name: "ready", dep: deploymentWithReady(testNamespace, filterName, 1), wantReady: true},
 		{name: "no ready replicas", dep: deploymentWithReady(testNamespace, filterName, 0), wantReady: false},
 		{name: "missing", dep: nil, wantReady: false},
+		{
+			name: "autoscaled to zero is ready",
+			dep: &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: filterName},
+				Spec:       appsv1.DeploymentSpec{Replicas: ptr.To[int32](0)},
+			},
+			mode:       filterAvailabilityAutoscaled,
+			wantReady:  true,
+			wantReason: "ScaledToZero",
+		},
+		{
+			name:       "fallback replica is ready with reason",
+			dep:        deploymentWithReady(testNamespace, filterName, 1),
+			mode:       filterAvailabilityFallback,
+			wantReady:  true,
+			wantReason: ReasonAutoscalerFallback,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -502,12 +850,15 @@ func TestPropagateFilterAvailability(t *testing.T) {
 			}
 			r := &Reconciler{deploymentLister: newDeploymentLister(deps...)}
 			b := testBroker(testNamespace, testBrokerName)
-			if err := r.propagateFilterAvailability(testContext(), b, nil); err != nil {
+			if err := r.propagateFilterAvailability(testContext(), b, nil, tc.mode); err != nil {
 				t.Fatalf("propagateFilterAvailability() error: %v", err)
 			}
 			cond := b.Status.GetCondition(eventingv1.BrokerConditionFilter)
 			if tc.wantReady != (cond != nil && cond.IsTrue()) {
 				t.Errorf("filter condition = %v, wantReady %v", cond, tc.wantReady)
+			}
+			if tc.wantReason != "" && (cond == nil || cond.Reason != tc.wantReason) {
+				t.Errorf("filter condition reason = %v, want %q", cond, tc.wantReason)
 			}
 		})
 	}
@@ -551,9 +902,9 @@ func TestReconcileFilterDeploymentCreate(t *testing.T) {
 
 func TestReconcileFilterServiceUpdate(t *testing.T) {
 	name := resources.FilterName(testBrokerName)
-	// Existing service with an empty spec differs from the expected spec, so the
-	// update branch runs.
 	b := testBroker(testNamespace, testBrokerName)
+	// Keep a valid Broker-owned identity while drifting the controller-owned
+	// port list so the update branch runs.
 	existing := resources.MakeFilterService(b)
 	existing.Spec.Ports = nil
 	kube := kubefake.NewSimpleClientset(existing)
@@ -572,9 +923,9 @@ func TestReconcileFilterServiceUpdate(t *testing.T) {
 }
 
 func TestReconcileFilterDeploymentUpdate(t *testing.T) {
-	name := resources.FilterName(testBrokerName)
 	b := testBroker(testNamespace, testBrokerName)
-	existing := resources.MakeFilterDeployment(&resources.FilterArgs{Broker: b, Image: "stale", ServiceAccountName: (&Reconciler{}).dataplaneIdentity(b), StreamName: "TEST_STREAM", NatsURL: "nats://localhost:4222"})
+	name := resources.FilterName(b.Name)
+	existing := ownedFilterDeployment(b, 1)
 	kube := kubefake.NewSimpleClientset(existing)
 	r := &Reconciler{
 		kubeClientSet:        kube,
@@ -602,6 +953,954 @@ func TestReconcileFilterDeploymentUpdate(t *testing.T) {
 	if got, want := envValues["NATS_CONFIG"], r.natsConfigJSON; got != want {
 		t.Errorf("NATS_CONFIG = %q, want controller snapshot %q", got, want)
 	}
+}
+
+func TestReconcileFilterDeploymentRepairsRequiredLabelsAndPreservesCustomLabels(t *testing.T) {
+	b := testBroker(testNamespace, testBrokerName)
+	existing := resources.MakeFilterDeployment(&resources.FilterArgs{
+		Broker:             b,
+		Image:              "filter:latest",
+		ServiceAccountName: "dp-sa",
+		StreamName:         "TEST_STREAM",
+		NatsURL:            "nats://localhost:4222",
+	})
+	existing.Labels = copyStringMap(existing.Labels)
+	existing.Labels[resources.BrokerLabelKey] = "wrong-broker"
+	existing.Labels[resources.RoleLabelKey] = "wrong-role"
+	existing.Labels["custom-existing-label"] = "kept"
+	kube := kubefake.NewSimpleClientset(existing)
+	r := &Reconciler{
+		kubeClientSet:        kube,
+		deploymentLister:     newDeploymentLister(existing),
+		filterImage:          "filter:latest",
+		filterServiceAccount: "dp-sa",
+		natsURL:              "nats://localhost:4222",
+	}
+
+	if err := r.reconcileFilterDeployment(testContext(), b, "TEST_STREAM", brokerconfig.DefaultBrokerConfig()); err != nil {
+		t.Fatalf("reconcileFilterDeployment() error: %v", err)
+	}
+	got, err := kube.AppsV1().Deployments(b.Namespace).Get(context.Background(), existing.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range resources.FilterLabels(b.Name) {
+		if got.Labels[key] != want {
+			t.Errorf("Deployment label %q = %q, want repaired value %q", key, got.Labels[key], want)
+		}
+	}
+	if got.Labels["custom-existing-label"] != "kept" {
+		t.Errorf("custom existing label = %q, want kept", got.Labels["custom-existing-label"])
+	}
+	updates := 0
+	for _, action := range kube.Actions() {
+		if action.Matches("update", "deployments") {
+			updates++
+		}
+	}
+	if updates != 1 {
+		t.Fatalf("Deployment updates = %d, want exactly 1", updates)
+	}
+}
+
+func TestReconcileFilterDeploymentReplicaPolicy(t *testing.T) {
+	name := resources.FilterName(testBrokerName)
+	for _, tc := range []struct {
+		name         string
+		policy       filterReplicaPolicy
+		existing     int32
+		wantReplicas int32
+	}{
+		{name: "autoscaled preserves KEDA zero", policy: autoscaledReplicaPolicy(autoscaler.Settings{MinScale: 0}), existing: 0, wantReplicas: 0},
+		{name: "fallback forces one", policy: fallbackReplicaPolicy(1), existing: 0, wantReplicas: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := testBroker(testNamespace, testBrokerName)
+			existing := ownedFilterDeployment(b, tc.existing)
+			kube := kubefake.NewSimpleClientset(existing)
+			r := &Reconciler{
+				kubeClientSet:        kube,
+				deploymentLister:     newDeploymentLister(existing),
+				filterImage:          "filter:latest",
+				filterServiceAccount: "dp-sa",
+				natsURL:              "nats://localhost:4222",
+			}
+
+			if err := r.reconcileFilterDeployment(testContext(), b, "TEST_STREAM", brokerconfig.DefaultBrokerConfig(), tc.policy); err != nil {
+				t.Fatal(err)
+			}
+			got, err := kube.AppsV1().Deployments(testNamespace).Get(context.Background(), name, metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Spec.Replicas == nil || *got.Spec.Replicas != tc.wantReplicas {
+				t.Fatalf("replicas = %v, want %d", got.Spec.Replicas, tc.wantReplicas)
+			}
+		})
+	}
+}
+
+func TestReconcileAutoscaledFilterDeploymentAPIDefaultsAreNoOp(t *testing.T) {
+	b := testBroker(testNamespace, testBrokerName)
+	r := &Reconciler{
+		filterImage:    "filter:v1",
+		natsURL:        "nats://localhost:4222",
+		natsConfigJSON: `{"url":"nats://localhost:4222"}`,
+	}
+	existing := resources.MakeFilterDeployment(&resources.FilterArgs{
+		Broker:             b,
+		Image:              r.filterImage,
+		ServiceAccountName: r.dataplaneIdentity(b),
+		StreamName:         "TEST_STREAM",
+		NatsURL:            r.natsURL,
+		NatsConfigJSON:     r.natsConfigJSON,
+		Template:           brokerconfig.DefaultBrokerConfig().Filter,
+	})
+	existing.Spec.Replicas = ptr.To[int32](0)
+	defaultFilterDeploymentAsAPIServer(existing)
+	kube := kubefake.NewSimpleClientset(existing)
+	r.kubeClientSet = kube
+	r.deploymentLister = newDeploymentLister(existing)
+
+	if err := r.reconcileFilterDeployment(testContext(), b, "TEST_STREAM", brokerconfig.DefaultBrokerConfig(), autoscaledReplicaPolicy(autoscaler.Settings{MinScale: 0})); err != nil {
+		t.Fatalf("reconcileFilterDeployment() error: %v", err)
+	}
+	if got := countResourceActions(kube.Actions(), "update", "deployments"); got != 0 {
+		t.Fatalf("Deployment updates = %d, want 0 for API-defaulted steady state; actions=%#v", got, kube.Actions())
+	}
+	stored, err := kube.AppsV1().Deployments(b.Namespace).Get(context.Background(), existing.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Spec.Replicas == nil || *stored.Spec.Replicas != 0 {
+		t.Fatalf("autoscaled replicas = %v, want preserved zero", stored.Spec.Replicas)
+	}
+	assertFilterAPIDefaultFixture(t, stored)
+}
+
+func TestReconcileFilterServiceAPIDefaultsAreNoOp(t *testing.T) {
+	b := testBroker(testNamespace, testBrokerName)
+	existing := resources.MakeFilterService(b)
+	defaultFilterServiceAsAPIServer(existing)
+	kube := kubefake.NewSimpleClientset(existing)
+	r := &Reconciler{kubeClientSet: kube, serviceLister: newServiceLister(existing)}
+
+	if _, err := r.reconcileFilterService(testContext(), b); err != nil {
+		t.Fatalf("reconcileFilterService() error: %v", err)
+	}
+	if got := countResourceActions(kube.Actions(), "update", "services"); got != 0 {
+		t.Fatalf("Service updates = %d, want 0 for API-defaulted steady state; actions=%#v", got, kube.Actions())
+	}
+}
+
+func TestReconcileFilterServiceRejectsForeignOwnerWithoutMutation(t *testing.T) {
+	b := testBroker(testNamespace, testBrokerName)
+	foreign := b.DeepCopy()
+	foreign.UID = "foreign-broker-uid"
+	existing := resources.MakeFilterService(b)
+	existing.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(foreign, eventingv1.SchemeGroupVersion.WithKind("Broker"))}
+	original := existing.DeepCopy()
+	kube := kubefake.NewSimpleClientset(existing)
+	r := &Reconciler{kubeClientSet: kube, serviceLister: newServiceLister(existing)}
+
+	if _, err := r.reconcileFilterService(testContext(), b); !errors.Is(err, errFilterServiceNotOwned) {
+		t.Fatalf("reconcileFilterService() error = %v, want errFilterServiceNotOwned", err)
+	}
+	if got := countResourceActions(kube.Actions(), "update", "services"); got != 0 {
+		t.Fatalf("foreign Service updates = %d, want 0", got)
+	}
+	stored, err := kube.CoreV1().Services(b.Namespace).Get(context.Background(), existing.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !apiequality.Semantic.DeepEqual(stored, original) {
+		t.Fatalf("foreign Service was mutated: got=%#v want=%#v", stored, original)
+	}
+}
+
+func TestReconcileFilterDeploymentSelectorMismatchFailsClosed(t *testing.T) {
+	b := testBroker(testNamespace, testBrokerName)
+	existing := ownedFilterDeployment(b, 0)
+	existing.Spec.Selector = existing.Spec.Selector.DeepCopy()
+	existing.Spec.Selector.MatchLabels = copyStringMap(existing.Spec.Selector.MatchLabels)
+	existing.Spec.Selector.MatchLabels[resources.RoleLabelKey] = "foreign-selector"
+	original := existing.DeepCopy()
+	kube := kubefake.NewSimpleClientset(existing)
+	r := &Reconciler{
+		kubeClientSet:    kube,
+		deploymentLister: newDeploymentLister(existing),
+		filterImage:      "filter:latest",
+		natsURL:          "nats://localhost:4222",
+	}
+
+	err := r.reconcileFilterDeployment(testContext(), b, "TEST_STREAM", brokerconfig.DefaultBrokerConfig(), autoscaledReplicaPolicy(autoscaler.Settings{MinScale: 0}))
+	if err == nil || !strings.Contains(err.Error(), "selector is immutable") {
+		t.Fatalf("reconcileFilterDeployment() error = %v, want immutable selector rejection", err)
+	}
+	if got := countResourceActions(kube.Actions(), "update", "deployments"); got != 0 {
+		t.Fatalf("selector-mismatched Deployment updates = %d, want 0", got)
+	}
+	stored, err := kube.AppsV1().Deployments(b.Namespace).Get(context.Background(), existing.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !apiequality.Semantic.DeepEqual(stored, original) {
+		t.Fatalf("selector-mismatched Deployment was mutated: got=%#v want=%#v", stored, original)
+	}
+}
+
+func TestReconcileAutoscaledFilterDeploymentOwnedDriftConvergesOnce(t *testing.T) {
+	b := testBroker(testNamespace, testBrokerName)
+	brokerConfig := brokerconfig.DefaultBrokerConfig()
+	brokerConfig.Filter = &brokerconfig.DeploymentTemplate{
+		Annotations: map[string]string{"controller.example/config": "desired"},
+	}
+	r := &Reconciler{
+		filterImage:    "filter:v2",
+		natsURL:        "nats://localhost:4222",
+		natsConfigJSON: `{"url":"nats://localhost:4222"}`,
+	}
+	existing := resources.MakeFilterDeployment(&resources.FilterArgs{
+		Broker:             b,
+		Image:              r.filterImage,
+		ServiceAccountName: r.dataplaneIdentity(b),
+		StreamName:         "TEST_STREAM",
+		NatsURL:            r.natsURL,
+		NatsConfigJSON:     r.natsConfigJSON,
+		Template:           brokerConfig.Filter,
+	})
+	existing.Spec.Replicas = ptr.To[int32](0)
+	existing.Labels = copyStringMap(existing.Labels)
+	existing.Labels["admission.example/extra"] = "preserved"
+	existing.Annotations = copyStringMap(existing.Annotations)
+	existing.Annotations["controller.example/config"] = "stale"
+	existing.Annotations["admission.example/deployment"] = "preserved"
+	existing.Spec.Template.Annotations = map[string]string{"sidecar.example/injected": "true"}
+	existing.Spec.Template.Spec.Tolerations = []corev1.Toleration{{Key: "dedicated", Operator: corev1.TolerationOpEqual, Value: "events"}}
+	filter := &existing.Spec.Template.Spec.Containers[0]
+	filter.Env = append(filter.Env, corev1.EnvVar{Name: "ADMISSION_EXTRA", Value: "preserved"})
+	filter.Ports = append(filter.Ports, corev1.ContainerPort{Name: "admin-extra", ContainerPort: 9090, Protocol: corev1.ProtocolTCP})
+	existing.Spec.Template.Spec.Containers = append(existing.Spec.Template.Spec.Containers, corev1.Container{Name: "injected-sidecar", Image: "sidecar:v1"})
+	defaultFilterDeploymentAsAPIServer(existing)
+
+	// Drift only controller-owned fields after API/admission defaults exist.
+	filter = &existing.Spec.Template.Spec.Containers[0]
+	filter.Image = "filter:stale"
+	for index := range filter.Env {
+		if filter.Env[index].Name == "NATS_URL" {
+			filter.Env[index].Value = "nats://stale:4222"
+		}
+	}
+	kube := kubefake.NewSimpleClientset(existing)
+	r.kubeClientSet = kube
+	r.deploymentLister = newDeploymentLister(existing)
+	policy := autoscaledReplicaPolicy(autoscaler.Settings{MinScale: 0})
+
+	if err := r.reconcileFilterDeployment(testContext(), b, "TEST_STREAM", brokerConfig, policy); err != nil {
+		t.Fatal(err)
+	}
+	if got := countResourceActions(kube.Actions(), "update", "deployments"); got != 1 {
+		t.Fatalf("first reconcile Deployment updates = %d, want 1", got)
+	}
+	updated, err := kube.AppsV1().Deployments(b.Namespace).Get(context.Background(), existing.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFilterDeploymentUnownedFieldsPreserved(t, existing, updated)
+	if updated.Spec.Replicas == nil || *updated.Spec.Replicas != 0 {
+		t.Fatalf("autoscaled replicas = %v, want preserved zero", updated.Spec.Replicas)
+	}
+	updatedFilter := containerByName(t, updated.Spec.Template.Spec.Containers, resources.FilterContainerName)
+	if updatedFilter.Image != r.filterImage {
+		t.Errorf("filter image = %q, want reconciled %q", updatedFilter.Image, r.filterImage)
+	}
+	if got := envValue(updatedFilter.Env, "NATS_URL"); got != r.natsURL {
+		t.Errorf("NATS_URL = %q, want reconciled %q", got, r.natsURL)
+	}
+	if got := updated.Annotations["controller.example/config"]; got != "desired" {
+		t.Errorf("controller-owned Deployment annotation = %q, want desired", got)
+	}
+	if got := updated.Annotations["admission.example/deployment"]; got != "preserved" {
+		t.Errorf("extra Deployment annotation = %q, want preserved", got)
+	}
+
+	kube.ClearActions()
+	r.deploymentLister = newDeploymentLister(updated)
+	if err := r.reconcileFilterDeployment(testContext(), b, "TEST_STREAM", brokerConfig, policy); err != nil {
+		t.Fatal(err)
+	}
+	if got := countResourceActions(kube.Actions(), "update", "deployments"); got != 0 {
+		t.Fatalf("second reconcile Deployment updates = %d, want 0; actions=%#v", got, kube.Actions())
+	}
+}
+
+func TestReconcileFilterDeploymentImagePullPolicyConvergesOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		desiredImage string
+		storedImage  string
+		storedPolicy corev1.PullPolicy
+		wantPolicy   corev1.PullPolicy
+	}{
+		{
+			name:         "latest to versioned",
+			desiredImage: "registry.example/filter:v2",
+			storedImage:  "registry.example/filter:latest",
+			storedPolicy: corev1.PullAlways,
+			wantPolicy:   corev1.PullIfNotPresent,
+		},
+		{
+			name:         "versioned to latest",
+			desiredImage: "registry.example/filter:latest",
+			storedImage:  "registry.example/filter:v1",
+			storedPolicy: corev1.PullIfNotPresent,
+			wantPolicy:   corev1.PullAlways,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := testBroker(testNamespace, testBrokerName)
+			r := &Reconciler{filterImage: tc.desiredImage, natsURL: "nats://localhost:4222"}
+			existing := filterDeploymentFixture(b, r, brokerconfig.DefaultBrokerConfig(), 0)
+			filter := containerByName(t, existing.Spec.Template.Spec.Containers, resources.FilterContainerName)
+			filter.Image = tc.storedImage
+			filter.ImagePullPolicy = tc.storedPolicy
+			kube := kubefake.NewSimpleClientset(existing)
+			r.kubeClientSet = kube
+			r.deploymentLister = newDeploymentLister(existing)
+			policy := autoscaledReplicaPolicy(autoscaler.Settings{MinScale: 0})
+
+			if err := r.reconcileFilterDeployment(testContext(), b, "TEST_STREAM", brokerconfig.DefaultBrokerConfig(), policy); err != nil {
+				t.Fatal(err)
+			}
+			if got := countResourceActions(kube.Actions(), "update", "deployments"); got != 1 {
+				t.Fatalf("first reconcile Deployment updates = %d, want 1", got)
+			}
+			updated, err := kube.AppsV1().Deployments(b.Namespace).Get(context.Background(), existing.Name, metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			updatedFilter := containerByName(t, updated.Spec.Template.Spec.Containers, resources.FilterContainerName)
+			if updatedFilter.Image != tc.desiredImage || updatedFilter.ImagePullPolicy != tc.wantPolicy {
+				t.Errorf("image/policy = %q/%q, want %q/%q", updatedFilter.Image, updatedFilter.ImagePullPolicy, tc.desiredImage, tc.wantPolicy)
+			}
+
+			kube.ClearActions()
+			r.deploymentLister = newDeploymentLister(updated)
+			if err := r.reconcileFilterDeployment(testContext(), b, "TEST_STREAM", brokerconfig.DefaultBrokerConfig(), policy); err != nil {
+				t.Fatal(err)
+			}
+			if got := countResourceActions(kube.Actions(), "update", "deployments"); got != 0 {
+				t.Fatalf("second reconcile Deployment updates = %d, want 0; actions=%#v", got, kube.Actions())
+			}
+		})
+	}
+}
+
+func TestReconcileFilterDeploymentAPIDefaultedEnvAndResourcesAreNoOp(t *testing.T) {
+	b := testBroker(testNamespace, testBrokerName)
+	brokerConfig := brokerconfig.DefaultBrokerConfig()
+	brokerConfig.Filter = &brokerconfig.DeploymentTemplate{
+		Env: []corev1.EnvVar{{
+			Name: "FILE_VALUE",
+			ValueFrom: &corev1.EnvVarSource{FileKeyRef: &corev1.FileKeySelector{
+				VolumeName: "filter-config",
+				Path:       "env",
+				Key:        "value",
+			}},
+		}},
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("0.1m")},
+			Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("0.1m")},
+		},
+	}
+	r := &Reconciler{filterImage: "filter:v1", natsURL: "nats://localhost:4222"}
+	existing := filterDeploymentFixture(b, r, brokerConfig, 0)
+	if got := brokerConfig.Filter.Env[0].ValueFrom.FileKeyRef.Optional; got != nil {
+		t.Fatalf("fixture defaulting mutated configured FileKeyRef optional to %v", *got)
+	}
+	if got, want := brokerConfig.Filter.Resources.Requests.Cpu(), resource.MustParse("0.1m"); got.Cmp(want) != 0 {
+		t.Fatalf("fixture defaulting mutated configured CPU request to %s, want %s", got.String(), want.String())
+	}
+	kube := kubefake.NewSimpleClientset(existing)
+	r.kubeClientSet = kube
+	r.deploymentLister = newDeploymentLister(existing)
+
+	if err := r.reconcileFilterDeployment(testContext(), b, "TEST_STREAM", brokerConfig, autoscaledReplicaPolicy(autoscaler.Settings{MinScale: 0})); err != nil {
+		t.Fatal(err)
+	}
+	if got := countResourceActions(kube.Actions(), "update", "deployments"); got != 0 {
+		t.Fatalf("Deployment updates = %d, want 0 for API-defaulted FileKeyRef/resources; actions=%#v", got, kube.Actions())
+	}
+	filter := containerByName(t, existing.Spec.Template.Spec.Containers, resources.FilterContainerName)
+	fileValue := envVarByName(t, filter.Env, "FILE_VALUE")
+	if fileValue.ValueFrom == nil || fileValue.ValueFrom.FileKeyRef == nil || fileValue.ValueFrom.FileKeyRef.Optional == nil || *fileValue.ValueFrom.FileKeyRef.Optional {
+		t.Fatalf("FILE_VALUE FileKeyRef optional = %#v, want explicit false API default", fileValue.ValueFrom)
+	}
+	if got := filter.Resources.Requests.Cpu().String(); got != "1m" {
+		t.Errorf("defaulted CPU request = %q, want 1m", got)
+	}
+	if got := filter.Resources.Limits.Memory().String(); got != "1m" {
+		t.Errorf("defaulted memory limit = %q, want 1m", got)
+	}
+}
+
+func TestReconcileFilterDeploymentRepairsDefaultResourcesAndSecurityOnce(t *testing.T) {
+	b := testBroker(testNamespace, testBrokerName)
+	r := &Reconciler{filterImage: "filter:v1", natsURL: "nats://localhost:4222"}
+	existing := filterDeploymentFixture(b, r, brokerconfig.DefaultBrokerConfig(), 0)
+	existing.Spec.Template.Spec.Tolerations = []corev1.Toleration{{
+		Key: "admission.example/dedicated", Operator: corev1.TolerationOpExists,
+	}}
+	existing.Spec.Template.Spec.Containers = append(existing.Spec.Template.Spec.Containers, corev1.Container{
+		Name: "admission-sidecar", Image: "sidecar:v1", ImagePullPolicy: corev1.PullIfNotPresent,
+	})
+	filter := containerByName(t, existing.Spec.Template.Spec.Containers, resources.FilterContainerName)
+	filter.Resources = corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("10m")},
+		Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("32Mi")},
+	}
+	filter.SecurityContext = &corev1.SecurityContext{
+		RunAsUser:                ptr.To[int64](10001),
+		RunAsGroup:               ptr.To[int64](10002),
+		RunAsNonRoot:             ptr.To(false),
+		AllowPrivilegeEscalation: ptr.To(true),
+		ReadOnlyRootFilesystem:   ptr.To(false),
+		Capabilities: &corev1.Capabilities{
+			Add: []corev1.Capability{"NET_ADMIN"},
+		},
+		SeccompProfile: &corev1.SeccompProfile{
+			Type:             corev1.SeccompProfileTypeLocalhost,
+			LocalhostProfile: ptr.To("profiles/unsafe.json"),
+		},
+	}
+	originalTolerations := append([]corev1.Toleration(nil), existing.Spec.Template.Spec.Tolerations...)
+	kube := kubefake.NewSimpleClientset(existing)
+	r.kubeClientSet = kube
+	r.deploymentLister = newDeploymentLister(existing)
+	policy := autoscaledReplicaPolicy(autoscaler.Settings{MinScale: 0})
+
+	if err := r.reconcileFilterDeployment(testContext(), b, "TEST_STREAM", brokerconfig.DefaultBrokerConfig(), policy); err != nil {
+		t.Fatal(err)
+	}
+	if got := countResourceActions(kube.Actions(), "update", "deployments"); got != 1 {
+		t.Fatalf("first reconcile Deployment updates = %d, want 1", got)
+	}
+	updated, err := kube.AppsV1().Deployments(b.Namespace).Get(context.Background(), existing.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updatedFilter := containerByName(t, updated.Spec.Template.Spec.Containers, resources.FilterContainerName)
+	assertDefaultFilterContainerResources(t, updatedFilter.Resources)
+	assertHardenedFilterSecurityContext(t, updatedFilter.SecurityContext)
+	if updatedFilter.SecurityContext.RunAsUser == nil || *updatedFilter.SecurityContext.RunAsUser != 10001 ||
+		updatedFilter.SecurityContext.RunAsGroup == nil || *updatedFilter.SecurityContext.RunAsGroup != 10002 {
+		t.Errorf("admission-owned runAs identity changed: %#v", updatedFilter.SecurityContext)
+	}
+	if !apiequality.Semantic.DeepEqual(updated.Spec.Template.Spec.Tolerations, originalTolerations) {
+		t.Errorf("Pod admission defaults changed: got=%v want=%v", updated.Spec.Template.Spec.Tolerations, originalTolerations)
+	}
+	if got := containerByName(t, updated.Spec.Template.Spec.Containers, "admission-sidecar"); got.Image != "sidecar:v1" {
+		t.Errorf("sidecar changed: %#v", got)
+	}
+	if updated.Spec.Replicas == nil || *updated.Spec.Replicas != 0 {
+		t.Errorf("autoscaled replicas = %v, want preserved zero", updated.Spec.Replicas)
+	}
+
+	kube.ClearActions()
+	r.deploymentLister = newDeploymentLister(updated)
+	if err := r.reconcileFilterDeployment(testContext(), b, "TEST_STREAM", brokerconfig.DefaultBrokerConfig(), policy); err != nil {
+		t.Fatal(err)
+	}
+	if got := countResourceActions(kube.Actions(), "update", "deployments"); got != 0 {
+		t.Fatalf("second reconcile Deployment updates = %d, want 0; actions=%#v", got, kube.Actions())
+	}
+}
+
+func TestReconcileFilterDeploymentPreservesUnknownEnvPositions(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		insertIndex func([]corev1.EnvVar) int
+	}{
+		{name: "beginning", insertIndex: func([]corev1.EnvVar) int { return 0 }},
+		{name: "middle", insertIndex: func(env []corev1.EnvVar) int { return len(env) / 2 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := testBroker(testNamespace, testBrokerName)
+			r := &Reconciler{filterImage: "filter:v1", natsURL: "nats://old:4222"}
+			existing := filterDeploymentFixture(b, r, brokerconfig.DefaultBrokerConfig(), 0)
+			filter := containerByName(t, existing.Spec.Template.Spec.Containers, resources.FilterContainerName)
+			insertAt := tc.insertIndex(filter.Env)
+			filter.Env = insertEnvVar(filter.Env, insertAt, corev1.EnvVar{Name: "WEBHOOK_EXTRA", Value: "preserved"})
+			kube := kubefake.NewSimpleClientset(existing)
+			r.kubeClientSet = kube
+			r.deploymentLister = newDeploymentLister(existing)
+			policy := autoscaledReplicaPolicy(autoscaler.Settings{MinScale: 0})
+
+			if err := r.reconcileFilterDeployment(testContext(), b, "TEST_STREAM", brokerconfig.DefaultBrokerConfig(), policy); err != nil {
+				t.Fatal(err)
+			}
+			if got := countResourceActions(kube.Actions(), "update", "deployments"); got != 0 {
+				t.Fatalf("steady-state Deployment updates = %d, want 0; actions=%#v", got, kube.Actions())
+			}
+
+			r.natsURL = "nats://new:4222"
+			kube.ClearActions()
+			if err := r.reconcileFilterDeployment(testContext(), b, "TEST_STREAM", brokerconfig.DefaultBrokerConfig(), policy); err != nil {
+				t.Fatal(err)
+			}
+			if got := countResourceActions(kube.Actions(), "update", "deployments"); got != 1 {
+				t.Fatalf("owned-config reconcile Deployment updates = %d, want 1", got)
+			}
+			updated, err := kube.AppsV1().Deployments(b.Namespace).Get(context.Background(), existing.Name, metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			updatedEnv := containerByName(t, updated.Spec.Template.Spec.Containers, resources.FilterContainerName).Env
+			if got := envVarIndex(updatedEnv, "WEBHOOK_EXTRA"); got != insertAt {
+				t.Errorf("unknown env index = %d, want preserved %d; env=%v", got, insertAt, updatedEnv)
+			}
+			if got := envValue(updatedEnv, "NATS_URL"); got != r.natsURL {
+				t.Errorf("NATS_URL = %q, want %q", got, r.natsURL)
+			}
+
+			kube.ClearActions()
+			r.deploymentLister = newDeploymentLister(updated)
+			if err := r.reconcileFilterDeployment(testContext(), b, "TEST_STREAM", brokerconfig.DefaultBrokerConfig(), policy); err != nil {
+				t.Fatal(err)
+			}
+			if got := countResourceActions(kube.Actions(), "update", "deployments"); got != 0 {
+				t.Fatalf("post-update Deployment updates = %d, want 0; actions=%#v", got, kube.Actions())
+			}
+		})
+	}
+}
+
+func TestReconcileFilterDeploymentRepairsHTTPSProbeOnce(t *testing.T) {
+	b := testBroker(testNamespace, testBrokerName)
+	r := &Reconciler{filterImage: "filter:v1", natsURL: "nats://localhost:4222"}
+	existing := filterDeploymentFixture(b, r, brokerconfig.DefaultBrokerConfig(), 0)
+	filter := containerByName(t, existing.Spec.Template.Spec.Containers, resources.FilterContainerName)
+	filter.LivenessProbe.HTTPGet.Scheme = corev1.URISchemeHTTPS
+	filter.ReadinessProbe.HTTPGet.Scheme = corev1.URISchemeHTTPS
+	kube := kubefake.NewSimpleClientset(existing)
+	r.kubeClientSet = kube
+	r.deploymentLister = newDeploymentLister(existing)
+	policy := autoscaledReplicaPolicy(autoscaler.Settings{MinScale: 0})
+
+	if err := r.reconcileFilterDeployment(testContext(), b, "TEST_STREAM", brokerconfig.DefaultBrokerConfig(), policy); err != nil {
+		t.Fatal(err)
+	}
+	if got := countResourceActions(kube.Actions(), "update", "deployments"); got != 1 {
+		t.Fatalf("first reconcile Deployment updates = %d, want 1", got)
+	}
+	updated, err := kube.AppsV1().Deployments(b.Namespace).Get(context.Background(), existing.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updatedFilter := containerByName(t, updated.Spec.Template.Spec.Containers, resources.FilterContainerName)
+	for name, probe := range map[string]*corev1.Probe{"liveness": updatedFilter.LivenessProbe, "readiness": updatedFilter.ReadinessProbe} {
+		if probe == nil || probe.HTTPGet == nil || probe.HTTPGet.Scheme != corev1.URISchemeHTTP {
+			t.Errorf("%s probe = %#v, want HTTP scheme", name, probe)
+		}
+	}
+
+	kube.ClearActions()
+	r.deploymentLister = newDeploymentLister(updated)
+	if err := r.reconcileFilterDeployment(testContext(), b, "TEST_STREAM", brokerconfig.DefaultBrokerConfig(), policy); err != nil {
+		t.Fatal(err)
+	}
+	if got := countResourceActions(kube.Actions(), "update", "deployments"); got != 0 {
+		t.Fatalf("second reconcile Deployment updates = %d, want 0; actions=%#v", got, kube.Actions())
+	}
+}
+
+func TestReconcileFilterServiceRepairsRenamedPortOnce(t *testing.T) {
+	b := testBroker(testNamespace, testBrokerName)
+	existing := resources.MakeFilterService(b)
+	defaultFilterServiceAsAPIServer(existing)
+	existing.Spec.Ports[0].Name = "webhook-renamed"
+	kube := kubefake.NewSimpleClientset(existing)
+	r := &Reconciler{kubeClientSet: kube, serviceLister: newServiceLister(existing)}
+
+	if _, err := r.reconcileFilterService(testContext(), b); err != nil {
+		t.Fatal(err)
+	}
+	if got := countResourceActions(kube.Actions(), "update", "services"); got != 1 {
+		t.Fatalf("first reconcile Service updates = %d, want 1", got)
+	}
+	updated, err := kube.CoreV1().Services(b.Namespace).Get(context.Background(), existing.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFilterServiceAllocationsPreserved(t, existing, updated)
+	servicePortByName(t, updated.Spec.Ports, resources.IngressPortName)
+
+	kube.ClearActions()
+	r.serviceLister = newServiceLister(updated)
+	if _, err := r.reconcileFilterService(testContext(), b); err != nil {
+		t.Fatal(err)
+	}
+	if got := countResourceActions(kube.Actions(), "update", "services"); got != 0 {
+		t.Fatalf("second reconcile Service updates = %d, want 0; actions=%#v", got, kube.Actions())
+	}
+}
+
+func TestReconcileFilterServiceRejectsAmbiguousRenamedPort(t *testing.T) {
+	b := testBroker(testNamespace, testBrokerName)
+	existing := resources.MakeFilterService(b)
+	defaultFilterServiceAsAPIServer(existing)
+	existing.Spec.Ports[0].Name = "first-renamed"
+	existing.Spec.Ports = append(existing.Spec.Ports, corev1.ServicePort{
+		Name: "second-renamed", Protocol: corev1.ProtocolTCP, Port: 80, TargetPort: intstr.FromInt(18080),
+	})
+	original := existing.DeepCopy()
+	kube := kubefake.NewSimpleClientset(existing)
+	r := &Reconciler{kubeClientSet: kube, serviceLister: newServiceLister(existing)}
+
+	if _, err := r.reconcileFilterService(testContext(), b); err == nil || !strings.Contains(err.Error(), "unambiguously") {
+		t.Fatalf("reconcileFilterService() error = %v, want ambiguous port rejection", err)
+	}
+	if got := countResourceActions(kube.Actions(), "update", "services"); got != 0 {
+		t.Fatalf("ambiguous Service updates = %d, want 0", got)
+	}
+	stored, err := kube.CoreV1().Services(b.Namespace).Get(context.Background(), existing.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !apiequality.Semantic.DeepEqual(stored, original) {
+		t.Fatalf("ambiguous Service was mutated: got=%#v want=%#v", stored, original)
+	}
+}
+
+func TestReconcileFilterServiceOwnedDriftConvergesOnce(t *testing.T) {
+	b := testBroker(testNamespace, testBrokerName)
+	existing := resources.MakeFilterService(b)
+	appProtocol := "custom.example/http"
+	existing.Spec.Ports = append(existing.Spec.Ports, corev1.ServicePort{
+		Name: "sidecar-extra", Protocol: corev1.ProtocolTCP, Port: 9090,
+		TargetPort: intstr.FromInt(9090), AppProtocol: &appProtocol,
+	})
+	defaultFilterServiceAsAPIServer(existing)
+	existing.Spec.Ports[0].Port = 81
+	existing.Spec.Ports[0].TargetPort = intstr.FromInt(8181)
+	kube := kubefake.NewSimpleClientset(existing)
+	r := &Reconciler{kubeClientSet: kube, serviceLister: newServiceLister(existing)}
+
+	if _, err := r.reconcileFilterService(testContext(), b); err != nil {
+		t.Fatal(err)
+	}
+	if got := countResourceActions(kube.Actions(), "update", "services"); got != 1 {
+		t.Fatalf("first reconcile Service updates = %d, want 1", got)
+	}
+	updated, err := kube.CoreV1().Services(b.Namespace).Get(context.Background(), existing.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFilterServiceAllocationsPreserved(t, existing, updated)
+	if got := servicePortByName(t, updated.Spec.Ports, resources.IngressPortName); got.Port != 80 || got.TargetPort != intstr.FromInt(resources.FilterPortNumber) {
+		t.Errorf("ingress port = %#v, want controller values", got)
+	}
+	if got, want := servicePortByName(t, updated.Spec.Ports, "sidecar-extra"), servicePortByName(t, existing.Spec.Ports, "sidecar-extra"); !apiequality.Semantic.DeepEqual(got, want) {
+		t.Errorf("extra Service port changed: got=%#v want=%#v", got, want)
+	}
+
+	kube.ClearActions()
+	r.serviceLister = newServiceLister(updated)
+	if _, err := r.reconcileFilterService(testContext(), b); err != nil {
+		t.Fatal(err)
+	}
+	if got := countResourceActions(kube.Actions(), "update", "services"); got != 0 {
+		t.Fatalf("second reconcile Service updates = %d, want 0; actions=%#v", got, kube.Actions())
+	}
+}
+
+func defaultFilterDeploymentAsAPIServer(deployment *appsv1.Deployment) {
+	deployment.Spec.Strategy = appsv1.DeploymentStrategy{
+		Type: appsv1.RollingUpdateDeploymentStrategyType,
+		RollingUpdate: &appsv1.RollingUpdateDeployment{
+			MaxUnavailable: ptr.To(intstr.FromString("25%")),
+			MaxSurge:       ptr.To(intstr.FromString("25%")),
+		},
+	}
+	deployment.Spec.RevisionHistoryLimit = ptr.To[int32](10)
+	deployment.Spec.ProgressDeadlineSeconds = ptr.To[int32](600)
+	podSpec := &deployment.Spec.Template.Spec
+	podSpec.RestartPolicy = corev1.RestartPolicyAlways
+	podSpec.DNSPolicy = corev1.DNSClusterFirst
+	podSpec.SchedulerName = corev1.DefaultSchedulerName
+	podSpec.SecurityContext = &corev1.PodSecurityContext{}
+	for index := range podSpec.Containers {
+		container := &podSpec.Containers[index]
+		container.ImagePullPolicy = defaultImagePullPolicy(container.Image)
+		container.TerminationMessagePath = corev1.TerminationMessagePathDefault
+		container.TerminationMessagePolicy = corev1.TerminationMessageReadFile
+		for name, quantity := range container.Resources.Limits {
+			quantity.RoundUp(-3)
+			container.Resources.Limits[name] = quantity
+		}
+		for name, quantity := range container.Resources.Requests {
+			quantity.RoundUp(-3)
+			container.Resources.Requests[name] = quantity
+		}
+		for _, probe := range []*corev1.Probe{container.LivenessProbe, container.ReadinessProbe} {
+			if probe == nil {
+				continue
+			}
+			probe.HTTPGet.Scheme = corev1.URISchemeHTTP
+			probe.TimeoutSeconds = 1
+			probe.SuccessThreshold = 1
+			probe.FailureThreshold = 3
+		}
+		for envIndex := range container.Env {
+			variable := &container.Env[envIndex]
+			if variable.Name == "POD_NAME" && variable.ValueFrom != nil && variable.ValueFrom.FieldRef != nil {
+				variable.ValueFrom.FieldRef.APIVersion = "v1"
+			}
+			if variable.ValueFrom != nil && variable.ValueFrom.FileKeyRef != nil && variable.ValueFrom.FileKeyRef.Optional == nil {
+				variable.ValueFrom.FileKeyRef.Optional = ptr.To(false)
+			}
+		}
+	}
+}
+
+func filterDeploymentFixture(broker *eventingv1.Broker, reconciler *Reconciler, brokerConfig *brokerconfig.NatsJetStreamBrokerConfig, replicas int32) *appsv1.Deployment {
+	deployment := resources.MakeFilterDeployment(&resources.FilterArgs{
+		Broker:             broker,
+		Image:              reconciler.filterImage,
+		ServiceAccountName: reconciler.dataplaneIdentity(broker),
+		StreamName:         "TEST_STREAM",
+		NatsURL:            reconciler.natsURL,
+		NatsConfigJSON:     reconciler.natsConfigJSON,
+		Template:           brokerConfig.Filter,
+	})
+	// The API server stores an independent object; do not let defaulting the
+	// fixture mutate pointer/map values in the controller's config snapshot.
+	deployment = deployment.DeepCopy()
+	deployment.Spec.Replicas = ptr.To(replicas)
+	defaultFilterDeploymentAsAPIServer(deployment)
+	return deployment
+}
+
+func defaultFilterServiceAsAPIServer(service *corev1.Service) {
+	service.Spec.Type = corev1.ServiceTypeClusterIP
+	service.Spec.SessionAffinity = corev1.ServiceAffinityNone
+	service.Spec.ClusterIP = "10.0.0.10"
+	service.Spec.ClusterIPs = []string{service.Spec.ClusterIP}
+	service.Spec.IPFamilies = []corev1.IPFamily{corev1.IPv4Protocol}
+	service.Spec.IPFamilyPolicy = ptr.To(corev1.IPFamilyPolicySingleStack)
+	service.Spec.InternalTrafficPolicy = ptr.To(corev1.ServiceInternalTrafficPolicyCluster)
+}
+
+func countResourceActions(actions []clienttesting.Action, verb, resource string) int {
+	count := 0
+	for _, action := range actions {
+		if action.Matches(verb, resource) {
+			count++
+		}
+	}
+	return count
+}
+
+func assertNoDeleteActions(t *testing.T, actions []clienttesting.Action, clientName string) {
+	t.Helper()
+	for _, action := range actions {
+		if action.GetVerb() == "delete" || strings.HasPrefix(action.GetVerb(), "deletecollection") {
+			t.Errorf("%s cleanup action occurred: %#v", clientName, action)
+		}
+	}
+}
+
+func assertDeletePreconditions(t *testing.T, actions []clienttesting.Action, resource string, wantUID types.UID, wantResourceVersion string, wantPropagation *metav1.DeletionPropagation) {
+	t.Helper()
+	for _, action := range actions {
+		if !action.Matches("delete", resource) {
+			continue
+		}
+		assertDeleteOptionsValues(t, action.(clienttesting.DeleteAction).GetDeleteOptions(), wantUID, wantResourceVersion, wantPropagation)
+		return
+	}
+	t.Fatalf("%s delete action was not recorded", resource)
+}
+
+func assertDeleteOptionsValues(t *testing.T, options metav1.DeleteOptions, wantUID types.UID, wantResourceVersion string, wantPropagation *metav1.DeletionPropagation) {
+	t.Helper()
+	if options.Preconditions == nil || options.Preconditions.UID == nil || *options.Preconditions.UID != wantUID ||
+		options.Preconditions.ResourceVersion == nil || *options.Preconditions.ResourceVersion != wantResourceVersion {
+		t.Fatalf("delete preconditions = %#v, want UID %q resourceVersion %q", options.Preconditions, wantUID, wantResourceVersion)
+	}
+	if !apiequality.Semantic.DeepEqual(options.PropagationPolicy, wantPropagation) {
+		t.Fatalf("delete propagation = %v, want %v", options.PropagationPolicy, wantPropagation)
+	}
+}
+
+func errorChainHasConflict(err error) bool {
+	for err != nil {
+		if apierrs.IsConflict(err) {
+			return true
+		}
+		err = errors.Unwrap(err)
+	}
+	return false
+}
+
+func assertFilterDeploymentUnownedFieldsPreserved(t *testing.T, before, after *appsv1.Deployment) {
+	t.Helper()
+	if !apiequality.Semantic.DeepEqual(after.Spec.Strategy, before.Spec.Strategy) ||
+		!apiequality.Semantic.DeepEqual(after.Spec.RevisionHistoryLimit, before.Spec.RevisionHistoryLimit) ||
+		!apiequality.Semantic.DeepEqual(after.Spec.ProgressDeadlineSeconds, before.Spec.ProgressDeadlineSeconds) {
+		t.Errorf("Deployment API defaults were not preserved: before=%#v after=%#v", before.Spec, after.Spec)
+	}
+	if after.Labels["admission.example/extra"] != "preserved" || after.Spec.Template.Annotations["sidecar.example/injected"] != "true" {
+		t.Errorf("extra metadata was not preserved: labels=%v annotations=%v", after.Labels, after.Spec.Template.Annotations)
+	}
+	if !apiequality.Semantic.DeepEqual(after.Spec.Template.Spec.Tolerations, before.Spec.Template.Spec.Tolerations) {
+		t.Errorf("Pod-level admission fields changed: before=%v after=%v", before.Spec.Template.Spec.Tolerations, after.Spec.Template.Spec.Tolerations)
+	}
+	if got := containerByName(t, after.Spec.Template.Spec.Containers, "injected-sidecar"); got.Image != "sidecar:v1" {
+		t.Errorf("sidecar = %#v, want preserved", got)
+	}
+	filter := containerByName(t, after.Spec.Template.Spec.Containers, resources.FilterContainerName)
+	if got := envValue(filter.Env, "ADMISSION_EXTRA"); got != "preserved" {
+		t.Errorf("extra filter env = %q, want preserved", got)
+	}
+	foundExtraPort := false
+	for _, port := range filter.Ports {
+		if port.Name == "admin-extra" && port.ContainerPort == 9090 {
+			foundExtraPort = true
+		}
+	}
+	if !foundExtraPort {
+		t.Errorf("extra filter port was not preserved: %v", filter.Ports)
+	}
+}
+
+func assertFilterAPIDefaultFixture(t *testing.T, deployment *appsv1.Deployment) {
+	t.Helper()
+	filter := containerByName(t, deployment.Spec.Template.Spec.Containers, resources.FilterContainerName)
+	for _, probe := range []*corev1.Probe{filter.LivenessProbe, filter.ReadinessProbe} {
+		if probe == nil || probe.HTTPGet == nil || probe.HTTPGet.Scheme != corev1.URISchemeHTTP {
+			t.Errorf("HTTP probe default scheme = %#v, want HTTP", probe)
+		}
+	}
+	for _, variable := range filter.Env {
+		if variable.Name == "POD_NAME" {
+			if variable.ValueFrom == nil || variable.ValueFrom.FieldRef == nil || variable.ValueFrom.FieldRef.APIVersion != "v1" {
+				t.Errorf("POD_NAME fieldRef = %#v, want apiVersion v1", variable.ValueFrom)
+			}
+			return
+		}
+	}
+	t.Error("POD_NAME env is missing")
+}
+
+func assertDefaultFilterContainerResources(t *testing.T, got corev1.ResourceRequirements) {
+	t.Helper()
+	want := corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("100m"),
+			corev1.ResourceMemory: resource.MustParse("64Mi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("500m"),
+			corev1.ResourceMemory: resource.MustParse("256Mi"),
+		},
+	}
+	if !apiequality.Semantic.DeepEqual(got, want) {
+		t.Errorf("filter resources = %#v, want defaults %#v", got, want)
+	}
+}
+
+func assertHardenedFilterSecurityContext(t *testing.T, got *corev1.SecurityContext) {
+	t.Helper()
+	if got == nil {
+		t.Fatal("filter securityContext is nil")
+	}
+	if got.RunAsNonRoot == nil || !*got.RunAsNonRoot {
+		t.Errorf("runAsNonRoot = %v, want true", got.RunAsNonRoot)
+	}
+	if got.AllowPrivilegeEscalation == nil || *got.AllowPrivilegeEscalation {
+		t.Errorf("allowPrivilegeEscalation = %v, want false", got.AllowPrivilegeEscalation)
+	}
+	if got.ReadOnlyRootFilesystem == nil || !*got.ReadOnlyRootFilesystem {
+		t.Errorf("readOnlyRootFilesystem = %v, want true", got.ReadOnlyRootFilesystem)
+	}
+	if got.Capabilities == nil || len(got.Capabilities.Add) != 0 || !apiequality.Semantic.DeepEqual(got.Capabilities.Drop, []corev1.Capability{"ALL"}) {
+		t.Errorf("capabilities = %#v, want drop ALL with no additions", got.Capabilities)
+	}
+	if got.SeccompProfile == nil || got.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault || got.SeccompProfile.LocalhostProfile != nil {
+		t.Errorf("seccompProfile = %#v, want RuntimeDefault", got.SeccompProfile)
+	}
+}
+
+func assertFilterServiceAllocationsPreserved(t *testing.T, before, after *corev1.Service) {
+	t.Helper()
+	if after.Spec.ClusterIP != before.Spec.ClusterIP ||
+		!apiequality.Semantic.DeepEqual(after.Spec.ClusterIPs, before.Spec.ClusterIPs) ||
+		!apiequality.Semantic.DeepEqual(after.Spec.IPFamilies, before.Spec.IPFamilies) ||
+		!apiequality.Semantic.DeepEqual(after.Spec.IPFamilyPolicy, before.Spec.IPFamilyPolicy) ||
+		!apiequality.Semantic.DeepEqual(after.Spec.InternalTrafficPolicy, before.Spec.InternalTrafficPolicy) ||
+		after.Spec.Type != before.Spec.Type || after.Spec.SessionAffinity != before.Spec.SessionAffinity {
+		t.Errorf("Service API allocations/defaults changed: before=%#v after=%#v", before.Spec, after.Spec)
+	}
+}
+
+func containerByName(t *testing.T, containers []corev1.Container, name string) *corev1.Container {
+	t.Helper()
+	for index := range containers {
+		if containers[index].Name == name {
+			return &containers[index]
+		}
+	}
+	t.Fatalf("container %q not found in %v", name, containers)
+	return nil
+}
+
+func envValue(env []corev1.EnvVar, name string) string {
+	for _, variable := range env {
+		if variable.Name == name {
+			return variable.Value
+		}
+	}
+	return ""
+}
+
+func envVarByName(t *testing.T, env []corev1.EnvVar, name string) *corev1.EnvVar {
+	t.Helper()
+	for index := range env {
+		if env[index].Name == name {
+			return &env[index]
+		}
+	}
+	t.Fatalf("env %q not found in %v", name, env)
+	return nil
+}
+
+func insertEnvVar(env []corev1.EnvVar, index int, variable corev1.EnvVar) []corev1.EnvVar {
+	result := make([]corev1.EnvVar, 0, len(env)+1)
+	result = append(result, env[:index]...)
+	result = append(result, variable)
+	result = append(result, env[index:]...)
+	return result
+}
+
+func envVarIndex(env []corev1.EnvVar, name string) int {
+	for index := range env {
+		if env[index].Name == name {
+			return index
+		}
+	}
+	return -1
+}
+
+func servicePortByName(t *testing.T, ports []corev1.ServicePort, name string) *corev1.ServicePort {
+	t.Helper()
+	for index := range ports {
+		if ports[index].Name == name {
+			return &ports[index]
+		}
+	}
+	t.Fatalf("Service port %q not found in %v", name, ports)
+	return nil
 }
 
 func TestEnqueueBrokerOfTrigger(t *testing.T) {
@@ -698,7 +1997,7 @@ func TestReconcileKind(t *testing.T) {
 		}
 		r := &Reconciler{
 			kubeClientSet:        kube,
-			eventingClient:       eventingfake.NewSimpleClientset(),
+			eventingClient:       eventingfake.NewSimpleClientset(triggerObjects(triggers...)...),
 			js:                   js,
 			triggerLister:        triggerLister,
 			deploymentLister:     newDeploymentLister(deploymentWithReady(ingressNS, ingressName, 1)),
@@ -729,6 +2028,69 @@ func TestReconcileKind(t *testing.T) {
 		}
 	})
 
+	t.Run("empty cache with live trigger does not run cleanup", func(t *testing.T) {
+		r, kube := setup(t)
+		b := testBroker(testNamespace, testBrokerName)
+		liveTrigger := testTrigger(testNamespace, "live-trigger", testBrokerName)
+		liveTrigger.UID = "live-trigger-uid"
+		r.eventingClient = eventingfake.NewSimpleClientset(liveTrigger)
+		dynamicClient := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme())
+		r.dynamicClient = dynamicClient
+		filterDeployment := ownedFilterDeployment(b, 1)
+		filterDeployment.UID = "deployment-uid"
+		filterDeployment.ResourceVersion = "deployment-rv"
+		filterService := resources.MakeFilterService(b)
+		filterService.UID = "service-uid"
+		filterService.ResourceVersion = "service-rv"
+		if err := kube.Tracker().Add(filterDeployment); err != nil {
+			t.Fatal(err)
+		}
+		if err := kube.Tracker().Add(filterService); err != nil {
+			t.Fatal(err)
+		}
+		r.deploymentLister = newDeploymentLister(deploymentWithReady(ingressNS, ingressName, 1), filterDeployment)
+		r.serviceLister = newServiceLister(filterService)
+
+		if err := r.ReconcileKind(testContext(), b); err != nil {
+			t.Fatalf("ReconcileKind() with live Trigger: %v", err)
+		}
+		assertNoDeleteActions(t, kube.Actions(), "Kubernetes")
+		assertNoDeleteActions(t, dynamicClient.Actions(), "dynamic")
+	})
+
+	t.Run("live trigger list error does not run cleanup", func(t *testing.T) {
+		r, kube := setup(t)
+		b := testBroker(testNamespace, testBrokerName)
+		live := eventingfake.NewSimpleClientset()
+		live.PrependReactor("list", "triggers", func(clienttesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("live Trigger list failed")
+		})
+		r.eventingClient = live
+		dynamicClient := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme())
+		r.dynamicClient = dynamicClient
+		filterDeployment := ownedFilterDeployment(b, 1)
+		filterDeployment.UID = "deployment-uid"
+		filterDeployment.ResourceVersion = "deployment-rv"
+		filterService := resources.MakeFilterService(b)
+		filterService.UID = "service-uid"
+		filterService.ResourceVersion = "service-rv"
+		if err := kube.Tracker().Add(filterDeployment); err != nil {
+			t.Fatal(err)
+		}
+		if err := kube.Tracker().Add(filterService); err != nil {
+			t.Fatal(err)
+		}
+		r.deploymentLister = newDeploymentLister(deploymentWithReady(ingressNS, ingressName, 1), filterDeployment)
+		r.serviceLister = newServiceLister(filterService)
+
+		err := r.ReconcileKind(testContext(), b)
+		if err == nil || !strings.Contains(err.Error(), "failed to confirm live triggers") {
+			t.Fatalf("ReconcileKind() error = %v, want live Trigger list failure", err)
+		}
+		assertNoDeleteActions(t, kube.Actions(), "Kubernetes")
+		assertNoDeleteActions(t, dynamicClient.Actions(), "dynamic")
+	})
+
 	t.Run("no triggers: RBAC is revoked even when filter deletion fails", func(t *testing.T) {
 		r, kube := setup(t)
 		r.natsConfigJSON = `{"auth":{"credentialFile":{"secret":{"name":"credentials"}}}}`
@@ -737,7 +2099,13 @@ func TestReconcileKind(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := kube.AppsV1().Deployments(b.Namespace).Create(context.Background(), &appsv1.Deployment{
-			ObjectMeta: metav1.ObjectMeta{Name: resources.FilterName(b.Name), Namespace: b.Namespace},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            resources.FilterName(b.Name),
+				Namespace:       b.Namespace,
+				UID:             "deployment-uid",
+				ResourceVersion: "deployment-rv",
+				OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(b, eventingv1.SchemeGroupVersion.WithKind("Broker"))},
+			},
 		}, metav1.CreateOptions{}); err != nil {
 			t.Fatal(err)
 		}

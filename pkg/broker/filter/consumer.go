@@ -92,6 +92,9 @@ var ErrConsumerManagerClosed = errors.New("consumer manager is shutting down")
 
 // ConsumerManagerConfig holds configuration for the ConsumerManager
 type ConsumerManagerConfig struct {
+	// StreamName is the only Broker stream this per-Broker filter may consume.
+	StreamName string
+
 	// FetchBatchSize is the number of messages to fetch in each batch.
 	// Defaults to DefaultFetchBatchSize if not set.
 	FetchBatchSize int
@@ -120,6 +123,7 @@ type ConsumerManager struct {
 	fetchBatchSize        int
 	fetchTimeout          time.Duration
 	defaultMaxConcurrency int
+	streamName            string
 
 	// Event dispatcher
 	dispatcher *kncloudevents.Dispatcher
@@ -203,8 +207,10 @@ func NewConsumerManager(ctx context.Context, conn *nats.Conn, js nats.JetStreamC
 	fetchBatchSize := DefaultFetchBatchSize
 	fetchTimeout := DefaultFetchTimeout
 	maxConcurrency := DefaultMaxConcurrency
+	streamName := ""
 
 	if config != nil {
+		streamName = config.StreamName
 		if config.FetchBatchSize > 0 {
 			fetchBatchSize = config.FetchBatchSize
 		}
@@ -252,6 +258,7 @@ func NewConsumerManager(ctx context.Context, conn *nats.Conn, js nats.JetStreamC
 		fetchBatchSize:        fetchBatchSize,
 		fetchTimeout:          fetchTimeout,
 		defaultMaxConcurrency: maxConcurrency,
+		streamName:            streamName,
 		dispatcher:            dispatcher,
 		tracer:                tracer,
 		dispatchDuration:      dispatchDuration,
@@ -418,6 +425,10 @@ func (m *ConsumerManager) SubscribeTrigger(
 
 	// Derive stream and consumer names
 	streamName := brokerutils.BrokerStreamName(broker)
+	if m.streamName != "" && streamName != m.streamName {
+		handler.Cleanup()
+		return fmt.Errorf("trigger stream %s does not match filter stream %s", streamName, m.streamName)
+	}
 	consumerName := brokerutils.TriggerConsumerName(triggerUID)
 
 	// Get consumer info (also verifies consumer exists)

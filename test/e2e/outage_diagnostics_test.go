@@ -25,9 +25,12 @@ import (
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/types"
 	clienttesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 
@@ -154,5 +157,68 @@ func TestShouldCaptureOutageSnapshot(t *testing.T) {
 				t.Errorf("shouldCaptureOutageSnapshot(%t, %t) = %t, want %t", test.failedBefore, test.failedAfter, got, test.want)
 			}
 		})
+	}
+}
+
+func TestAutoscalerTriggerShapeHelpers(t *testing.T) {
+	brokerUID := types.UID("broker-uid")
+	controller := true
+	scaledObject := &unstructured.Unstructured{Object: map[string]interface{}{
+		"spec": map[string]interface{}{
+			"scaleTargetRef": map[string]interface{}{
+				"apiVersion": "apps/v1",
+				"kind":       "Deployment",
+				"name":       "broker-filter",
+			},
+			"triggers": []interface{}{
+				map[string]interface{}{"metadata": map[string]interface{}{"consumer": "KN_TRIGGER_UID_A"}},
+				map[string]interface{}{"metadata": map[string]interface{}{"consumer": "KN_TRIGGER_UID_B"}},
+			},
+		},
+		"status": map[string]interface{}{
+			"conditions": []interface{}{map[string]interface{}{"type": "Ready", "status": "True"}},
+		},
+	}}
+	scaledObject.SetOwnerReferences([]metav1.OwnerReference{{
+		APIVersion: "eventing.knative.dev/v1", Kind: "Broker", UID: brokerUID, Controller: &controller,
+	}})
+	if err := requireControllerOwner(scaledObject.GetOwnerReferences(), "eventing.knative.dev/v1", "Broker", brokerUID); err != nil {
+		t.Errorf("valid ScaledObject owner rejected: %v", err)
+	}
+	if err := requireUnstructuredScaleTarget(scaledObject, "broker-filter"); err != nil {
+		t.Errorf("valid ScaledObject target rejected: %v", err)
+	}
+	consumers, err := scaledObjectConsumers(scaledObject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(consumers, ","), "KN_TRIGGER_UID_A,KN_TRIGGER_UID_B"; got != want {
+		t.Errorf("ScaledObject consumers = %q, want %q", got, want)
+	}
+	ready, err := scaledObjectReadyTrue(scaledObject)
+	if err != nil || !ready {
+		t.Errorf("ScaledObject Ready=True = %t, %v", ready, err)
+	}
+
+	hpa := &autoscalingv2.HorizontalPodAutoscaler{Spec: autoscalingv2.HorizontalPodAutoscalerSpec{
+		Metrics: []autoscalingv2.MetricSpec{
+			{Type: autoscalingv2.ExternalMetricSourceType, External: &autoscalingv2.ExternalMetricSource{Metric: autoscalingv2.MetricIdentifier{Name: "s0-nats-jetstream"}}},
+			{Type: autoscalingv2.ExternalMetricSourceType, External: &autoscalingv2.ExternalMetricSource{Metric: autoscalingv2.MetricIdentifier{Name: "s1-nats-jetstream"}}},
+		},
+	}}
+	metricNames, err := externalMetricNames(hpa)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(metricNames, ","), "s0-nats-jetstream,s1-nats-jetstream"; got != want {
+		t.Errorf("HPA external metrics = %q, want %q", got, want)
+	}
+
+	hpa.Spec.Metrics[1].External.Metric.Name = hpa.Spec.Metrics[0].External.Metric.Name
+	if _, err := externalMetricNames(hpa); err == nil || !strings.Contains(err.Error(), "duplicated") {
+		t.Errorf("duplicate HPA external metric error = %v, want duplicate rejection", err)
+	}
+	if err := requireControllerOwner(scaledObject.GetOwnerReferences(), "eventing.knative.dev/v1", "Broker", "replacement-uid"); err == nil {
+		t.Error("replacement Broker UID unexpectedly passed owner validation")
 	}
 }

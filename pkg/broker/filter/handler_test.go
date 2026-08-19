@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"slices"
 	"testing"
+	"time"
 
 	cloudevents "github.com/cloudevents/sdk-go/v2"
 	"github.com/cloudevents/sdk-go/v2/binding"
@@ -35,6 +36,7 @@ import (
 	duckv1 "knative.dev/pkg/apis/duck/v1"
 	"knative.dev/pkg/logging"
 
+	eventingduckv1 "knative.dev/eventing/pkg/apis/duck/v1"
 	eventingv1 "knative.dev/eventing/pkg/apis/eventing/v1"
 	"knative.dev/eventing/pkg/eventfilter"
 	"knative.dev/eventing/pkg/kncloudevents"
@@ -190,7 +192,7 @@ func TestDetermineNatsResult_EdgeCases(t *testing.T) {
 			name:         "zero response code with no error",
 			responseCode: 0,
 			err:          nil,
-			wantACK:      true,
+			wantACK:      false,
 		},
 		{
 			name:         "zero response code with error",
@@ -202,7 +204,7 @@ func TestDetermineNatsResult_EdgeCases(t *testing.T) {
 			name:         "1xx informational (no error)",
 			responseCode: 100,
 			err:          nil,
-			wantACK:      true,
+			wantACK:      false,
 		},
 		{
 			name:         "3xx redirect with error",
@@ -219,6 +221,54 @@ func TestDetermineNatsResult_EdgeCases(t *testing.T) {
 			isACK := protocol.IsACK(result)
 			if isACK != tt.wantACK {
 				t.Errorf("IsACK() = %v, want %v", isACK, tt.wantACK)
+			}
+		})
+	}
+}
+
+func TestCalculateDurationNakDelay(t *testing.T) {
+	policy := eventingduckv1.BackoffPolicyExponential
+	delay := "PT1S"
+	backoffMax := "PT10M"
+	retryAfterMax := "PT1H"
+	config, err := kncloudevents.RetryConfigFromDeliverySpec(eventingduckv1.DeliverySpec{
+		BackoffPolicy: &policy,
+		BackoffDelay:  &delay,
+		BackoffMax:    &backoffMax,
+		RetryAfterMax: &retryAfterMax,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	retryAfter := func(value string) *http.Response {
+		return &http.Response{StatusCode: http.StatusTooManyRequests, Header: http.Header{"Retry-After": []string{value}}}
+	}
+
+	tests := []struct {
+		name         string
+		numDelivered int
+		config       *kncloudevents.RetryConfig
+		response     *http.Response
+		maxBackoff   time.Duration
+		remaining    time.Duration
+		want         time.Duration
+	}{
+		{name: "first delivery uses the base delay", numDelivered: 1, config: &config, maxBackoff: 10 * time.Minute, remaining: time.Hour, want: time.Second},
+		{name: "second delivery doubles", numDelivered: 2, config: &config, maxBackoff: 10 * time.Minute, remaining: time.Hour, want: 2 * time.Second},
+		{name: "large delivery number is capped", numDelivered: 64, config: &config, maxBackoff: 10 * time.Minute, remaining: time.Hour, want: 10 * time.Minute},
+		{name: "default max backoff caps the backoff", numDelivered: 64, config: &config, maxBackoff: time.Minute, remaining: time.Hour, want: time.Minute},
+		{name: "deadline remainder wins", numDelivered: 20, config: &config, maxBackoff: 10 * time.Minute, remaining: 17 * time.Second, want: 17 * time.Second},
+		{name: "retry after is honored", numDelivered: 1, config: &config, response: retryAfter("30"), maxBackoff: 10 * time.Minute, remaining: time.Hour, want: 30 * time.Second},
+		{name: "max backoff does not cap retry after", numDelivered: 1, config: &config, response: retryAfter("1200"), maxBackoff: 10 * time.Minute, remaining: time.Hour, want: 20 * time.Minute},
+		{name: "deadline remainder caps retry after", numDelivered: 1, config: &config, response: retryAfter("1200"), maxBackoff: 10 * time.Minute, remaining: 17 * time.Second, want: 17 * time.Second},
+		{name: "missing backoff uses one second", numDelivered: 3, maxBackoff: 10 * time.Minute, remaining: time.Hour, want: time.Second},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := calculateDurationNakDelay(tt.numDelivered, tt.config, tt.response, tt.maxBackoff, tt.remaining)
+			if got != tt.want {
+				t.Errorf("calculateDurationNakDelay() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -553,7 +603,7 @@ func TestNewTriggerHandler(t *testing.T) {
 	subscriberURL, _ := apis.ParseURL("http://subscriber.example.com")
 	subscriber := duckv1.Addressable{URL: subscriberURL}
 
-	handler, err := NewTriggerHandler(ctx, trigger, subscriber, nil, nil, nil, nil, nil, nil, nil, nil)
+	handler, err := NewTriggerHandler(ctx, trigger, subscriber, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("NewTriggerHandler() unexpected error: %v", err)
 	}
@@ -614,7 +664,7 @@ func TestNewTriggerHandler_WithOptionalParams(t *testing.T) {
 	retryConfig := &kncloudevents.RetryConfig{RetryMax: 3}
 	noRetryConfig := &kncloudevents.RetryConfig{RetryMax: 0}
 
-	handler, err := NewTriggerHandler(ctx, trigger, subscriber, brokerIngress, dls, retryConfig, noRetryConfig, nil, nil, nil, nil)
+	handler, err := NewTriggerHandler(ctx, trigger, subscriber, brokerIngress, dls, retryConfig, nil, noRetryConfig, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("NewTriggerHandler() unexpected error: %v", err)
 	}

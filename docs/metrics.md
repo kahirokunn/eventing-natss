@@ -4,6 +4,27 @@ Follow the instructions on Knative eventing to
 [access Prometheus metrics](https://github.com/knative/eventing/blob/master/docs/metrics.md#access-metrics).
 Then do the following to access NATS Streaming metrics.
 
+## Broker filter delivery attempts
+
+The Broker filter exports
+`kn.eventing.broker.filter.dispatch.attempts`, normalized by the Prometheus
+exporter as `kn_eventing_broker_filter_dispatch_attempts_total`.
+
+| Label | Example | Use |
+|-------|---------|-----|
+| `kn_trigger_namespace` | `tcg-platform-eventing` | Find the namespace that owns the Trigger |
+| `kn_trigger_name` | `tcg-platform-es-sync` | Find the subscriber configuration and logs |
+| `http_response_status_code` | `503`, or `0` when no response arrived | Separate HTTP failures from network/timeout failures |
+| `delivery_result` | `subscriber_retry`, `subscriber_permanent`, `dead_letter_success`, `dead_letter_failure` | Alert on the delivery decision without using event IDs |
+
+For example, this query finds DLS requests that failed in the last five minutes:
+
+```promql
+sum by (kn_trigger_namespace, kn_trigger_name, http_response_status_code) (
+  increase(kn_eventing_broker_filter_dispatch_attempts_total{delivery_result="dead_letter_failure"}[5m])
+)
+```
+
 ## Add NatssChannel scrape jobs in the Prometheus config map
 
 Edit the config map **prometheus-scrape-config**:

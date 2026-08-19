@@ -41,6 +41,7 @@ import (
 	fakekubeclient "knative.dev/pkg/client/injection/kube/client/fake"
 	"knative.dev/pkg/logging"
 
+	eventingduckv1 "knative.dev/eventing/pkg/apis/duck/v1"
 	eventingv1 "knative.dev/eventing/pkg/apis/eventing/v1"
 	"knative.dev/eventing/pkg/eventingtls"
 	"knative.dev/eventing/pkg/kncloudevents"
@@ -224,7 +225,7 @@ func TestSubscribeTrigger_And_Unsubscribe(t *testing.T) {
 	subscriberURL, _ := apis.ParseURL("http://localhost:9999")
 	subscriber := duckv1.Addressable{URL: subscriberURL}
 
-	err := cm.SubscribeTrigger(trigger, broker, subscriber, nil, nil, nil, nil)
+	err := cm.SubscribeTrigger(trigger, broker, subscriber, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("SubscribeTrigger: %v", err)
 	}
@@ -282,7 +283,7 @@ func TestFetchLoop_DispatchesMessages(t *testing.T) {
 	subscriberURL, _ := apis.ParseURL(srv.URL)
 	subscriber := duckv1.Addressable{URL: subscriberURL}
 
-	err := cm.SubscribeTrigger(trigger, broker, subscriber, nil, nil, nil, nil)
+	err := cm.SubscribeTrigger(trigger, broker, subscriber, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("SubscribeTrigger: %v", err)
 	}
@@ -339,7 +340,7 @@ func TestFetchLoop_ContextCancellation(t *testing.T) {
 	subscriberURL, _ := apis.ParseURL(srv.URL)
 	subscriber := duckv1.Addressable{URL: subscriberURL}
 
-	err := cm.SubscribeTrigger(trigger, broker, subscriber, nil, nil, nil, nil)
+	err := cm.SubscribeTrigger(trigger, broker, subscriber, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("SubscribeTrigger: %v", err)
 	}
@@ -404,10 +405,10 @@ func TestClose_WithActiveSubscriptions(t *testing.T) {
 	trigger1 := makeTriggerWithUID(namespace, "close-trigger-1", brokerName, triggerUID1)
 	trigger2 := makeTriggerWithUID(namespace, "close-trigger-2", brokerName, triggerUID2)
 
-	if err := cm.SubscribeTrigger(trigger1, broker, subscriber, nil, nil, nil, nil); err != nil {
+	if err := cm.SubscribeTrigger(trigger1, broker, subscriber, nil, nil, nil, nil, nil); err != nil {
 		t.Fatalf("SubscribeTrigger(trigger1): %v", err)
 	}
-	if err := cm.SubscribeTrigger(trigger2, broker, subscriber, nil, nil, nil, nil); err != nil {
+	if err := cm.SubscribeTrigger(trigger2, broker, subscriber, nil, nil, nil, nil, nil); err != nil {
 		t.Fatalf("SubscribeTrigger(trigger2): %v", err)
 	}
 
@@ -460,7 +461,7 @@ func TestFetchLoop_DynamicBatchSize(t *testing.T) {
 	subscriberURL, _ := apis.ParseURL(srv.URL)
 	subscriber := duckv1.Addressable{URL: subscriberURL}
 
-	err := cm.SubscribeTrigger(trigger, broker, subscriber, nil, nil, nil, nil)
+	err := cm.SubscribeTrigger(trigger, broker, subscriber, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("SubscribeTrigger: %v", err)
 	}
@@ -521,7 +522,7 @@ func TestSubscribeTrigger_RestartOnAnnotationChange(t *testing.T) {
 	subscriberURL, _ := apis.ParseURL(srv.URL)
 	subscriber := duckv1.Addressable{URL: subscriberURL}
 
-	if err := cm.SubscribeTrigger(trigger, broker, subscriber, nil, nil, nil, nil); err != nil {
+	if err := cm.SubscribeTrigger(trigger, broker, subscriber, nil, nil, nil, nil, nil); err != nil {
 		t.Fatalf("SubscribeTrigger (first): %v", err)
 	}
 
@@ -543,7 +544,7 @@ func TestSubscribeTrigger_RestartOnAnnotationChange(t *testing.T) {
 		TriggerMaxConcurrencyAnnotation: "12",
 	}
 
-	if err := cm.SubscribeTrigger(trigger, broker, subscriber, nil, nil, nil, nil); err != nil {
+	if err := cm.SubscribeTrigger(trigger, broker, subscriber, nil, nil, nil, nil, nil); err != nil {
 		t.Fatalf("SubscribeTrigger (restart): %v", err)
 	}
 
@@ -615,7 +616,7 @@ func TestSubscribeTrigger_NoRestartWhenAnnotationsUnchanged(t *testing.T) {
 	url1, _ := apis.ParseURL("http://localhost:9996")
 	url2, _ := apis.ParseURL("http://localhost:9995")
 
-	if err := cm.SubscribeTrigger(trigger, broker, duckv1.Addressable{URL: url1}, nil, nil, nil, nil); err != nil {
+	if err := cm.SubscribeTrigger(trigger, broker, duckv1.Addressable{URL: url1}, nil, nil, nil, nil, nil); err != nil {
 		t.Fatalf("SubscribeTrigger (first): %v", err)
 	}
 
@@ -626,7 +627,7 @@ func TestSubscribeTrigger_NoRestartWhenAnnotationsUnchanged(t *testing.T) {
 	cm.mu.RUnlock()
 
 	// Same trigger, no annotations — should be a pure in-place handler update.
-	if err := cm.SubscribeTrigger(trigger, broker, duckv1.Addressable{URL: url2}, nil, nil, nil, nil); err != nil {
+	if err := cm.SubscribeTrigger(trigger, broker, duckv1.Addressable{URL: url2}, nil, nil, nil, nil, nil); err != nil {
 		t.Fatalf("SubscribeTrigger (second): %v", err)
 	}
 
@@ -759,7 +760,7 @@ func TestSubscribeTrigger_RestartTriggers(t *testing.T) {
 			trigger := makeTriggerWithUID(namespace, "trig", brokerName, triggerUID)
 
 			trigger.Annotations = tc.firstAnn
-			if err := cm.SubscribeTrigger(trigger, broker, subscriber, nil, nil, nil, nil); err != nil {
+			if err := cm.SubscribeTrigger(trigger, broker, subscriber, nil, nil, nil, nil, nil); err != nil {
 				t.Fatalf("first SubscribeTrigger: %v", err)
 			}
 
@@ -770,7 +771,7 @@ func TestSubscribeTrigger_RestartTriggers(t *testing.T) {
 			cm.mu.RUnlock()
 
 			trigger.Annotations = tc.secondAnn
-			if err := cm.SubscribeTrigger(trigger, broker, subscriber, nil, nil, nil, nil); err != nil {
+			if err := cm.SubscribeTrigger(trigger, broker, subscriber, nil, nil, nil, nil, nil); err != nil {
 				t.Fatalf("second SubscribeTrigger: %v", err)
 			}
 
@@ -864,6 +865,10 @@ func TestObservability_SpanAndMetricsEmitted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create process histogram: %v", err)
 	}
+	dispatchAttempts, err := meter.Int64Counter("kn.eventing.broker.filter.dispatch.attempts")
+	if err != nil {
+		t.Fatalf("create dispatch attempts counter: %v", err)
+	}
 
 	cm := &ConsumerManager{
 		logger:                logging.FromContext(ctx),
@@ -877,6 +882,7 @@ func TestObservability_SpanAndMetricsEmitted(t *testing.T) {
 		tracer:                tracer,
 		dispatchDuration:      dispatchDuration,
 		processDuration:       processDuration,
+		dispatchAttempts:      dispatchAttempts,
 		subscriptions:         make(map[string]*TriggerSubscription),
 	}
 	defer cm.Close() //nolint:errcheck
@@ -900,7 +906,7 @@ func TestObservability_SpanAndMetricsEmitted(t *testing.T) {
 	subscriberURL, _ := apis.ParseURL(srv.URL)
 	subscriber := duckv1.Addressable{URL: subscriberURL}
 
-	if err := cm.SubscribeTrigger(trigger, broker, subscriber, nil, nil, nil, nil); err != nil {
+	if err := cm.SubscribeTrigger(trigger, broker, subscriber, nil, nil, nil, nil, nil); err != nil {
 		t.Fatalf("SubscribeTrigger: %v", err)
 	}
 
@@ -962,7 +968,7 @@ func TestObservability_SpanAndMetricsEmitted(t *testing.T) {
 		t.Fatalf("metric reader Collect: %v", err)
 	}
 
-	var sawDuration, sawProcess, sawInflight bool
+	var sawDuration, sawProcess, sawInflight, sawDispatchAttempt bool
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
 			switch m.Name {
@@ -982,6 +988,10 @@ func TestObservability_SpanAndMetricsEmitted(t *testing.T) {
 					// exist, but in this test we do have one.
 					sawInflight = true
 				}
+			case "kn.eventing.broker.filter.dispatch.attempts":
+				if sum, ok := m.Data.(metricdata.Sum[int64]); ok && len(sum.DataPoints) > 0 {
+					sawDispatchAttempt = true
+				}
 			}
 		}
 	}
@@ -993,6 +1003,9 @@ func TestObservability_SpanAndMetricsEmitted(t *testing.T) {
 	}
 	if !sawInflight {
 		t.Error("kn.eventing.broker.filter.dispatches.inflight gauge was not collected")
+	}
+	if !sawDispatchAttempt {
+		t.Error("kn.eventing.broker.filter.dispatch.attempts counter had no data points")
 	}
 }
 
@@ -1044,7 +1057,7 @@ func TestUnsubscribeTrigger_WaitsForInflightDispatches(t *testing.T) {
 	subscriberURL, _ := apis.ParseURL(srv.URL)
 	subscriber := duckv1.Addressable{URL: subscriberURL}
 
-	if err := cm.SubscribeTrigger(trigger, broker, subscriber, nil, nil, nil, nil); err != nil {
+	if err := cm.SubscribeTrigger(trigger, broker, subscriber, nil, nil, nil, nil, nil); err != nil {
 		t.Fatalf("SubscribeTrigger: %v", err)
 	}
 
@@ -1110,13 +1123,13 @@ func TestSubscribeTrigger_UpdateInPlace(t *testing.T) {
 	url1, _ := apis.ParseURL("http://localhost:9998")
 	url2, _ := apis.ParseURL("http://localhost:9997")
 
-	err := cm.SubscribeTrigger(trigger, broker, duckv1.Addressable{URL: url1}, nil, nil, nil, nil)
+	err := cm.SubscribeTrigger(trigger, broker, duckv1.Addressable{URL: url1}, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("SubscribeTrigger (first): %v", err)
 	}
 
 	// Second call with same triggerUID — should update in place.
-	err = cm.SubscribeTrigger(trigger, broker, duckv1.Addressable{URL: url2}, nil, nil, nil, nil)
+	err = cm.SubscribeTrigger(trigger, broker, duckv1.Addressable{URL: url2}, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("SubscribeTrigger (second): %v", err)
 	}
@@ -1235,4 +1248,245 @@ func ackRedelivery(t *testing.T, js nats.JetStreamContext, subject, stream, cons
 		t.Fatal(err)
 	}
 	return metadata.NumDelivered
+}
+
+func TestDeadLetterFailureRetainsMessageUntilDLSSucceeds(t *testing.T) {
+	s := natsTesting.RunBasicJetstreamServer()
+	defer natsTesting.ShutdownJSServerAndRemoveStorage(t, s)
+	conn, js := natsTesting.JsClient(t, s)
+	defer conn.Close()
+
+	const namespace, brokerName, triggerUID = "default", "dls-recovery-broker", "dls-recovery-trigger-uid"
+	streamName, consumerName := setupStreamAndConsumer(t, js, namespace, brokerName, triggerUID)
+
+	var subscriberCalls atomic.Int64
+	subscriberServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		subscriberCalls.Add(1)
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer subscriberServer.Close()
+
+	firstDLSAttempt := make(chan struct{})
+	secondDLSAttempt := make(chan struct{})
+	allowDLSSuccess := make(chan struct{})
+	var dlsCalls atomic.Int64
+	dlsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempt := dlsCalls.Add(1)
+		if attempt == 1 {
+			close(firstDLSAttempt)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		if attempt == 2 {
+			close(secondDLSAttempt)
+			<-allowDLSSuccess
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer dlsServer.Close()
+
+	cm := newConsumerManagerForTest(t, conn, js, &ConsumerManagerConfig{FetchBatchSize: 1, FetchTimeout: 20 * time.Millisecond, MaxConcurrency: 1})
+	defer cm.Close() //nolint:errcheck
+	broker := makeTestBrokerForNats(namespace, brokerName)
+	trigger := makeTriggerWithUID(namespace, "dls-recovery-trigger", brokerName, triggerUID)
+	subscriberURL, _ := apis.ParseURL(subscriberServer.URL)
+	dlsURL, _ := apis.ParseURL(dlsServer.URL)
+	policy, backoff := eventingduckv1.BackoffPolicyExponential, "PT0.01S"
+	retryConfigValue, configErr := kncloudevents.RetryConfigFromDeliverySpec(eventingduckv1.DeliverySpec{BackoffPolicy: &policy, BackoffDelay: &backoff})
+	if configErr != nil {
+		t.Fatal(configErr)
+	}
+	retryConfig := &retryConfigValue
+	noRetryConfig := kncloudevents.NoRetries()
+	durationConfig := &brokerutils.DurationRetryConfig{MaxDuration: time.Minute, MaxBackoff: 50 * time.Millisecond}
+
+	if err := cm.SubscribeTrigger(
+		trigger,
+		broker,
+		duckv1.Addressable{URL: subscriberURL},
+		nil,
+		&duckv1.Addressable{URL: dlsURL},
+		retryConfig,
+		durationConfig,
+		&noRetryConfig,
+	); err != nil {
+		t.Fatalf("SubscribeTrigger: %v", err)
+	}
+	cm.subscriptions[triggerUID].handler.deadLetterRetryDelay = 50 * time.Millisecond
+
+	publishStructuredCE(t, js, brokerutils.BrokerPublishSubjectName(namespace, brokerName), "dls-recovery-event")
+	select {
+	case <-firstDLSAttempt:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first DLS attempt did not arrive")
+	}
+	select {
+	case <-secondDLSAttempt:
+	case <-time.After(5 * time.Second):
+		t.Fatal("message was not redelivered after DLS failure")
+	}
+
+	info, err := js.ConsumerInfo(streamName, consumerName)
+	if err != nil {
+		t.Fatalf("ConsumerInfo while DLS is blocked: %v", err)
+	}
+	if info.NumAckPending == 0 {
+		t.Fatal("original message was ACKed before DLS returned 2xx")
+	}
+
+	close(allowDLSSuccess)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		info, err = js.ConsumerInfo(streamName, consumerName)
+		if err == nil && info.NumAckPending == 0 && info.NumPending == 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if info == nil || info.NumAckPending != 0 || info.NumPending != 0 {
+		t.Fatalf("message remained pending after DLS success: %+v", info)
+	}
+	if got := dlsCalls.Load(); got != 2 {
+		t.Errorf("DLS calls = %d, want 2", got)
+	}
+	if got := subscriberCalls.Load(); got != 2 {
+		t.Errorf("subscriber calls = %d, want 2 (one per delivery before immediate DLS)", got)
+	}
+}
+
+func TestExpiredMessageBypassesSubscriberAndGoesToDLS(t *testing.T) {
+	s := natsTesting.RunBasicJetstreamServer()
+	defer natsTesting.ShutdownJSServerAndRemoveStorage(t, s)
+	conn, js := natsTesting.JsClient(t, s)
+	defer conn.Close()
+
+	const namespace, brokerName, triggerUID = "default", "expired-broker", "expired-trigger-uid"
+	_, _ = setupStreamAndConsumer(t, js, namespace, brokerName, triggerUID)
+
+	var subscriberCalls, dlsCalls atomic.Int64
+	subscriberServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		subscriberCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer subscriberServer.Close()
+	dlsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		dlsCalls.Add(1)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer dlsServer.Close()
+
+	cm := newConsumerManagerForTest(t, conn, js, &ConsumerManagerConfig{FetchBatchSize: 1, FetchTimeout: 20 * time.Millisecond, MaxConcurrency: 1})
+	defer cm.Close() //nolint:errcheck
+	broker := makeTestBrokerForNats(namespace, brokerName)
+	trigger := makeTriggerWithUID(namespace, "expired-trigger", brokerName, triggerUID)
+	subscriberURL, _ := apis.ParseURL(subscriberServer.URL)
+	dlsURL, _ := apis.ParseURL(dlsServer.URL)
+	noRetryConfig := kncloudevents.NoRetries()
+	durationConfig := &brokerutils.DurationRetryConfig{MaxDuration: time.Second, MaxBackoff: 50 * time.Millisecond}
+	if err := cm.SubscribeTrigger(trigger, broker, duckv1.Addressable{URL: subscriberURL}, nil, &duckv1.Addressable{URL: dlsURL}, nil, durationConfig, &noRetryConfig); err != nil {
+		t.Fatalf("SubscribeTrigger: %v", err)
+	}
+	cm.subscriptions[triggerUID].handler.now = func() time.Time { return time.Now().Add(2 * time.Second) }
+
+	publishStructuredCE(t, js, brokerutils.BrokerPublishSubjectName(namespace, brokerName), "expired-event")
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && dlsCalls.Load() == 0 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := subscriberCalls.Load(); got != 0 {
+		t.Errorf("subscriber calls = %d, want 0 for expired message", got)
+	}
+	if got := dlsCalls.Load(); got != 1 {
+		t.Errorf("DLS calls = %d, want 1", got)
+	}
+}
+
+func TestDurationRetrySurvivesFilterRestart(t *testing.T) {
+	s := natsTesting.RunBasicJetstreamServer()
+	defer natsTesting.ShutdownJSServerAndRemoveStorage(t, s)
+	conn, js := natsTesting.JsClient(t, s)
+	defer conn.Close()
+
+	const namespace, brokerName, triggerUID = "default", "filter-restart-broker", "filter-restart-trigger-uid"
+	streamName, consumerName := setupStreamAndConsumer(t, js, namespace, brokerName, triggerUID)
+
+	firstAttempt := make(chan struct{})
+	deliveredAfterRestart := make(chan struct{})
+	var recovered atomic.Bool
+	var calls atomic.Int64
+	subscriberServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		if !recovered.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			select {
+			case <-firstAttempt:
+			default:
+				close(firstAttempt)
+			}
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+		select {
+		case <-deliveredAfterRestart:
+		default:
+			close(deliveredAfterRestart)
+		}
+	}))
+	defer subscriberServer.Close()
+
+	broker := makeTestBrokerForNats(namespace, brokerName)
+	trigger := makeTriggerWithUID(namespace, "filter-restart-trigger", brokerName, triggerUID)
+	subscriberURL, _ := apis.ParseURL(subscriberServer.URL)
+	policy, backoff := eventingduckv1.BackoffPolicyExponential, "PT0.2S"
+	retryConfigValue, configErr := kncloudevents.RetryConfigFromDeliverySpec(eventingduckv1.DeliverySpec{BackoffPolicy: &policy, BackoffDelay: &backoff})
+	if configErr != nil {
+		t.Fatal(configErr)
+	}
+	retryConfig := &retryConfigValue
+	durationConfig := &brokerutils.DurationRetryConfig{MaxDuration: time.Minute, MaxBackoff: 200 * time.Millisecond}
+	noRetryConfig := kncloudevents.NoRetries()
+	managerConfig := &ConsumerManagerConfig{FetchBatchSize: 1, FetchTimeout: 20 * time.Millisecond, MaxConcurrency: 1}
+
+	cm1 := newConsumerManagerForTest(t, conn, js, managerConfig)
+	if err := cm1.SubscribeTrigger(trigger, broker, duckv1.Addressable{URL: subscriberURL}, nil, nil, retryConfig, durationConfig, &noRetryConfig); err != nil {
+		t.Fatalf("first SubscribeTrigger: %v", err)
+	}
+	publishStructuredCE(t, js, brokerutils.BrokerPublishSubjectName(namespace, brokerName), "filter-restart-event")
+	select {
+	case <-firstAttempt:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first subscriber attempt did not arrive")
+	}
+	if err := cm1.Close(); err != nil {
+		t.Fatalf("close first ConsumerManager: %v", err)
+	}
+
+	recovered.Store(true)
+	cm2 := newConsumerManagerForTest(t, conn, js, managerConfig)
+	defer cm2.Close() //nolint:errcheck
+	if err := cm2.SubscribeTrigger(trigger, broker, duckv1.Addressable{URL: subscriberURL}, nil, nil, retryConfig, durationConfig, &noRetryConfig); err != nil {
+		t.Fatalf("second SubscribeTrigger: %v", err)
+	}
+	select {
+	case <-deliveredAfterRestart:
+	case <-time.After(5 * time.Second):
+		t.Fatal("pending event was not delivered after filter restart")
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	var info *nats.ConsumerInfo
+	var err error
+	for time.Now().Before(deadline) {
+		info, err = js.ConsumerInfo(streamName, consumerName)
+		if err == nil && info.NumAckPending == 0 && info.NumPending == 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if info == nil || info.NumAckPending != 0 || info.NumPending != 0 {
+		t.Fatalf("message remained pending after restart recovery: info=%+v err=%v", info, err)
+	}
+	if got := calls.Load(); got < 2 {
+		t.Errorf("subscriber calls = %d, want at least 2", got)
+	}
 }

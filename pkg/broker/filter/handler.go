@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"sync"
@@ -43,6 +44,7 @@ import (
 	duckv1 "knative.dev/pkg/apis/duck/v1"
 	"knative.dev/pkg/logging"
 
+	brokerutils "knative.dev/eventing-natss/pkg/broker/utils"
 	jsutils "knative.dev/eventing-natss/pkg/channel/jetstream/utils"
 	"knative.dev/eventing-natss/pkg/tracing"
 	eventingduckv1 "knative.dev/eventing/pkg/apis/duck/v1"
@@ -102,9 +104,12 @@ type TriggerHandler struct {
 	// Observability. tracer is used to wrap each dispatch in a span;
 	// dispatchDuration records the per-dispatch HTTP wall time; processDuration
 	// records the pre-dispatch work (message decode + filter evaluation).
-	tracer           trace.Tracer
-	dispatchDuration metric.Float64Histogram
-	processDuration  metric.Float64Histogram
+	tracer               trace.Tracer
+	dispatchDuration     metric.Float64Histogram
+	processDuration      metric.Float64Histogram
+	dispatchAttempts     metric.Int64Counter
+	now                  func() time.Time
+	deadLetterRetryDelay time.Duration
 }
 
 type handlerConfig struct {
@@ -115,6 +120,9 @@ type handlerConfig struct {
 	retryConfig      *kncloudevents.RetryConfig
 	noRetryConfig    *kncloudevents.RetryConfig
 	deadLetterSink   *duckv1.Addressable
+
+	// durationRetryConfig enables duration-based delivery when non-nil.
+	durationRetryConfig *brokerutils.DurationRetryConfig
 }
 
 // NewTriggerHandler creates a new handler for a trigger
@@ -125,6 +133,7 @@ func NewTriggerHandler(
 	brokerIngressURL *duckv1.Addressable,
 	deadLetterSink *duckv1.Addressable,
 	retryConfig *kncloudevents.RetryConfig,
+	durationRetryConfig *brokerutils.DurationRetryConfig,
 	noRetryConfig *kncloudevents.RetryConfig,
 	dispatcher *kncloudevents.Dispatcher,
 	tracer trace.Tracer,
@@ -146,16 +155,18 @@ func NewTriggerHandler(
 	name := attribute.String("kn.trigger.name", trigger.Name)
 	namespace := attribute.String("kn.trigger.namespace", trigger.Namespace)
 	h := &TriggerHandler{
-		logger:           logger,
-		ctx:              ctx,
-		metricAttrs:      metric.WithAttributes(name, namespace),
-		spanAttrs:        []attribute.KeyValue{name, namespace, attribute.String("kn.trigger.uid", string(trigger.UID))},
-		dispatcher:       dispatcher,
-		tracer:           tracer,
-		dispatchDuration: dispatchDuration,
-		processDuration:  processDuration,
+		logger:               logger,
+		ctx:                  ctx,
+		metricAttrs:          metric.WithAttributes(name, namespace),
+		spanAttrs:            []attribute.KeyValue{name, namespace, attribute.String("kn.trigger.uid", string(trigger.UID))},
+		dispatcher:           dispatcher,
+		tracer:               tracer,
+		dispatchDuration:     dispatchDuration,
+		processDuration:      processDuration,
+		now:                  time.Now,
+		deadLetterRetryDelay: brokerutils.DeadLetterRetryDelay,
 	}
-	h.Update(trigger, subscriber, brokerIngressURL, deadLetterSink, retryConfig, noRetryConfig)
+	h.Update(trigger, subscriber, brokerIngressURL, deadLetterSink, retryConfig, durationRetryConfig, noRetryConfig)
 	return h, nil
 }
 
@@ -168,16 +179,18 @@ func (h *TriggerHandler) Update(
 	brokerIngressURL *duckv1.Addressable,
 	deadLetterSink *duckv1.Addressable,
 	retryConfig *kncloudevents.RetryConfig,
+	durationRetryConfig *brokerutils.DurationRetryConfig,
 	noRetryConfig *kncloudevents.RetryConfig,
 ) {
 	h.replaceConfig(&handlerConfig{
-		subscriber:       subscriber,
-		subscriberURL:    subscriber.URL.String(),
-		filter:           buildTriggerFilter(h.logger, trigger),
-		brokerIngressURL: brokerIngressURL,
-		deadLetterSink:   deadLetterSink,
-		retryConfig:      retryConfig,
-		noRetryConfig:    noRetryConfig,
+		subscriber:          subscriber,
+		subscriberURL:       subscriber.URL.String(),
+		filter:              buildTriggerFilter(h.logger, trigger),
+		brokerIngressURL:    brokerIngressURL,
+		deadLetterSink:      deadLetterSink,
+		retryConfig:         retryConfig,
+		noRetryConfig:       noRetryConfig,
+		durationRetryConfig: durationRetryConfig,
 	})
 }
 
@@ -312,20 +325,20 @@ func (h *TriggerHandler) doHandle(ctx context.Context, msg *nats.Msg) {
 	}
 	if eventProcessingDeadlineExceeded(err) {
 		span.SetStatus(codes.Error, "dispatch deadline exceeded")
-		logger.Warnw("dispatch context expired before subscriber response, message will be redelivered by JetStream", zap.Error(err))
+		logger.Warnw("dispatch context expired before subscriber response; message was scheduled for redelivery", zap.Error(err))
 		return
 	} else if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
 		logger.Errorw("failed to dispatch event",
 			zap.Error(err),
-			zap.Int("response_code", dispatchInfo.ResponseCode),
+			zap.Int("response_code", dispatchResponseCode(dispatchInfo)),
 		)
 		return
 	}
 
 	logger.Debugw("event dispatched successfully",
-		zap.Int("response_code", dispatchInfo.ResponseCode),
+		zap.Int("response_code", dispatchResponseCode(dispatchInfo)),
 	)
 }
 
@@ -336,18 +349,24 @@ func (h *TriggerHandler) dispatchEvent(ctx context.Context, event *cloudevents.E
 	additionalHeaders := tracing.ConvertEventToHttpHeader(event)
 	te := TypeExtractorTransformer("")
 
-	// Get retry number from message metadata
-	retryNumber := 1
-	if meta, err := msg.Metadata(); err == nil {
-		retryNumber = int(meta.NumDelivered)
-	}
+	retryNumber, messageAge := h.deliveryState(msg)
 
-	// Determine if this is the last try
+	// Count mode retains Knative's DeliverySpec.Retry behavior. Duration mode
+	// ignores that count and uses the original JetStream publish timestamp.
 	maxRetries := 0
 	if config.retryConfig != nil {
 		maxRetries = config.retryConfig.RetryMax
 	}
 	lastTry := retryNumber > maxRetries
+	span := trace.SpanFromContext(ctx)
+	span.SetAttributes(attribute.Int("delivery.attempt", retryNumber))
+
+	durationRetryConfig := config.durationRetryConfig
+	if durationRetryConfig != nil && messageAge >= durationRetryConfig.MaxDuration {
+		span.SetAttributes(attribute.Bool("delivery.deadline_exceeded", true))
+		h.routeToDeadLetter(ctx, event, msg, config, additionalHeaders, &te, span)
+		return &kncloudevents.DispatchInfo{}, nil
+	}
 
 	// Dispatch the message to trigger's destination
 	dispatchInfo, err := h.dispatcher.SendEvent(ctx, *event, config.subscriber,
@@ -363,25 +382,16 @@ func (h *TriggerHandler) dispatchEvent(ctx context.Context, event *cloudevents.E
 		h.dispatchDuration.Record(ctx, dispatchInfo.Duration.Seconds(), h.metricAttrs)
 	}
 
-	// Context deadline/cancellation means the AckWait guard fired before we got
-	// a subscriber response. Don't ack/nack/term the message — JetStream will
-	// redeliver it automatically once its own AckWait timer expires.
-	if eventProcessingDeadlineExceeded(err) {
-		return dispatchInfo, err
-	}
-
-	result := determineNatsResult(dispatchInfo.ResponseCode, err)
+	responseCode := dispatchResponseCode(dispatchInfo)
+	result := determineNatsResult(responseCode, err)
+	h.recordDispatchAttempt(ctx, responseCode, subscriberDeliveryResult(result))
 
 	// Extract pass-through headers (tracing, knative-*, x-b3-*, etc.) from
 	// the subscriber's response so they are available in every code path.
-	responseHeaders := eventingutils.PassThroughHeaders(dispatchInfo.ResponseHeader)
-
-	// Decorate the active span with the delivery attempt. The span was started
-	// in doHandle; SpanFromContext returns the same one. Per-branch nats.result
-	// is set inside the switch so each label reflects the path actually taken
-	// (e.g. NACK on lastTry with no DLS does NOT visit the dead-letter sink).
-	span := trace.SpanFromContext(ctx)
-	span.SetAttributes(attribute.Int("delivery.attempt", retryNumber))
+	responseHeaders := http.Header(nil)
+	if dispatchInfo != nil {
+		responseHeaders = eventingutils.PassThroughHeaders(dispatchInfo.ResponseHeader)
+	}
 
 	// Handle ack/nack/term based on result
 	switch {
@@ -406,71 +416,187 @@ func (h *TriggerHandler) dispatchEvent(ctx context.Context, event *cloudevents.E
 				}
 			}
 		}
-		if err := msg.Ack(nats.Context(ctx)); err != nil {
+		if err := msg.Ack(); err != nil {
 			logger.Errorw("failed to ack message", zap.Error(err))
 		}
 	case protocol.IsNACK(result):
+		if durationRetryConfig != nil {
+			_, currentAge := h.deliveryState(msg)
+			if currentAge >= durationRetryConfig.MaxDuration {
+				span.SetAttributes(attribute.Bool("delivery.deadline_exceeded", true))
+				h.routeToDeadLetter(ctx, event, msg, config, additionalHeaders, &te, span)
+				break
+			}
+			remaining := durationRetryConfig.MaxDuration - currentAge
+			nakDelay := calculateDurationNakDelay(retryNumber, config.retryConfig, retryResponse(dispatchInfo), durationRetryConfig.MaxBackoff, remaining)
+			span.SetAttributes(attribute.String("nats.result", "nak"))
+			h.nakWithDelay(msg, nakDelay, "subscriber delivery failed")
+			break
+		}
+
 		if lastTry {
 			if config.deadLetterSink != nil {
-				// Send to dead letter sink
-				dlsDispatchInfo, dlsErr := h.dispatcher.SendEvent(ctx, *event, *config.deadLetterSink,
-					kncloudevents.WithRetryConfig(&defaultRetry),
-					kncloudevents.WithHeader(additionalHeaders),
-					kncloudevents.WithTransformers(&te),
-				)
-				if dlsErr != nil {
-					logger.Errorw("failed to send to dead letter sink",
-						zap.Error(dlsErr),
-						zap.Int("response_code", dlsDispatchInfo.ResponseCode),
-					)
-				}
-				span.SetAttributes(attribute.String("nats.result", "ack_after_dls"))
+				h.routeToDeadLetter(ctx, event, msg, config, additionalHeaders, &te, span)
 			} else {
 				span.SetAttributes(attribute.String("nats.result", "ack_retries_exhausted"))
-			}
-
-			// Ack after DLS attempt
-			if err := msg.Ack(nats.Context(ctx)); err != nil {
-				logger.Errorw("failed to ack message after last retry", zap.Error(err))
+				if err := msg.Ack(); err != nil {
+					logger.Errorw("failed to ack message after retries exhausted", zap.Error(err))
+				}
 			}
 		} else {
 			span.SetAttributes(attribute.String("nats.result", "nak"))
-			// Nack for retry
-			response := &http.Response{
-				StatusCode: dispatchInfo.ResponseCode,
-				Header:     dispatchInfo.ResponseHeader,
-			}
-			nakDelay := jsutils.CalculateNakDelayForRetryNumber(retryNumber, config.retryConfig, response)
-			if err := msg.NakWithDelay(nakDelay, nats.Context(ctx)); err != nil {
-				logger.Errorw("failed to nack message", zap.Error(err))
-			}
+			nakDelay := jsutils.CalculateNakDelayForRetryNumber(retryNumber, config.retryConfig, retryResponse(dispatchInfo))
+			h.nakWithDelay(msg, nakDelay, "subscriber delivery failed")
 		}
 	default:
-		// Terminate - non-retriable error
-		if lastTry && config.deadLetterSink != nil {
-			// Send to dead letter sink
-			dlsDispatchInfo, dlsErr := h.dispatcher.SendEvent(ctx, *event, *config.deadLetterSink,
-				kncloudevents.WithRetryConfig(&defaultRetry),
-				kncloudevents.WithHeader(additionalHeaders),
-				kncloudevents.WithTransformers(&te),
-			)
-			if dlsErr != nil {
-				logger.Errorw("failed to send to dead letter sink",
-					zap.Error(dlsErr),
-					zap.Int("response_code", dlsDispatchInfo.ResponseCode),
-				)
-			}
-			span.SetAttributes(attribute.String("nats.result", "term_after_dls"))
+		// Permanent subscriber responses go to DLS immediately; retrying the
+		// same 400/404/413 cannot make the request valid.
+		if config.deadLetterSink != nil {
+			h.routeToDeadLetter(ctx, event, msg, config, additionalHeaders, &te, span)
 		} else {
 			span.SetAttributes(attribute.String("nats.result", "term"))
-		}
-
-		if err := msg.Term(nats.Context(ctx)); err != nil {
-			logger.Errorw("failed to term message", zap.Error(err))
+			if err := msg.Term(); err != nil {
+				logger.Errorw("failed to term message", zap.Error(err))
+			}
 		}
 	}
 
 	return dispatchInfo, err
+}
+
+func (h *TriggerHandler) routeToDeadLetter(ctx context.Context, event *cloudevents.Event, msg *nats.Msg, config *handlerConfig, headers http.Header, te *TypeExtractorTransformer, span trace.Span) {
+	logger := logging.FromContext(ctx)
+	if config.deadLetterSink == nil {
+		span.SetAttributes(attribute.String("nats.result", "term_without_dls"))
+		if err := msg.Term(); err != nil {
+			logger.Errorw("failed to terminate message without a dead letter sink", zap.Error(err))
+		}
+		return
+	}
+
+	// Subscriber timeouts cancel ctx at AckWait. DLS still needs an independent
+	// attempt, so retain trace values while detaching cancellation.
+	dlsTimeout := 2 * time.Minute
+	if config.noRetryConfig != nil && config.noRetryConfig.RequestTimeout > 0 {
+		dlsTimeout = config.noRetryConfig.RequestTimeout
+	}
+	dlsCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), dlsTimeout)
+	defer cancel()
+	dlsDispatchInfo, dlsErr := h.dispatcher.SendEvent(dlsCtx, *event, *config.deadLetterSink,
+		kncloudevents.WithRetryConfig(config.noRetryConfig),
+		kncloudevents.WithHeader(headers),
+		kncloudevents.WithTransformers(te),
+	)
+	dlsStatus := dispatchResponseCode(dlsDispatchInfo)
+	if dlsErr == nil && dlsStatus >= http.StatusOK && dlsStatus < http.StatusMultipleChoices {
+		h.recordDispatchAttempt(dlsCtx, dlsStatus, "dead_letter_success")
+		span.SetAttributes(attribute.String("nats.result", "ack_after_dls"))
+		if err := msg.Ack(); err != nil {
+			logger.Errorw("failed to ack message after dead letter delivery", zap.Error(err))
+		}
+		return
+	}
+
+	h.recordDispatchAttempt(dlsCtx, dlsStatus, "dead_letter_failure")
+	span.SetAttributes(attribute.String("nats.result", "nak_after_dls_failure"))
+	logger.Errorw("failed to send to dead letter sink; retaining original message",
+		zap.Error(dlsErr),
+		zap.Int("response_code", dlsStatus),
+	)
+	delay := h.deadLetterRetryDelay
+	if delay <= 0 {
+		delay = brokerutils.DeadLetterRetryDelay
+	}
+	h.nakWithDelay(msg, delay, "dead letter delivery failed")
+}
+
+func (h *TriggerHandler) deliveryState(msg *nats.Msg) (int, time.Duration) {
+	retryNumber := 1
+	var published time.Time
+	if meta, err := msg.Metadata(); err == nil {
+		retryNumber = int(meta.NumDelivered)
+		published = meta.Timestamp
+	}
+	if published.IsZero() {
+		return retryNumber, 0
+	}
+	now := time.Now
+	if h.now != nil {
+		now = h.now
+	}
+	age := now().Sub(published)
+	if age < 0 {
+		age = 0
+	}
+	return retryNumber, age
+}
+
+func (h *TriggerHandler) nakWithDelay(msg *nats.Msg, delay time.Duration, reason string) {
+	if err := msg.NakWithDelay(delay); err != nil {
+		h.logger.Errorw("failed to nack message", zap.Error(err), zap.Duration("delay", delay), zap.String("reason", reason))
+	}
+}
+
+func (h *TriggerHandler) recordDispatchAttempt(ctx context.Context, status int, result string) {
+	if h.dispatchAttempts == nil {
+		return
+	}
+	h.dispatchAttempts.Add(ctx, 1, h.metricAttrs, metric.WithAttributes(
+		attribute.Int("http.response.status_code", status),
+		attribute.String("delivery.result", result),
+	))
+}
+
+func subscriberDeliveryResult(result protocol.Result) string {
+	switch {
+	case protocol.IsACK(result):
+		return "subscriber_success"
+	case protocol.IsNACK(result):
+		return "subscriber_retry"
+	default:
+		return "subscriber_permanent"
+	}
+}
+
+func dispatchResponseCode(info *kncloudevents.DispatchInfo) int {
+	if info == nil {
+		return 0
+	}
+	return info.ResponseCode
+}
+
+// calculateDurationNakDelay returns the redelivery delay in duration mode. It
+// shares count mode's delivery numbering and Retry-After handling, caps the
+// computed backoff at maxBackoff, and never waits beyond the remaining duration.
+func calculateDurationNakDelay(numDelivered int, config *kncloudevents.RetryConfig, response *http.Response, maxBackoff, remaining time.Duration) time.Duration {
+	delay := time.Second
+	var retryAfter time.Duration
+	if config != nil && config.Backoff != nil {
+		delay = jsutils.CalculateNakDelayForRetryNumber(numDelivered, config, nil)
+		// As in count mode, RetryAfterMax rather than backoffMax bounds a
+		// subscriber's Retry-After.
+		if d := jsutils.CalculateNakDelayForRetryNumber(numDelivered, config, response); d > delay {
+			retryAfter = d
+		}
+	}
+
+	if maxBackoff > 0 && delay > maxBackoff {
+		delay = maxBackoff
+	}
+	delay = max(delay, retryAfter)
+	if remaining > 0 && delay > remaining {
+		delay = remaining
+	}
+	return max(delay, time.Millisecond)
+}
+
+// retryResponse exposes the subscriber's status and headers to the Knative
+// backoff function so it can honor Retry-After.
+func retryResponse(info *kncloudevents.DispatchInfo) *http.Response {
+	if info == nil {
+		return nil
+	}
+	return &http.Response{StatusCode: info.ResponseCode, Header: info.ResponseHeader}
 }
 
 func eventProcessingDeadlineExceeded(err error) bool {
@@ -502,18 +628,19 @@ func (h *TriggerHandler) Cleanup() {
 }
 
 func determineNatsResult(responseCode int, err error) protocol.Result {
-	result := protocol.ResultACK
-	if err != nil {
-		code := responseCode
-		if code/100 == 5 || code == http.StatusTooManyRequests || code == http.StatusRequestTimeout {
-			// Retriable error, effectively this is nats protocol NACK
-			result = protocol.NewReceipt(false, "%w", err)
-		} else {
-			// Non-retriable error
-			result = err
-		}
+	if err == nil && responseCode >= http.StatusOK && responseCode < http.StatusMultipleChoices {
+		return protocol.ResultACK
 	}
-	return result
+	if responseCode == 0 || responseCode/100 == 5 || responseCode == http.StatusTooManyRequests || responseCode == http.StatusRequestTimeout {
+		if err == nil {
+			err = fmt.Errorf("retryable HTTP response %d", responseCode)
+		}
+		return protocol.NewReceipt(false, "%w", err)
+	}
+	if err != nil {
+		return err
+	}
+	return fmt.Errorf("permanent HTTP response %d", responseCode)
 }
 
 // buildTriggerFilter builds a filter from the trigger spec.

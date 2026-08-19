@@ -124,6 +124,7 @@ type ConsumerManager struct {
 	tracer           trace.Tracer
 	dispatchDuration metric.Float64Histogram
 	processDuration  metric.Float64Histogram
+	dispatchAttempts metric.Int64Counter
 
 	// Map of trigger UID to subscription
 	subscriptions map[string]*TriggerSubscription
@@ -233,6 +234,15 @@ func NewConsumerManager(ctx context.Context, conn *nats.Conn, js nats.JetStreamC
 		processDuration = nil
 	}
 
+	dispatchAttempts, err := meter.Int64Counter(
+		"kn.eventing.broker.filter.dispatch.attempts",
+		metric.WithDescription("Subscriber and dead-letter delivery attempts by result"),
+	)
+	if err != nil {
+		logger.Warnw("failed to create dispatch attempts counter; metric will be skipped", zap.Error(err))
+		dispatchAttempts = nil
+	}
+
 	cm := &ConsumerManager{
 		logger:                logger,
 		ctx:                   ctx,
@@ -245,6 +255,7 @@ func NewConsumerManager(ctx context.Context, conn *nats.Conn, js nats.JetStreamC
 		tracer:                tracer,
 		dispatchDuration:      dispatchDuration,
 		processDuration:       processDuration,
+		dispatchAttempts:      dispatchAttempts,
 		subscriptions:         make(map[string]*TriggerSubscription),
 	}
 
@@ -316,6 +327,7 @@ func (m *ConsumerManager) SubscribeTrigger(
 	brokerIngressURL *duckv1.Addressable,
 	deadLetterSink *duckv1.Addressable,
 	retryConfig *kncloudevents.RetryConfig,
+	durationRetryConfig *brokerutils.DurationRetryConfig,
 	noRetryConfig *kncloudevents.RetryConfig,
 ) error {
 	m.mu.Lock()
@@ -335,7 +347,7 @@ func (m *ConsumerManager) SubscribeTrigger(
 	// however, captures its parameters at start, so a change to any of the
 	// three fetch-related annotations requires restarting it.
 	if existing, ok := m.subscriptions[triggerUID]; ok {
-		existing.handler.Update(trigger, subscriber, brokerIngressURL, deadLetterSink, retryConfig, noRetryConfig)
+		existing.handler.Update(trigger, subscriber, brokerIngressURL, deadLetterSink, retryConfig, durationRetryConfig, noRetryConfig)
 
 		newBatch := parseTriggerAnnotationInt(trigger.Annotations, TriggerFetchBatchSizeAnnotation, m.fetchBatchSize, logger)
 		newTimeout := parseTriggerAnnotationDuration(trigger.Annotations, TriggerFetchTimeoutAnnotation, m.fetchTimeout, logger)
@@ -382,6 +394,7 @@ func (m *ConsumerManager) SubscribeTrigger(
 		brokerIngressURL,
 		deadLetterSink,
 		retryConfig,
+		durationRetryConfig,
 		noRetryConfig,
 		m.dispatcher,
 		m.tracer,
@@ -391,6 +404,7 @@ func (m *ConsumerManager) SubscribeTrigger(
 	if err != nil {
 		return fmt.Errorf("failed to create trigger handler: %w", err)
 	}
+	handler.dispatchAttempts = m.dispatchAttempts
 
 	// Derive stream and consumer names
 	streamName := brokerutils.BrokerStreamName(broker)

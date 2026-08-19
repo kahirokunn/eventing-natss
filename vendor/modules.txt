@@ -1210,7 +1210,7 @@ k8s.io/utils/net
 k8s.io/utils/pointer
 k8s.io/utils/ptr
 k8s.io/utils/trace
-# knative.dev/eventing v0.50.0
+# knative.dev/eventing v0.50.0 => github.com/kahirokunn/knative-eventing v0.0.0-20260820020110-e2099f727203
 ## explicit; go 1.25.0
 knative.dev/eventing/pkg/apis
 knative.dev/eventing/pkg/apis/common/integration/v1alpha1
@@ -1458,3 +1458,4 @@ sigs.k8s.io/structured-merge-diff/v6/value
 # sigs.k8s.io/yaml v1.6.0
 ## explicit; go 1.22
 sigs.k8s.io/yaml
+# knative.dev/eventing => github.com/kahirokunn/knative-eventing v0.0.0-20260820020110-e2099f727203

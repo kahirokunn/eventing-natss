@@ -320,6 +320,8 @@ github.com/json-iterator/go v1.1.12/go.mod h1:e30LSqwooZae/UwlEbR2852Gd8hjQvJoHm
 github.com/jstemmer/go-junit-report v0.0.0-20190106144839-af01ea7f8024/go.mod h1:6v2b51hI/fHJwM22ozAgKL4VKDeJcHhJFhtBdhmNjmU=
 github.com/jstemmer/go-junit-report v0.9.1/go.mod h1:Brl9GWCQeLvo8nXZwPNNblvFj/XSXhF0NWZEnDohbsk=
 github.com/julienschmidt/httprouter v1.2.0/go.mod h1:SYymIcj16QtmaHHD7aYtjjsJG7VTCxuUUipMqKk8s4w=
+github.com/kahirokunn/knative-eventing v0.0.0-20260820020110-e2099f727203 h1:YvrmHrrDVpIkwKblOh0nAtTGzZ5Odj/7pqYTb6QtENw=
+github.com/kahirokunn/knative-eventing v0.0.0-20260820020110-e2099f727203/go.mod h1:HC1K7A1oa/sMd6X6RHO547NgvL2gtKlmNK+HYnELz6g=
 github.com/kelseyhightower/envconfig v1.4.0 h1:Im6hONhd3pLkfDFsbRgu68RDNkGF1r3dvMUtDTo2cv8=
 github.com/kelseyhightower/envconfig v1.4.0/go.mod h1:cccZRl6mQpaq41TPp5QxidR+Sa3axMbJDNb//FQX6Gg=
 github.com/kisielk/errcheck v1.5.0/go.mod h1:pFxgyoBC7bSaBwPgfKdkLd5X25qrDl4LWUI2bnpBCr8=
@@ -1074,8 +1076,6 @@ k8s.io/kube-openapi v0.0.0-20250910181357-589584f1c912 h1:Y3gxNAuB0OBLImH611+UDZ
 k8s.io/kube-openapi v0.0.0-20250910181357-589584f1c912/go.mod h1:kdmbQkyfwUagLfXIad1y2TdrjPFWp2Q89B3qkRwf/pQ=
 k8s.io/utils v0.0.0-20251002143259-bc988d571ff4 h1:SjGebBtkBqHFOli+05xYbK8YF1Dzkbzn+gDM4X9T4Ck=
 k8s.io/utils v0.0.0-20251002143259-bc988d571ff4/go.mod h1:OLgZIPagt7ERELqWJFomSt595RzquPNLL48iOWgYOg0=
-knative.dev/eventing v0.50.0 h1:4GSn7yyMLgpGUqU0vZjcyFKK0vSi3TtZXPVzb7HW7Ds=
-knative.dev/eventing v0.50.0/go.mod h1:HC1K7A1oa/sMd6X6RHO547NgvL2gtKlmNK+HYnELz6g=
 knative.dev/hack v0.0.0-20260428014158-b2a37f1b6e7b h1:MvbV2F2BdI8qKrYYUhDwbUZbX0BAYRSIpXM2TOtTvs0=
 knative.dev/hack v0.0.0-20260428014158-b2a37f1b6e7b/go.mod h1:L5RzHgbvam0u8QFHfzCX6MKxu/a/gIGEdaRBqNiVbl0=
 knative.dev/pkg v0.0.0-20260727151759-521cb33b33dd h1:Tpo7m+KdcccVGygF/fr0af9Qv4CG4DTAE756fEDURIo=

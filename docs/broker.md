@@ -134,7 +134,7 @@ spec:
 
 ### Dead Letter Sink
 
-Configure a dead letter sink to receive events that fail delivery after all retries:
+Configure a dead letter sink to receive events that cannot be delivered to a subscriber:
 
 ```yaml
 apiVersion: eventing.knative.dev/v1
@@ -158,6 +158,67 @@ spec:
     backoffPolicy: exponential
     backoffDelay: PT1S
 ```
+
+The original JetStream message is acknowledged only after the dead letter sink
+returns a 2xx response. If the sink returns a non-2xx response, times out, or
+cannot be reached, the filter keeps the original message and tries the dead
+letter delivery again after 10 minutes.
+
+This is at-least-once delivery, not exactly-once delivery. A failed dead-letter
+attempt NAKs the original JetStream message, so the filter runs that message
+again. Before `retry-max-duration` expires, this can call the subscriber again;
+the subscriber and dead letter sink should deduplicate by CloudEvent `id` when
+repeating an operation would be unsafe.
+
+### Retrying for a Fixed Duration
+
+Use duration-based retry when a subscriber outage must not exhaust a small
+attempt count. The following Broker retries delivery for 60 days from the NATS
+publish timestamp. With Knative's retry numbering, the first retry waits two
+seconds for `backoffDelay: PT1S`; the wait then grows exponentially and stops
+growing at 10 minutes.
+
+```yaml
+apiVersion: eventing.knative.dev/v1
+kind: Broker
+metadata:
+  name: events
+  namespace: tcg-platform-eventing
+  annotations:
+    eventing.knative.dev/broker.class: NatsJetStreamBroker
+    natsjetstream.eventing.knative.dev/retry-max-duration: "1440h"
+spec:
+  delivery:
+    deadLetterSink:
+      ref:
+        apiVersion: eventing.knative.dev/v1
+        kind: Broker
+        name: dead-letter
+    retry: 10
+    backoffPolicy: exponential
+    backoffDelay: PT1S
+    backoffMax: PT10M
+    timeout: PT110S
+```
+
+| Setting | Who uses it | Effect |
+|---------|-------------|--------|
+| `retry-max-duration: "1440h"` | Trigger controller and filter | Sets JetStream `MaxDeliver=-1`; after 60 days the filter skips the subscriber and sends the event to DLS |
+| `spec.delivery.backoffMax: PT10M` | Filter | Caps the normal subscriber retry delay at 10 minutes in both count and duration modes |
+| `spec.delivery.retry: 10` | Trigger controller after annotation rollback | Restores count-based delivery (`MaxDeliver=11`) when the duration annotation is removed |
+
+The `retry-max-duration` annotation can also be placed on an individual Trigger;
+its value takes precedence over the Broker annotation and uses Go duration syntax
+such as `30s` or `1440h`. `backoffMax` is part of `spec.delivery`, uses ISO 8601
+syntax such as `PT10M`, and follows Knative's whole-spec precedence: when a
+Trigger sets any delivery field, its complete delivery spec replaces the Broker
+delivery spec. Cluster operators must enable `delivery-backoff-max` in the
+Knative Eventing `config-features` ConfigMap before users set this field.
+
+Invalid or non-positive duration values make reconciliation fail instead of
+silently enabling finite retries. Duration mode also requires an effective dead
+letter sink, because the event must have a durable destination after subscriber
+retries reach the deadline.
 
 ## Configuration
 
@@ -277,13 +338,18 @@ The fetch loop caps each pull request to the number of free semaphore slots, so 
 
 ## Retry Behavior
 
-When a subscriber returns an error or times out:
+The filter makes the following decision after each subscriber request:
 
-1. **5xx errors, 408, 429**: Message is redelivered with backoff
-2. **4xx errors (except 408, 429)**: Message is terminated (non-retriable)
-3. **Network errors**: Message is redelivered with backoff
+| Subscriber result | Next action |
+|-------------------|-------------|
+| 2xx | ACK the original JetStream message |
+| No HTTP response, network error, timeout, 408, 429, or 5xx | NAK with backoff and retry until the configured count or duration is exhausted |
+| Other non-2xx, including 400, 404, and 413 | Send to DLS immediately because repeating the same request cannot make it valid |
 
-After all retries are exhausted, if a dead letter sink is configured, the event is sent there before being acknowledged.
+After the retry count or duration is exhausted, the filter sends the event to
+DLS. A DLS 2xx ACKs the original message. Any other DLS result leaves the
+original message unacknowledged and schedules another DLS attempt after 10
+minutes, including after the subscriber retry duration has expired.
 
 ## Troubleshooting
 

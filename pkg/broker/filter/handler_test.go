@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net/http"
 	"testing"
+	"time"
 
 	cloudevents "github.com/cloudevents/sdk-go/v2"
 	"github.com/cloudevents/sdk-go/v2/binding"
@@ -33,6 +34,7 @@ import (
 	duckv1 "knative.dev/pkg/apis/duck/v1"
 	"knative.dev/pkg/logging"
 
+	eventingduckv1 "knative.dev/eventing/pkg/apis/duck/v1"
 	eventingv1 "knative.dev/eventing/pkg/apis/eventing/v1"
 	"knative.dev/eventing/pkg/eventfilter"
 	"knative.dev/eventing/pkg/kncloudevents"
@@ -188,7 +190,7 @@ func TestDetermineNatsResult_EdgeCases(t *testing.T) {
 			name:         "zero response code with no error",
 			responseCode: 0,
 			err:          nil,
-			wantACK:      true,
+			wantACK:      false,
 		},
 		{
 			name:         "zero response code with error",
@@ -200,7 +202,7 @@ func TestDetermineNatsResult_EdgeCases(t *testing.T) {
 			name:         "1xx informational (no error)",
 			responseCode: 100,
 			err:          nil,
-			wantACK:      true,
+			wantACK:      false,
 		},
 		{
 			name:         "3xx redirect with error",
@@ -217,6 +219,41 @@ func TestDetermineNatsResult_EdgeCases(t *testing.T) {
 			isACK := protocol.IsACK(result)
 			if isACK != tt.wantACK {
 				t.Errorf("IsACK() = %v, want %v", isACK, tt.wantACK)
+			}
+		})
+	}
+}
+
+func TestCalculateDurationNakDelay(t *testing.T) {
+	policy := eventingduckv1.BackoffPolicyExponential
+	delay := "PT1S"
+	backoffMax := "PT10M"
+	config, err := kncloudevents.RetryConfigFromDeliverySpec(eventingduckv1.DeliverySpec{
+		BackoffPolicy: &policy,
+		BackoffDelay:  &delay,
+		BackoffMax:    &backoffMax,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name      string
+		attempt   int
+		remaining time.Duration
+		want      time.Duration
+	}{
+		{name: "first retry uses Knative attempt numbering", attempt: 1, remaining: time.Hour, want: 2 * time.Second},
+		{name: "second retry doubles", attempt: 2, remaining: time.Hour, want: 4 * time.Second},
+		{name: "large attempt is capped", attempt: 64, remaining: time.Hour, want: 10 * time.Minute},
+		{name: "deadline remainder wins", attempt: 20, remaining: 17 * time.Second, want: 17 * time.Second},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := calculateDurationNakDelay(tt.attempt, &config, 10*time.Minute, tt.remaining)
+			if got != tt.want {
+				t.Errorf("calculateDurationNakDelay() = %v, want %v", got, tt.want)
 			}
 		})
 	}

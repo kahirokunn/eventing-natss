@@ -62,6 +62,7 @@ const (
 	ReasonFilterServiceCreated    = "FilterServiceCreated"
 	ReasonFilterServiceFailed     = "FilterServiceFailed"
 	ReasonStreamCreated           = "JetStreamStreamCreated"
+	ReasonStreamUpdated           = "JetStreamStreamUpdated"
 	ReasonStreamFailed            = "JetStreamStreamFailed"
 
 	// DataplaneClusterRoleName is the name of the ClusterRole for dataplane components
@@ -115,6 +116,11 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, b *eventingv1.Broker) pk
 		logger.Errorw("Failed to get broker config", zap.Error(err))
 		b.Status.MarkIngressFailed("ConfigLoadFailed", "Failed to load broker configuration: %v", err)
 		return fmt.Errorf("failed to get broker config: %w", err)
+	}
+	if _, err := brokerutils.EffectiveDurationRetryConfig(nil, b); err != nil {
+		logger.Errorw("Invalid duration-based retry configuration", zap.Error(err))
+		b.Status.MarkIngressFailed("RetryConfigurationInvalid", "Invalid duration-based retry configuration: %v", err)
+		return err
 	}
 
 	// Step 1: Reconcile dataplane RBAC (service account and role binding for filter)
@@ -220,6 +226,7 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, b *eventingv1.Broker) pk
 // reconcileStream ensures the JetStream stream exists for the broker
 func (r *Reconciler) reconcileStream(ctx context.Context, b *eventingv1.Broker, streamName, publishSubject string, brokerCfg *brokerconfig.NatsJetStreamBrokerConfig) pkgreconciler.Event {
 	logger := logging.FromContext(ctx)
+	streamConfig := brokerconfig.BuildNatsStreamConfig(streamName, publishSubject, brokerCfg)
 
 	// Check if stream exists
 	_, err := r.js.StreamInfo(streamName)
@@ -231,8 +238,6 @@ func (r *Reconciler) reconcileStream(ctx context.Context, b *eventingv1.Broker, 
 		}
 
 		// Stream doesn't exist, create it
-		streamConfig := brokerconfig.BuildNatsStreamConfig(streamName, publishSubject, brokerCfg)
-
 		_, err = r.js.AddStream(streamConfig)
 		if err != nil {
 			logger.Errorw("Failed to create JetStream stream", zap.Error(err), zap.String("stream", streamName))
@@ -243,7 +248,20 @@ func (r *Reconciler) reconcileStream(ctx context.Context, b *eventingv1.Broker, 
 
 		logger.Infow("JetStream stream created", zap.String("stream", streamName))
 		controller.GetEventRecorder(ctx).Event(b, corev1.EventTypeNormal, ReasonStreamCreated, "JetStream stream created")
+		return nil
 	}
+
+	// AddStream does not reconcile changed retention, capacity, or replica
+	// settings on an existing stream. Update it explicitly so manifest changes
+	// take effect without deleting (and therefore purging) stored events.
+	if _, err = r.js.UpdateStream(streamConfig); err != nil {
+		logger.Errorw("Failed to update JetStream stream", zap.Error(err), zap.String("stream", streamName))
+		controller.GetEventRecorder(ctx).Event(b, corev1.EventTypeWarning, ReasonStreamFailed, err.Error())
+		b.Status.MarkIngressFailed("StreamUpdateFailed", "Failed to update JetStream stream: %v", err)
+		return fmt.Errorf("failed to update stream: %w", err)
+	}
+	logger.Debugw("JetStream stream updated", zap.String("stream", streamName))
+	controller.GetEventRecorder(ctx).Event(b, corev1.EventTypeNormal, ReasonStreamUpdated, "JetStream stream updated")
 
 	return nil
 }

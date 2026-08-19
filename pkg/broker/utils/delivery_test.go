@@ -35,6 +35,7 @@ func TestDeliveryIsSet(t *testing.T) {
 		{name: "nil", spec: nil, want: false},
 		{name: "empty", spec: &eventingduckv1.DeliverySpec{}, want: false},
 		{name: "retry set", spec: &eventingduckv1.DeliverySpec{Retry: &r}, want: true},
+		{name: "backoff max set", spec: &eventingduckv1.DeliverySpec{BackoffMax: stringPointer("PT10M")}, want: true},
 		{name: "dls set", spec: &eventingduckv1.DeliverySpec{DeadLetterSink: &duckv1.Destination{}}, want: true},
 	}
 	for _, tc := range tests {

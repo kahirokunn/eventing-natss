@@ -125,6 +125,7 @@ type ConsumerManager struct {
 	tracer           trace.Tracer
 	dispatchDuration metric.Float64Histogram
 	processDuration  metric.Float64Histogram
+	dispatchAttempts metric.Int64Counter
 
 	// Map of trigger UID to subscription
 	subscriptions map[string]*TriggerSubscription
@@ -221,6 +222,15 @@ func NewConsumerManager(ctx context.Context, conn *nats.Conn, js nats.JetStreamC
 		processDuration = nil
 	}
 
+	dispatchAttempts, err := meter.Int64Counter(
+		"kn.eventing.broker.filter.dispatch.attempts",
+		metric.WithDescription("Subscriber and dead-letter delivery attempts by result"),
+	)
+	if err != nil {
+		logger.Warnw("failed to create dispatch attempts counter; metric will be skipped", zap.Error(err))
+		dispatchAttempts = nil
+	}
+
 	cm := &ConsumerManager{
 		logger:                logger,
 		ctx:                   ctx,
@@ -233,6 +243,7 @@ func NewConsumerManager(ctx context.Context, conn *nats.Conn, js nats.JetStreamC
 		tracer:                tracer,
 		dispatchDuration:      dispatchDuration,
 		processDuration:       processDuration,
+		dispatchAttempts:      dispatchAttempts,
 		subscriptions:         make(map[string]*TriggerSubscription),
 	}
 
@@ -307,6 +318,7 @@ func (m *ConsumerManager) SubscribeTrigger(
 	brokerIngressURL *duckv1.Addressable,
 	deadLetterSink *duckv1.Addressable,
 	retryConfig *kncloudevents.RetryConfig,
+	durationRetryConfig *brokerutils.DurationRetryConfig,
 	noRetryConfig *kncloudevents.RetryConfig,
 ) error {
 	m.mu.Lock()
@@ -330,6 +342,7 @@ func (m *ConsumerManager) SubscribeTrigger(
 		existing.handler.brokerIngressURL = brokerIngressURL
 		existing.handler.noRetryConfig = noRetryConfig
 		existing.handler.retryConfig = retryConfig
+		existing.handler.durationRetryConfig = durationRetryConfig
 		existing.handler.filter = buildTriggerFilter(logger, trigger)
 		existing.handler.deadLetterSink = deadLetterSink
 		existing.handler.trigger = trigger
@@ -394,6 +407,8 @@ func (m *ConsumerManager) SubscribeTrigger(
 	if err != nil {
 		return fmt.Errorf("failed to create trigger handler: %w", err)
 	}
+	handler.durationRetryConfig = durationRetryConfig
+	handler.dispatchAttempts = m.dispatchAttempts
 
 	// Derive stream and consumer names
 	streamName := brokerutils.BrokerStreamName(broker)

@@ -102,6 +102,23 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, trigger *eventingv1.Trig
 	// Broker is ready
 	trigger.Status.PropagateBrokerCondition(broker.Status.GetTopLevelCondition())
 
+	// Validate duration-based retry annotations before creating an unlimited
+	// JetStream consumer. Invalid values must fail closed instead of silently
+	// falling back to the finite DeliverySpec.Retry count.
+	durationRetryConfig, err := brokerutils.EffectiveDurationRetryConfig(trigger, broker)
+	if err != nil {
+		trigger.Status.MarkNotSubscribed("RetryConfigurationInvalid", "Invalid duration-based retry configuration: %v", err)
+		return err
+	}
+	if durationRetryConfig != nil {
+		delivery := brokerutils.EffectiveDelivery(trigger, broker)
+		if delivery == nil || delivery.DeadLetterSink == nil {
+			err := fmt.Errorf("duration-based retry requires an effective dead letter sink")
+			trigger.Status.MarkNotSubscribed("RetryConfigurationInvalid", "%v", err)
+			return err
+		}
+	}
+
 	// Step 2: Resolve the subscriber URI
 	subscriberURI, err := r.resolveSubscriberURI(ctx, trigger)
 	if err != nil {
@@ -145,7 +162,7 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, trigger *eventingv1.Trig
 	}
 
 	// Step 4: Reconcile the JetStream consumer
-	if err := r.reconcileConsumer(ctx, trigger, broker); err != nil {
+	if err := r.reconcileConsumer(ctx, trigger, broker, durationRetryConfig); err != nil {
 		trigger.Status.MarkNotSubscribed("ConsumerFailed", "Failed to create JetStream consumer: %v", err)
 		return err
 	}
@@ -249,14 +266,14 @@ func (r *Reconciler) resolveDeadLetterSink(ctx context.Context, trigger *eventin
 }
 
 // reconcileConsumer creates or updates the JetStream consumer for the trigger
-func (r *Reconciler) reconcileConsumer(ctx context.Context, trigger *eventingv1.Trigger, broker *eventingv1.Broker) error {
+func (r *Reconciler) reconcileConsumer(ctx context.Context, trigger *eventingv1.Trigger, broker *eventingv1.Broker, durationRetryConfig *brokerutils.DurationRetryConfig) error {
 	logger := logging.FromContext(ctx)
 
 	streamName := brokerutils.BrokerStreamName(broker)
 	consumerName := brokerutils.TriggerConsumerName(string(trigger.UID))
 
 	// Build consumer configuration
-	consumerConfig := r.buildConsumerConfig(trigger, broker, consumerName)
+	consumerConfig := r.buildConsumerConfig(trigger, broker, consumerName, durationRetryConfig)
 
 	// Check if consumer exists
 	_, err := r.js.ConsumerInfo(streamName, consumerName)
@@ -283,18 +300,18 @@ func (r *Reconciler) reconcileConsumer(ctx context.Context, trigger *eventingv1.
 	// Consumer exists, update it
 	_, err = r.js.UpdateConsumer(streamName, consumerConfig)
 	if err != nil {
-		// Some fields cannot be updated, so log and continue if it's just a minor mismatch
-		logger.Warnw("Failed to update JetStream consumer", zap.Error(err), zap.String("consumer", consumerName))
-	} else {
-		logger.Debugw("JetStream consumer updated", zap.String("consumer", consumerName))
-		controller.GetEventRecorder(ctx).Event(trigger, corev1.EventTypeNormal, ReasonConsumerUpdated, "JetStream consumer updated")
+		logger.Errorw("Failed to update JetStream consumer", zap.Error(err), zap.String("consumer", consumerName))
+		controller.GetEventRecorder(ctx).Event(trigger, corev1.EventTypeWarning, ReasonConsumerFailed, err.Error())
+		return fmt.Errorf("failed to update consumer: %w", err)
 	}
+	logger.Debugw("JetStream consumer updated", zap.String("consumer", consumerName))
+	controller.GetEventRecorder(ctx).Event(trigger, corev1.EventTypeNormal, ReasonConsumerUpdated, "JetStream consumer updated")
 
 	return nil
 }
 
 // buildConsumerConfig creates a NATS JetStream pull consumer configuration for the trigger
-func (r *Reconciler) buildConsumerConfig(trigger *eventingv1.Trigger, broker *eventingv1.Broker, consumerName string) *nats.ConsumerConfig {
+func (r *Reconciler) buildConsumerConfig(trigger *eventingv1.Trigger, broker *eventingv1.Broker, consumerName string, durationRetryConfig *brokerutils.DurationRetryConfig) *nats.ConsumerConfig {
 	// The filter subject matches all events published to the broker
 	filterSubject := brokerutils.BrokerPublishSubjectName(broker.Namespace, broker.Name) + ".>"
 
@@ -302,7 +319,8 @@ func (r *Reconciler) buildConsumerConfig(trigger *eventingv1.Trigger, broker *ev
 	ackWait := 30 * time.Second
 	maxDeliver := 3
 
-	// Apply effective delivery: trigger spec overrides broker spec field-by-field.
+	// Apply effective delivery: the Trigger delivery spec replaces the Broker
+	// delivery spec wholesale when set.
 	if delivery := brokerutils.EffectiveDelivery(trigger, broker); delivery != nil {
 		if delivery.Retry != nil {
 			maxDeliver = int(*delivery.Retry) + 1
@@ -313,6 +331,13 @@ func (r *Reconciler) buildConsumerConfig(trigger *eventingv1.Trigger, broker *ev
 				ackWait, _ = timeout.Duration()
 			}
 		}
+	}
+
+	// Duration mode overrides the count-based retry limit. MaxDeliver=-1 tells
+	// JetStream to keep the message available; the filter uses the original
+	// publish timestamp to enforce the configured duration and route to DLS.
+	if durationRetryConfig != nil {
+		maxDeliver = -1
 	}
 
 	// Pull consumer configuration (no DeliverSubject or DeliverGroup)

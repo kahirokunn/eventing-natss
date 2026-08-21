@@ -63,6 +63,9 @@ type RetryConfig struct {
 	// Backoff (at least not easily).
 	BackoffDelay  *string
 	BackoffPolicy *v1.BackoffPolicyType
+	// BackoffMaxDuration is the maximum delay calculated from BackoffDelay and
+	// BackoffPolicy. Retry-After delays are governed by RetryAfterMaxDuration.
+	BackoffMaxDuration *time.Duration
 
 	CheckRetry CheckRetry
 	Backoff    Backoff
@@ -93,6 +96,18 @@ func RetryConfigFromDeliverySpec(spec v1.DeliverySpec) (RetryConfig, error) {
 	retryConfig.BackoffPolicy = spec.BackoffPolicy
 	retryConfig.BackoffDelay = spec.BackoffDelay
 
+	if spec.BackoffMax != nil {
+		maxPeriod, err := period.Parse(*spec.BackoffMax)
+		if err != nil || maxPeriod.IsZero() || maxPeriod.IsNegative() {
+			if err != nil {
+				return retryConfig, fmt.Errorf("failed to parse Spec.BackoffMax: %w", err)
+			}
+			return retryConfig, fmt.Errorf("Spec.BackoffMax must be greater than zero")
+		}
+		maxDuration := periodDuration(maxPeriod)
+		retryConfig.BackoffMaxDuration = &maxDuration
+	}
+
 	if spec.BackoffPolicy != nil && spec.BackoffDelay != nil {
 
 		delay, err := period.Parse(*spec.BackoffDelay)
@@ -100,15 +115,15 @@ func RetryConfigFromDeliverySpec(spec v1.DeliverySpec) (RetryConfig, error) {
 			return retryConfig, fmt.Errorf("failed to parse Spec.BackoffDelay: %w", err)
 		}
 
-		delayDuration, _ := delay.Duration()
+		delayDuration := periodDuration(delay)
 		switch *spec.BackoffPolicy {
 		case v1.BackoffPolicyExponential:
 			retryConfig.Backoff = func(attemptNum int, resp *http.Response) time.Duration {
-				return delayDuration * time.Duration(math.Exp2(float64(attemptNum)))
+				return exponentialBackoff(delayDuration, attemptNum, retryConfig.BackoffMaxDuration)
 			}
 		case v1.BackoffPolicyLinear:
 			retryConfig.Backoff = func(attemptNum int, resp *http.Response) time.Duration {
-				return delayDuration * time.Duration(attemptNum)
+				return linearBackoff(delayDuration, attemptNum, retryConfig.BackoffMaxDuration)
 			}
 		}
 	}
@@ -118,7 +133,7 @@ func RetryConfigFromDeliverySpec(spec v1.DeliverySpec) (RetryConfig, error) {
 		if err != nil {
 			return retryConfig, fmt.Errorf("failed to parse Spec.Timeout: %w", err)
 		}
-		retryConfig.RequestTimeout, _ = timeout.Duration()
+		retryConfig.RequestTimeout = periodDuration(timeout)
 	}
 
 	if spec.RetryAfterMax != nil {
@@ -126,11 +141,117 @@ func RetryConfigFromDeliverySpec(spec v1.DeliverySpec) (RetryConfig, error) {
 		if err != nil { // Should never happen based on DeliverySpec validation
 			return retryConfig, fmt.Errorf("failed to parse Spec.RetryAfterMax: %w", err)
 		}
-		maxDuration, _ := maxPeriod.Duration()
+		maxDuration := periodDuration(maxPeriod)
 		retryConfig.RetryAfterMaxDuration = &maxDuration
 	}
 
 	return retryConfig, nil
+}
+
+const (
+	maxDuration = time.Duration(1<<63 - 1)
+	minDuration = time.Duration(-1 << 63)
+
+	// period.Period stores each component in tenths. These factors match the
+	// Gregorian approximations used by period.Duration for years and months.
+	periodYearDaysE7  = int64(365242500)
+	periodMonthDaysE7 = int64(30436875)
+	periodDayDaysE7   = int64(1000000)
+)
+
+// periodDuration converts a period without allowing the intermediate
+// arithmetic in period.Duration to wrap time.Duration.
+func periodDuration(p period.Period) time.Duration {
+	sign := p.Sign()
+	if sign == 0 {
+		return 0
+	}
+
+	p = p.Abs()
+	daysE7 := saturatingAddInt64(
+		saturatingMultiplyInt64(periodTenths(p.YearsFloat()), periodYearDaysE7),
+		saturatingMultiplyInt64(periodTenths(p.MonthsFloat()), periodMonthDaysE7),
+		saturatingMultiplyInt64(periodTenths(p.DaysFloat()), periodDayDaysE7),
+	)
+	dayMicroseconds := saturatingMultiplyInt64(daysE7, 8640)
+
+	timeMilliseconds := saturatingAddInt64(
+		saturatingMultiplyInt64(periodTenths(p.HoursFloat()), 360000),
+		saturatingMultiplyInt64(periodTenths(p.MinutesFloat()), 6000),
+		saturatingMultiplyInt64(periodTenths(p.SecondsFloat()), 100),
+	)
+
+	duration := saturatingAddInt64(
+		saturatingMultiplyInt64(dayMicroseconds, int64(time.Microsecond)),
+		saturatingMultiplyInt64(timeMilliseconds, int64(time.Millisecond)),
+	)
+	if sign < 0 {
+		if duration == int64(maxDuration) {
+			return minDuration
+		}
+		return -time.Duration(duration)
+	}
+	return time.Duration(duration)
+}
+
+func periodTenths(value float32) int64 {
+	return int64(math.Round(float64(value) * 10))
+}
+
+func saturatingMultiplyInt64(value, factor int64) int64 {
+	if value == 0 || factor == 0 {
+		return 0
+	}
+	if value > int64(maxDuration)/factor {
+		return int64(maxDuration)
+	}
+	return value * factor
+}
+
+func saturatingAddInt64(values ...int64) int64 {
+	var result int64
+	for _, value := range values {
+		if value > int64(maxDuration)-result {
+			return int64(maxDuration)
+		}
+		result += value
+	}
+	return result
+}
+
+func linearBackoff(delay time.Duration, attemptNum int, configuredMax *time.Duration) time.Duration {
+	if attemptNum <= 0 || delay <= 0 {
+		return 0
+	}
+	limit := maxDuration
+	if configuredMax != nil {
+		limit = *configuredMax
+	}
+	if delay >= limit || time.Duration(attemptNum) > limit/delay {
+		return limit
+	}
+	return delay * time.Duration(attemptNum)
+}
+
+func exponentialBackoff(delay time.Duration, attemptNum int, configuredMax *time.Duration) time.Duration {
+	if attemptNum < 0 || delay <= 0 {
+		return 0
+	}
+	limit := maxDuration
+	if configuredMax != nil {
+		limit = *configuredMax
+	}
+	if delay >= limit {
+		return limit
+	}
+	result := delay
+	for range attemptNum {
+		if result > limit/2 {
+			return limit
+		}
+		result *= 2
+	}
+	return result
 }
 
 // SelectiveRetry is an alternative function to determine whether to retry based on response

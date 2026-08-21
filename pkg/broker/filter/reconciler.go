@@ -175,6 +175,13 @@ func (r *FilterReconciler) ReconcileTrigger(ctx context.Context, trigger *eventi
 			retryConfig = &config
 		}
 	}
+	durationRetryConfig, err := brokerutils.EffectiveDurationRetryConfig(trigger, broker)
+	if err != nil {
+		return fmt.Errorf("invalid duration-based retry configuration: %w", err)
+	}
+	if durationRetryConfig != nil && deadLetterSink == nil {
+		return fmt.Errorf("duration-based retry requires a resolved dead letter sink")
+	}
 
 	// Build no-retry config (JetStream handles retries via redelivery)
 	var requestTimeout time.Duration
@@ -200,6 +207,7 @@ func (r *FilterReconciler) ReconcileTrigger(ctx context.Context, trigger *eventi
 		brokerIngressURL,
 		deadLetterSink,
 		retryConfig,
+		durationRetryConfig,
 		&noRetryConfig,
 	)
 	if err != nil {

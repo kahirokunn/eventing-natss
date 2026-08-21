@@ -257,9 +257,24 @@ func TestReconcileStream(t *testing.T) {
 	if _, err := js.StreamInfo(streamName); err != nil {
 		t.Fatalf("stream not created: %v", err)
 	}
-	// Idempotent when the stream already exists.
-	if err := r.reconcileStream(ctx, b, streamName, publish, brokerconfig.DefaultBrokerConfig()); err != nil {
+	if _, err := js.Publish(publish+".event", []byte("stored-before-update")); err != nil {
+		t.Fatalf("Publish() before stream update: %v", err)
+	}
+	// Existing streams are updated in place without deleting stored messages.
+	updatedConfig := brokerconfig.DefaultBrokerConfig()
+	updatedConfig.Stream.MaxBytes = 123456
+	if err := r.reconcileStream(ctx, b, streamName, publish, updatedConfig); err != nil {
 		t.Errorf("second reconcileStream() error: %v", err)
+	}
+	info, err := js.StreamInfo(streamName)
+	if err != nil {
+		t.Fatalf("StreamInfo() after update: %v", err)
+	}
+	if info.Config.MaxBytes != updatedConfig.Stream.MaxBytes {
+		t.Errorf("stream MaxBytes = %d, want %d", info.Config.MaxBytes, updatedConfig.Stream.MaxBytes)
+	}
+	if info.State.Msgs != 1 {
+		t.Errorf("stream messages after update = %d, want 1 (no purge)", info.State.Msgs)
 	}
 }
 

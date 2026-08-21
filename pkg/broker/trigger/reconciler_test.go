@@ -37,6 +37,7 @@ import (
 	eventingv1 "knative.dev/eventing/pkg/apis/eventing/v1"
 
 	"knative.dev/eventing-natss/pkg/broker/constants"
+	brokerutils "knative.dev/eventing-natss/pkg/broker/utils"
 )
 
 const (
@@ -471,6 +472,23 @@ func TestBuildConsumerConfig(t *testing.T) {
 			wantFilterSubj: "test-namespace.test-broker._knative_broker.>",
 		},
 		{
+			name:    "duration mode overrides retry count",
+			trigger: newTriggerWithSubscriber(testNamespace, testTriggerName, testBrokerName, "subscriber.example.com"),
+			broker: func() *eventingv1.Broker {
+				retry := int32(10)
+				backoffMax := "PT10M"
+				b := newReadyBroker(testNamespace, testBrokerName)
+				b.Spec.Delivery = &eventingduckv1.DeliverySpec{Retry: &retry, BackoffMax: &backoffMax}
+				b.Annotations[brokerutils.RetryMaxDurationAnnotation] = "1440h"
+				return b
+			}(),
+			consumerName:   "test-consumer",
+			wantAckWait:    30 * time.Second,
+			wantMaxDeliver: -1,
+			wantAckPolicy:  nats.AckExplicitPolicy,
+			wantFilterSubj: "test-namespace.test-broker._knative_broker.>",
+		},
+		{
 			name: "custom timeout",
 			trigger: func() *eventingv1.Trigger {
 				timeout := "PT1M" // 1 minute in ISO 8601 duration format
@@ -544,7 +562,11 @@ func TestBuildConsumerConfig(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			r := &Reconciler{}
-			config := r.buildConsumerConfig(tc.trigger, tc.broker, tc.consumerName)
+			durationRetryConfig, err := brokerutils.EffectiveDurationRetryConfig(tc.trigger, tc.broker)
+			if err != nil {
+				t.Fatalf("EffectiveDurationRetryConfig() returned error: %v", err)
+			}
+			config := r.buildConsumerConfig(tc.trigger, tc.broker, tc.consumerName, durationRetryConfig)
 
 			if config.AckWait != tc.wantAckWait {
 				t.Errorf("AckWait = %v, want %v", config.AckWait, tc.wantAckWait)
@@ -586,7 +608,7 @@ func TestReconcileConsumer_CreateNew(t *testing.T) {
 
 	trigger := newTriggerWithSubscriber(testNamespace, testTriggerName, testBrokerName, "subscriber.example.com")
 
-	err := r.reconcileConsumer(ctx, trigger, broker)
+	err := r.reconcileConsumer(ctx, trigger, broker, nil)
 
 	if err != nil {
 		t.Errorf("reconcileConsumer() returned error = %v, want nil", err)
@@ -613,7 +635,7 @@ func TestReconcileConsumer_CreateFailed(t *testing.T) {
 
 	trigger := newTriggerWithSubscriber(testNamespace, testTriggerName, testBrokerName, "subscriber.example.com")
 
-	err := r.reconcileConsumer(ctx, trigger, broker)
+	err := r.reconcileConsumer(ctx, trigger, broker, nil)
 
 	if err == nil {
 		t.Error("reconcileConsumer() returned nil, want error when create fails")
@@ -637,10 +659,26 @@ func TestReconcileConsumer_UpdateExisting(t *testing.T) {
 
 	trigger := newTriggerWithSubscriber(testNamespace, testTriggerName, testBrokerName, "subscriber.example.com")
 
-	err := r.reconcileConsumer(ctx, trigger, broker)
+	err := r.reconcileConsumer(ctx, trigger, broker, nil)
 
 	if err != nil {
 		t.Errorf("reconcileConsumer() returned error = %v, want nil", err)
+	}
+}
+
+func TestReconcileConsumer_UpdateFailed(t *testing.T) {
+	ctx := testContextWithRecorder(t)
+	js := newMockJetStreamContext()
+	broker := newReadyBroker(testNamespace, testBrokerName)
+	streamName := "KN_BROKER_TEST_NAMESPACE__TEST_BROKER"
+	consumerName := "KN_TRIGGER_TESTTRIGGERUID12345"
+	js.addConsumerInfo(streamName, consumerName)
+	js.updateConsumer = errors.New("consumer update rejected")
+
+	r := newReconcilerForTest(newFakeBrokerLister(), js)
+	trigger := newTriggerWithSubscriber(testNamespace, testTriggerName, testBrokerName, "subscriber.example.com")
+	if err := r.reconcileConsumer(ctx, trigger, broker, nil); err == nil {
+		t.Fatal("reconcileConsumer() returned nil when MaxDeliver update could not be applied")
 	}
 }
 
@@ -657,7 +695,7 @@ func TestReconcileConsumer_ConsumerInfoError(t *testing.T) {
 
 	trigger := newTriggerWithSubscriber(testNamespace, testTriggerName, testBrokerName, "subscriber.example.com")
 
-	err := r.reconcileConsumer(ctx, trigger, broker)
+	err := r.reconcileConsumer(ctx, trigger, broker, nil)
 
 	if err == nil {
 		t.Error("reconcileConsumer() returned nil, want error when consumer info fails")

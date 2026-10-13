@@ -63,6 +63,8 @@ func TestCalculateNakDelayForRetryNumber(t *testing.T) {
 		{name: "first exponential retry", numDelivered: 1, config: newConfig(exponential, &backoffMax, nil), want: time.Second},
 		{name: "second exponential retry", numDelivered: 2, config: newConfig(exponential, &backoffMax, nil), want: 2 * time.Second},
 		{name: "capped exponential retry", numDelivered: 4, config: newConfig(exponential, &backoffMax, nil), want: 2 * time.Second},
+		{name: "first linear retry", numDelivered: 1, config: newConfig(linear, &backoffMax, nil), want: time.Second},
+		{name: "second linear retry", numDelivered: 2, config: newConfig(linear, &backoffMax, nil), want: 2 * time.Second},
 		{name: "capped linear retry", numDelivered: 4, config: newConfig(linear, &backoffMax, nil), want: 2 * time.Second},
 		{name: "zero delivery number is clamped", numDelivered: 0, config: newConfig(exponential, &backoffMax, nil), want: time.Second},
 		{name: "negative delivery number is clamped", numDelivered: -1, config: newConfig(exponential, &backoffMax, nil), want: time.Second},

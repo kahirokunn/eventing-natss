@@ -25,6 +25,7 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"knative.dev/eventing-natss/pkg/apis/messaging/v1alpha1"
+	eventingduckv1 "knative.dev/eventing/pkg/apis/duck/v1"
 	"knative.dev/eventing/pkg/kncloudevents"
 
 	_ "unsafe"
@@ -115,15 +116,15 @@ func CalcRequestTimeout(numDelivered int, ackWait time.Duration) time.Duration {
 }
 
 // CalculateNakDelayForRetryNumber calculates the NAK delay for a JetStream
-// delivery. JetStream's NumDelivered is one-based, while Knative's retry
-// backoff callback receives a zero-based retry attempt.
+// delivery. Linear backoff preserves JetStream's one-based delivery count,
+// while exponential backoff uses a zero-based attempt.
 func CalculateNakDelayForRetryNumber(numDelivered int, config *kncloudevents.RetryConfig, response *http.Response) time.Duration {
 	if config == nil || config.Backoff == nil {
 		return 0
 	}
-	attemptNum := numDelivered - 1
-	if attemptNum < 0 {
-		attemptNum = 0
+	attemptNum := max(numDelivered, 1) - 1
+	if config.BackoffPolicy != nil && *config.BackoffPolicy == eventingduckv1.BackoffPolicyLinear {
+		attemptNum++
 	}
 	return generateBackoffFn(config)(0, 0, attemptNum, response)
 }

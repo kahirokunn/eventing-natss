@@ -28,6 +28,7 @@ import (
 func TestCalculateNakDelayForRetryNumber(t *testing.T) {
 	delay := "PT1S"
 	backoffMax := "PT2S"
+	shortBackoffMax := "PT0.5S"
 	retryAfterMax := "PT3S"
 	retryAfterDisabled := "PT0S"
 	exponential := eventingduckv1.BackoffPolicyExponential
@@ -59,12 +60,31 @@ func TestCalculateNakDelayForRetryNumber(t *testing.T) {
 		{name: "first exponential retry", numDelivered: 1, config: newConfig(exponential, &backoffMax, nil), want: time.Second},
 		{name: "second exponential retry", numDelivered: 2, config: newConfig(exponential, &backoffMax, nil), want: 2 * time.Second},
 		{name: "capped exponential retry", numDelivered: 4, config: newConfig(exponential, &backoffMax, nil), want: 2 * time.Second},
-		{name: "first linear retry", numDelivered: 1, config: newConfig(linear, &backoffMax, nil), want: 0},
-		{name: "second linear retry", numDelivered: 2, config: newConfig(linear, &backoffMax, nil), want: time.Second},
+		{name: "first linear retry without maximum", numDelivered: 1, config: newConfig(linear, nil, nil), want: time.Second},
+		{name: "second linear retry without maximum", numDelivered: 2, config: newConfig(linear, nil, nil), want: 2 * time.Second},
+		{name: "third linear retry without maximum", numDelivered: 3, config: newConfig(linear, nil, nil), want: 3 * time.Second},
+		{name: "first linear retry", numDelivered: 1, config: newConfig(linear, &backoffMax, nil), want: time.Second},
+		{name: "second linear retry", numDelivered: 2, config: newConfig(linear, &backoffMax, nil), want: 2 * time.Second},
 		{name: "capped linear retry", numDelivered: 4, config: newConfig(linear, &backoffMax, nil), want: 2 * time.Second},
+		{name: "first linear retry is capped below backoff delay", numDelivered: 1, config: newConfig(linear, &shortBackoffMax, nil), want: 500 * time.Millisecond},
 		{name: "zero delivery number is clamped", numDelivered: 0, config: newConfig(exponential, &backoffMax, nil), want: time.Second},
 		{name: "negative delivery number is clamped", numDelivered: -1, config: newConfig(exponential, &backoffMax, nil), want: time.Second},
 		{name: "huge retry stays capped", numDelivered: int(^uint(0) >> 1), config: newConfig(exponential, &backoffMax, nil), want: 2 * time.Second},
+		{name: "huge linear retry stays capped", numDelivered: int(^uint(0) >> 1), config: newConfig(linear, &backoffMax, nil), want: 2 * time.Second},
+		{
+			name:         "linear retry after is capped independently",
+			numDelivered: 1,
+			config:       newConfig(linear, &backoffMax, &retryAfterMax),
+			response:     retryAfterResponse(http.StatusTooManyRequests, "5"),
+			want:         3 * time.Second,
+		},
+		{
+			name:         "larger linear backoff wins",
+			numDelivered: 4,
+			config:       newConfig(linear, nil, &retryAfterMax),
+			response:     retryAfterResponse(http.StatusServiceUnavailable, "2"),
+			want:         4 * time.Second,
+		},
 		{
 			name:         "429 retry after is capped independently",
 			numDelivered: 1,

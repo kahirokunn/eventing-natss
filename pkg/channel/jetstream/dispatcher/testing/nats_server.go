@@ -17,6 +17,7 @@ package testing
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -29,6 +30,7 @@ func RunBasicJetstreamServer() *server.Server {
 	opts := natsserver.DefaultTestOptions
 	opts.Port = -1
 	opts.JetStream = true
+	opts.StoreDir = filepath.Join(os.TempDir(), "nats-test-"+nats.NewInbox())
 	return natsserver.RunServer(&opts)
 }
 
@@ -36,15 +38,16 @@ func ShutdownJSServerAndRemoveStorage(t *testing.T, s *server.Server) {
 	t.Helper()
 	var sd string
 	if config := s.JetStreamConfig(); config != nil {
-		sd = config.StoreDir
+		// JetStream appends its own subdirectory to the unique server root.
+		sd = filepath.Dir(config.StoreDir)
 	}
 	s.Shutdown()
+	s.WaitForShutdown()
 	if sd != "" {
 		if err := os.RemoveAll(sd); err != nil {
 			t.Fatalf("Unable to remove storage %q: %v", sd, err)
 		}
 	}
-	s.WaitForShutdown()
 }
 
 func JsClient(t *testing.T, s *server.Server, opts ...nats.Option) (*nats.Conn, nats.JetStreamContext) {

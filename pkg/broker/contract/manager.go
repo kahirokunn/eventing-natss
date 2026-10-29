@@ -49,11 +49,21 @@ func NewManager(client kubernetes.Interface, lister corev1listers.ConfigMapListe
 
 // GetContract loads the contract from the ConfigMap
 func (m *Manager) GetContract(ctx context.Context) (*Contract, error) {
-	cm, err := m.lister.ConfigMaps(m.namespace).Get(ConfigMapName)
+	return contractFromConfigMap(m.lister.ConfigMaps(m.namespace).Get(ConfigMapName))
+}
+
+// GetContractFromAPI reads the current contract for stream ownership checks,
+// including writes that have not reached the informer cache yet.
+func (m *Manager) GetContractFromAPI(ctx context.Context) (*Contract, error) {
+	return contractFromConfigMap(m.client.CoreV1().ConfigMaps(m.namespace).Get(ctx, ConfigMapName, metav1.GetOptions{}))
+}
+
+// contractFromConfigMap treats a missing ConfigMap as an empty contract.
+func contractFromConfigMap(cm *corev1.ConfigMap, err error) (*Contract, error) {
+	if apierrs.IsNotFound(err) {
+		return &Contract{Brokers: make(map[string]BrokerContract)}, nil
+	}
 	if err != nil {
-		if apierrs.IsNotFound(err) {
-			return &Contract{Brokers: make(map[string]BrokerContract)}, nil
-		}
 		return nil, err
 	}
 	return ParseContract(cm)

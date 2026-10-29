@@ -37,6 +37,8 @@ import (
 	eventingv1 "knative.dev/eventing/pkg/apis/eventing/v1"
 
 	"knative.dev/eventing-natss/pkg/broker/constants"
+	brokerutils "knative.dev/eventing-natss/pkg/broker/utils"
+	natsTesting "knative.dev/eventing-natss/pkg/channel/jetstream/dispatcher/testing"
 )
 
 const (
@@ -429,6 +431,53 @@ func TestFinalizeKind_ConsumerNotFoundOK(t *testing.T) {
 
 	if err != nil {
 		t.Errorf("FinalizeKind() returned error = %v, want nil when consumer not found", err)
+	}
+}
+
+func TestConsumerUsesBoundStreamAfterAnnotationChange(t *testing.T) {
+	s := natsTesting.RunBasicJetstreamServer()
+	defer natsTesting.ShutdownJSServerAndRemoveStorage(t, s)
+	conn, js := natsTesting.JsClient(t, s)
+	defer conn.Close()
+	b := newReadyBroker(testNamespace, testBrokerName)
+	b.Annotations[brokerutils.BrokerStreamNameAnnotation] = "CHANGED_STREAM"
+	b.Status.Annotations = map[string]string{brokerutils.BrokerStreamNameAnnotation: "ORIGINAL_STREAM"}
+	if _, err := js.AddStream(&nats.StreamConfig{
+		Name: "ORIGINAL_STREAM", Subjects: []string{brokerutils.BrokerPublishSubjectName(b.Namespace, b.Name) + ".>"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	lister := newFakeBrokerLister()
+	lister.addBroker(b)
+	r := &Reconciler{brokerLister: lister, js: js}
+	trigger := newTriggerWithSubscriber(testNamespace, testTriggerName, testBrokerName, "subscriber.example.com")
+	ctx := testContextWithRecorder(t)
+	if err := r.reconcileConsumer(ctx, trigger, b); err != nil {
+		t.Fatal(err)
+	}
+	consumerName := brokerutils.TriggerConsumerName(string(trigger.UID))
+	if _, err := js.ConsumerInfo("ORIGINAL_STREAM", consumerName); err != nil {
+		t.Fatalf("consumer not created in bound stream: %v", err)
+	}
+	if err := r.FinalizeKind(ctx, trigger); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.ConsumerInfo("ORIGINAL_STREAM", consumerName); !errors.Is(err, nats.ErrConsumerNotFound) {
+		t.Fatalf("bound consumer was not deleted: %v", err)
+	}
+}
+
+func TestFinalizeKind_InvalidInitialStreamName(t *testing.T) {
+	b := newReadyBroker(testNamespace, testBrokerName)
+	b.Annotations[brokerutils.BrokerStreamNameAnnotation] = "bad.stream.name"
+	lister := newFakeBrokerLister()
+	lister.addBroker(b)
+	js := newMockJetStreamContext()
+	js.setDeleteConsumerError(errors.New("must not delete a consumer from an invalid stream"))
+	r := newReconcilerForTest(lister, js)
+	trigger := newTriggerWithSubscriber(testNamespace, testTriggerName, testBrokerName, "subscriber.example.com")
+	if err := r.FinalizeKind(testContextWithRecorder(t), trigger); err != nil {
+		t.Fatalf("invalid initial stream blocked Trigger deletion: %v", err)
 	}
 }
 

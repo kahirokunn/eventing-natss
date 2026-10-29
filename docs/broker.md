@@ -230,8 +230,10 @@ metadata:
 Notes:
 
 - The value must be a valid JetStream stream name — no spaces, `.`, `*`, `>`, `/` or `\`. An invalid value fails broker reconciliation.
-- The name is stored on the Broker (not the config ConfigMap) so it is resolved consistently everywhere, including when the stream is deleted on broker finalization.
-- Like other stream settings this applies at stream **creation** (create-once); changing it on an existing broker points the broker at a new stream and orphans the old one.
+- The annotation selects the name at stream creation. The controller records the bound name in `status.annotations["natsjetstream.eventing.knative.dev/stream-name"]`; ingress, Trigger consumers, and cleanup use that name.
+- After creation, changing the effective name marks the Broker NotReady with reason `StreamNameImmutable`. Restore the original annotation to resume reconciliation. Removing a custom name also counts as a change unless it equals the generated name. The original stream and its stored events are retained.
+- Each stream belongs to one Broker UID. An existing stream belonging to another Broker, or a manually created stream, is rejected even if its name matches. A stream already used by this Broker is retained when its UID, name, and subject can be verified from the existing ingress contract.
+- Stream ownership uses JetStream metadata and requires NATS Server 2.10 or later.
 
 ### Per-Trigger Configuration
 

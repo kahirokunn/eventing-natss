@@ -105,13 +105,6 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, b *eventingv1.Broker) pk
 	logger := logging.FromContext(ctx)
 	logger.Infow("Reconciling broker", zap.String("broker", b.Name), zap.String("namespace", b.Namespace))
 
-	// Get stream name for this broker (may be overridden via annotation).
-	streamName := brokerutils.BrokerStreamName(b)
-	if err := brokerutils.ValidateStreamName(streamName); err != nil {
-		logger.Errorw("Invalid stream name", zap.Error(err), zap.String("stream", streamName))
-		b.Status.MarkIngressFailed("InvalidStreamName", "%v", err)
-		return fmt.Errorf("invalid stream name: %w", err)
-	}
 	publishSubject := brokerutils.BrokerPublishSubjectName(b.Namespace, b.Name)
 
 	// Load broker configuration (once for the entire reconciliation)
@@ -122,13 +115,14 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, b *eventingv1.Broker) pk
 		return fmt.Errorf("failed to get broker config: %w", err)
 	}
 
-	// Step 1: Reconcile dataplane RBAC (service account and role binding for filter)
-	if err := r.reconcileDataplaneRBAC(ctx, b); err != nil {
+	// Reconcile the stream and its immutable binding before publishing a contract.
+	streamName, err := r.reconcileStream(ctx, b, brokerCfg)
+	if err != nil {
 		return err
 	}
 
-	// Step 2: Reconcile JetStream stream
-	if err := r.reconcileStream(ctx, b, streamName, publishSubject, brokerCfg); err != nil {
+	// Reconcile dataplane RBAC (service account and role binding for filter).
+	if err := r.reconcileDataplaneRBAC(ctx, b); err != nil {
 		return err
 	}
 
@@ -222,37 +216,6 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, b *eventingv1.Broker) pk
 	b.Status.MarkEventPoliciesTrueWithReason("EventPoliciesSkipped", "Feature %q is disabled", "OIDC")
 
 	logger.Infow("Broker reconciliation completed successfully", zap.String("broker", b.Name))
-	return nil
-}
-
-// reconcileStream ensures the JetStream stream exists for the broker
-func (r *Reconciler) reconcileStream(ctx context.Context, b *eventingv1.Broker, streamName, publishSubject string, brokerCfg *brokerconfig.NatsJetStreamBrokerConfig) pkgreconciler.Event {
-	logger := logging.FromContext(ctx)
-
-	// Check if stream exists
-	_, err := r.js.StreamInfo(streamName)
-	if err != nil {
-		if !errors.Is(err, nats.ErrStreamNotFound) {
-			logger.Errorw("Failed to get stream info", zap.Error(err), zap.String("stream", streamName))
-			b.Status.MarkIngressFailed("StreamInfoFailed", "Failed to get JetStream stream info: %v", err)
-			return fmt.Errorf("failed to get stream info: %w", err)
-		}
-
-		// Stream doesn't exist, create it
-		streamConfig := brokerconfig.BuildNatsStreamConfig(streamName, publishSubject, brokerCfg)
-
-		_, err = r.js.AddStream(streamConfig)
-		if err != nil {
-			logger.Errorw("Failed to create JetStream stream", zap.Error(err), zap.String("stream", streamName))
-			controller.GetEventRecorder(ctx).Event(b, corev1.EventTypeWarning, ReasonStreamFailed, err.Error())
-			b.Status.MarkIngressFailed("StreamCreationFailed", "Failed to create JetStream stream: %v", err)
-			return fmt.Errorf("failed to create stream: %w", err)
-		}
-
-		logger.Infow("JetStream stream created", zap.String("stream", streamName))
-		controller.GetEventRecorder(ctx).Event(b, corev1.EventTypeNormal, ReasonStreamCreated, "JetStream stream created")
-	}
-
 	return nil
 }
 
@@ -492,19 +455,23 @@ func (r *Reconciler) FinalizeKind(ctx context.Context, b *eventingv1.Broker) pkg
 	logger := logging.FromContext(ctx)
 	logger.Infow("Finalizing broker", zap.String("broker", b.Name))
 
-	// Delete from contract ConfigMap
-	if err := r.contractManager.DeleteBroker(ctx, b.Namespace, b.Name); err != nil {
-		logger.Errorw("Failed to delete broker from contract", zap.Error(err))
-		return fmt.Errorf("failed to delete broker from contract: %w", err)
+	stream, err := r.getBrokerStream(ctx, b)
+	if err != nil {
+		return err
+	}
+	switch {
+	case stream.owned:
+		if err := r.js.DeleteStream(stream.name); err != nil && !errors.Is(err, nats.ErrStreamNotFound) {
+			return fmt.Errorf("failed to delete stream: %w", err)
+		}
+	case stream.info != nil:
+		logger.Warnw("Leaving stream owned by another resource", zap.String("stream", stream.name))
 	}
 
-	streamName := brokerutils.BrokerStreamName(b)
-
-	// Delete the JetStream stream
-	err := r.js.DeleteStream(streamName)
-	if err != nil && !errors.Is(err, nats.ErrStreamNotFound) {
-		logger.Errorw("Failed to delete JetStream stream", zap.Error(err), zap.String("stream", streamName))
-		return fmt.Errorf("failed to delete stream: %w", err)
+	// Retain the contract until stream deletion succeeds so retries can still
+	// identify streams created before ownership metadata was introduced.
+	if err := r.contractManager.DeleteBroker(ctx, b.Namespace, b.Name); err != nil {
+		return fmt.Errorf("failed to delete broker from contract: %w", err)
 	}
 
 	logger.Infow("Broker finalization completed", zap.String("broker", b.Name))

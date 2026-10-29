@@ -185,6 +185,10 @@ func (r *Reconciler) FinalizeKind(ctx context.Context, trigger *eventingv1.Trigg
 	} else {
 		streamName = brokerutils.BrokerStreamName(broker)
 	}
+	if err := brokerutils.ValidateStreamName(streamName); err != nil {
+		logger.Warnw("No valid stream to finalize", zap.Error(err))
+		return nil
+	}
 
 	consumerName := brokerutils.TriggerConsumerName(string(trigger.UID))
 

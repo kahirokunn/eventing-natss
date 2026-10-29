@@ -28,24 +28,28 @@ var (
 	uidReplacer        = strings.NewReplacer("-", "")
 )
 
-// BrokerStreamNameAnnotation, when set on a Broker, overrides the generated
-// JetStream stream name with its value. The value must be a valid JetStream
-// stream name (see ValidateStreamName). Because it lives on the Broker object,
-// it is resolvable everywhere the stream name is needed, including finalization.
+// BrokerStreamNameAnnotation selects the stream name in metadata.annotations.
+// The controller records the bound name under the same key in status.annotations.
 const BrokerStreamNameAnnotation = "natsjetstream.eventing.knative.dev/stream-name"
 
-// invalidStreamNameChars are the characters JetStream disallows in a stream name.
-const invalidStreamNameChars = " \t\n\r.*>/\\"
+// BrokerStreamOwnerUIDMetadata identifies the Broker that owns a stream.
+const BrokerStreamOwnerUIDMetadata = "natsjetstream.eventing.knative.dev/broker-uid"
 
-// BrokerStreamName returns the JetStream stream name for a Broker. If the
-// BrokerStreamNameAnnotation is set, its value is used verbatim; otherwise the
-// name is generated as KN_BROKER_NAMESPACE__NAME, where hyphens in the namespace
-// or name are replaced with _.
-//
-// For example:
-// - "default/my-broker" => "KN_BROKER_DEFAULT__MY_BROKER"
-// - "knative-eventing/test-broker" => "KN_BROKER_KNATIVE_EVENTING__TEST_BROKER"
+// invalidStreamNameChars are the characters JetStream disallows in a stream name.
+const invalidStreamNameChars = " \t\n\r\f.*>/\\"
+
+// BrokerStreamName returns the bound stream name, falling back to the requested
+// name for Brokers that have not been reconciled yet.
 func BrokerStreamName(b *eventingv1.Broker) string {
+	if name := b.Status.Annotations[BrokerStreamNameAnnotation]; name != "" {
+		return name
+	}
+	return RequestedBrokerStreamName(b)
+}
+
+// RequestedBrokerStreamName returns the annotation override or the generated
+// name, for example KN_BROKER_DEFAULT__MY_BROKER for default/my-broker.
+func RequestedBrokerStreamName(b *eventingv1.Broker) string {
 	if name := b.Annotations[BrokerStreamNameAnnotation]; name != "" {
 		return name
 	}

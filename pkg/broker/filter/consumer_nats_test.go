@@ -282,7 +282,7 @@ func TestSubscribeTrigger_And_Unsubscribe(t *testing.T) {
 	brokerName := "test-broker"
 	triggerUID := "subscribe-trigger-uid-001"
 
-	setupStreamAndConsumer(t, js, namespace, brokerName, triggerUID)
+	streamName, _ := setupStreamAndConsumer(t, js, namespace, brokerName, triggerUID)
 
 	cm := newConsumerManagerForTest(t, ctx, conn, js, &ConsumerManagerConfig{
 		FetchBatchSize: 2,
@@ -291,6 +291,8 @@ func TestSubscribeTrigger_And_Unsubscribe(t *testing.T) {
 	})
 
 	broker := makeTestBrokerForNats(namespace, brokerName)
+	broker.Annotations = map[string]string{brokerutils.BrokerStreamNameAnnotation: "CHANGED_STREAM"}
+	broker.Status.Annotations = map[string]string{brokerutils.BrokerStreamNameAnnotation: streamName}
 	trigger := makeTriggerWithUID(namespace, "test-trigger", brokerName, triggerUID)
 
 	subscriberURL, _ := apis.ParseURL("http://localhost:9999")

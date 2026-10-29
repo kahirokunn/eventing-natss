@@ -81,6 +81,18 @@ func TestBrokerStreamName(t *testing.T) {
 			wantName: "MY_CUSTOM_STREAM",
 		},
 		{
+			name: "bound name survives annotation changes",
+			broker: func() *eventingv1.Broker {
+				b := &eventingv1.Broker{ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default", Name: "mybroker",
+					Annotations: map[string]string{BrokerStreamNameAnnotation: "NEW_STREAM"},
+				}}
+				b.Status.Annotations = map[string]string{BrokerStreamNameAnnotation: "ORIGINAL_STREAM"}
+				return b
+			}(),
+			wantName: "ORIGINAL_STREAM",
+		},
+		{
 			name: "empty annotation falls back to the generated name",
 			broker: &eventingv1.Broker{
 				ObjectMeta: metav1.ObjectMeta{

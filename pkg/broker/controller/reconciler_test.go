@@ -57,7 +57,7 @@ const (
 )
 
 func testBroker(ns, name string) *eventingv1.Broker {
-	return &eventingv1.Broker{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name}}
+	return &eventingv1.Broker{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name, UID: types.UID(ns + "/" + name + "-uid")}}
 }
 
 func testTrigger(ns, name, brokerName string) *eventingv1.Trigger {
@@ -240,25 +240,18 @@ func TestGetBrokerConfig(t *testing.T) {
 }
 
 func TestReconcileStream(t *testing.T) {
-	s := natsTesting.RunBasicJetstreamServer()
-	defer natsTesting.ShutdownJSServerAndRemoveStorage(t, s)
-	conn, js := natsTesting.JsClient(t, s)
-	defer conn.Close()
-
-	r := &Reconciler{js: js}
+	r, _ := setupBrokerReconciler(t)
 	ctx := testContext()
 	b := testBroker(testNamespace, testBrokerName)
 	streamName := brokerutils.BrokerStreamName(b)
-	publish := brokerutils.BrokerPublishSubjectName(b.Namespace, b.Name)
-
-	if err := r.reconcileStream(ctx, b, streamName, publish, brokerconfig.DefaultBrokerConfig()); err != nil {
+	if _, err := r.reconcileStream(ctx, b, brokerconfig.DefaultBrokerConfig()); err != nil {
 		t.Fatalf("reconcileStream() error: %v", err)
 	}
-	if _, err := js.StreamInfo(streamName); err != nil {
+	if _, err := r.js.StreamInfo(streamName); err != nil {
 		t.Fatalf("stream not created: %v", err)
 	}
 	// Idempotent when the stream already exists.
-	if err := r.reconcileStream(ctx, b, streamName, publish, brokerconfig.DefaultBrokerConfig()); err != nil {
+	if _, err := r.reconcileStream(ctx, b, brokerconfig.DefaultBrokerConfig()); err != nil {
 		t.Errorf("second reconcileStream() error: %v", err)
 	}
 }
@@ -427,16 +420,8 @@ func TestEnqueueBrokerOfTrigger(t *testing.T) {
 }
 
 func TestFinalizeKind(t *testing.T) {
-	t.Setenv("SYSTEM_NAMESPACE", "knative-eventing")
-
-	s := natsTesting.RunBasicJetstreamServer()
-	defer natsTesting.ShutdownJSServerAndRemoveStorage(t, s)
-	conn, js := natsTesting.JsClient(t, s)
-	defer conn.Close()
-
-	kube := kubefake.NewSimpleClientset()
-	cmLister := corev1listers.NewConfigMapLister(cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}))
-	r := &Reconciler{js: js, contractManager: contract.NewManager(kube, cmLister)}
+	r, _ := setupBrokerReconciler(t)
+	js := r.js
 	ctx := testContext()
 	b := testBroker(testNamespace, testBrokerName)
 
@@ -444,6 +429,7 @@ func TestFinalizeKind(t *testing.T) {
 	if _, err := js.AddStream(&nats.StreamConfig{
 		Name:     streamName,
 		Subjects: []string{brokerutils.BrokerPublishSubjectName(b.Namespace, b.Name) + ".>"},
+		Metadata: map[string]string{brokerutils.BrokerStreamOwnerUIDMetadata: string(b.UID)},
 	}); err != nil {
 		t.Fatalf("AddStream() error: %v", err)
 	}
@@ -456,40 +442,40 @@ func TestFinalizeKind(t *testing.T) {
 	}
 }
 
-func TestReconcileKind(t *testing.T) {
+func setupBrokerReconciler(t *testing.T, triggers ...*eventingv1.Trigger) (*Reconciler, *kubefake.Clientset) {
+	t.Helper()
 	const ingressNS, ingressName = "knative-eventing", "nats-broker-ingress"
+	t.Setenv("SYSTEM_NAMESPACE", ingressNS)
+	s := natsTesting.RunBasicJetstreamServer()
+	t.Cleanup(func() { natsTesting.ShutdownJSServerAndRemoveStorage(t, s) })
+	conn, js := natsTesting.JsClient(t, s)
+	t.Cleanup(func() { conn.Close() })
 
-	setup := func(t *testing.T, triggers ...*eventingv1.Trigger) (*Reconciler, *kubefake.Clientset) {
-		t.Setenv("SYSTEM_NAMESPACE", ingressNS)
-		s := natsTesting.RunBasicJetstreamServer()
-		t.Cleanup(func() { natsTesting.ShutdownJSServerAndRemoveStorage(t, s) })
-		conn, js := natsTesting.JsClient(t, s)
-		t.Cleanup(func() { conn.Close() })
-
-		kube := kubefake.NewSimpleClientset()
-		cmLister := corev1listers.NewConfigMapLister(cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}))
-		triggerLister := newFakeTriggerLister()
-		for _, tr := range triggers {
-			triggerLister.add(tr)
-		}
-		r := &Reconciler{
-			kubeClientSet:        kube,
-			js:                   js,
-			triggerLister:        triggerLister,
-			deploymentLister:     newDeploymentLister(deploymentWithReady(ingressNS, ingressName, 1)),
-			serviceLister:        newServiceLister(),
-			contractManager:      contract.NewManager(kube, cmLister),
-			filterImage:          "filter:latest",
-			filterServiceAccount: "dp-sa",
-			natsURL:              "nats://localhost:4222",
-			ingressServiceName:   ingressName,
-			ingressNamespace:     ingressNS,
-		}
-		return r, kube
+	kube := kubefake.NewSimpleClientset()
+	cmLister := corev1listers.NewConfigMapLister(cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}))
+	triggerLister := newFakeTriggerLister()
+	for _, tr := range triggers {
+		triggerLister.add(tr)
 	}
+	r := &Reconciler{
+		kubeClientSet:        kube,
+		js:                   js,
+		triggerLister:        triggerLister,
+		deploymentLister:     newDeploymentLister(deploymentWithReady(ingressNS, ingressName, 1)),
+		serviceLister:        newServiceLister(),
+		contractManager:      contract.NewManager(kube, cmLister),
+		filterImage:          "filter:latest",
+		filterServiceAccount: "dp-sa",
+		natsURL:              "nats://localhost:4222",
+		ingressServiceName:   ingressName,
+		ingressNamespace:     ingressNS,
+	}
+	return r, kube
+}
 
+func TestReconcileKind(t *testing.T) {
 	t.Run("no triggers: no filter created, filter condition NoTriggers", func(t *testing.T) {
-		r, kube := setup(t)
+		r, kube := setupBrokerReconciler(t)
 		b := testBroker(testNamespace, testBrokerName)
 
 		if err := r.ReconcileKind(testContext(), b); err != nil {
@@ -505,7 +491,7 @@ func TestReconcileKind(t *testing.T) {
 	})
 
 	t.Run("with a trigger: filter deployment is created", func(t *testing.T) {
-		r, kube := setup(t, testTrigger(testNamespace, "t1", testBrokerName))
+		r, kube := setupBrokerReconciler(t, testTrigger(testNamespace, "t1", testBrokerName))
 		b := testBroker(testNamespace, testBrokerName)
 
 		if err := r.ReconcileKind(testContext(), b); err != nil {
@@ -517,7 +503,7 @@ func TestReconcileKind(t *testing.T) {
 	})
 
 	t.Run("custom stream-name annotation is used", func(t *testing.T) {
-		r, _ := setup(t)
+		r, _ := setupBrokerReconciler(t)
 		b := testBroker(testNamespace, testBrokerName)
 		b.Annotations = map[string]string{brokerutils.BrokerStreamNameAnnotation: "MY_CUSTOM_STREAM"}
 
@@ -530,16 +516,14 @@ func TestReconcileKind(t *testing.T) {
 	})
 
 	t.Run("invalid stream-name annotation fails reconciliation", func(t *testing.T) {
-		r, _ := setup(t)
+		r, _ := setupBrokerReconciler(t)
 		b := testBroker(testNamespace, testBrokerName)
 		b.Annotations = map[string]string{brokerutils.BrokerStreamNameAnnotation: "bad.stream.name"}
 
 		if err := r.ReconcileKind(testContext(), b); err == nil {
 			t.Error("ReconcileKind() expected an error for an invalid stream name, got nil")
 		}
-		if cond := b.Status.GetCondition(eventingv1.BrokerConditionIngress); cond == nil || cond.IsTrue() {
-			t.Errorf("expected BrokerConditionIngress to be marked failed, got %v", cond)
-		}
+		requireIngressFailure(t, b, "InvalidStreamName")
 	})
 }
 

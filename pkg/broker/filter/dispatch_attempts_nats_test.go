@@ -19,6 +19,7 @@ package filter
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -46,12 +47,12 @@ func TestDispatchAttemptsCounter(t *testing.T) {
 	tests := []struct {
 		name                string
 		subscriberResponses []int
-		deadLetterResponse  int
+		deadLetterResponses []int
 		want                map[string]int64
 	}{{
 		name:                "retry, then non-retriable response sent to the dead letter sink",
 		subscriberResponses: []int{http.StatusServiceUnavailable, http.StatusBadRequest},
-		deadLetterResponse:  http.StatusAccepted,
+		deadLetterResponses: []int{http.StatusAccepted},
 		want: map[string]int64{
 			"subscriber_retry/503":     1,
 			"subscriber_permanent/400": 1,
@@ -60,10 +61,19 @@ func TestDispatchAttemptsCounter(t *testing.T) {
 	}, {
 		name:                "dead letter sink failure",
 		subscriberResponses: []int{http.StatusBadRequest},
-		deadLetterResponse:  http.StatusBadRequest,
+		deadLetterResponses: []int{http.StatusBadRequest},
 		want: map[string]int64{
 			"subscriber_permanent/400": 1,
 			"dead_letter_failure/400":  1,
+		},
+	}, {
+		name:                "request timeout, then permanent failure and dead letter retry",
+		subscriberResponses: []int{0, http.StatusBadRequest},
+		deadLetterResponses: []int{http.StatusServiceUnavailable, http.StatusAccepted},
+		want: map[string]int64{
+			"subscriber_timeout/0":     1,
+			"subscriber_permanent/400": 1,
+			"dead_letter_success/202":  1,
 		},
 	}}
 
@@ -77,13 +87,19 @@ func TestDispatchAttemptsCounter(t *testing.T) {
 			const namespace, brokerName, triggerName, triggerUID = "default", "attempts-broker", "attempts-trigger", "attempts-trigger-uid"
 			setupStreamAndConsumer(t, js, namespace, brokerName, triggerUID)
 
-			var subscriberCalls atomic.Int64
-			subscriberServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				w.WriteHeader(tc.subscriberResponses[subscriberCalls.Add(1)-1])
+			var subscriberCalls, deadLetterCalls atomic.Int64
+			subscriberServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				status := tc.subscriberResponses[min(int(subscriberCalls.Add(1)), len(tc.subscriberResponses))-1]
+				if status == 0 {
+					_, _ = io.Copy(io.Discard, r.Body)
+					<-r.Context().Done()
+					return
+				}
+				w.WriteHeader(status)
 			}))
 			defer subscriberServer.Close()
 			deadLetterServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				w.WriteHeader(tc.deadLetterResponse)
+				w.WriteHeader(tc.deadLetterResponses[min(int(deadLetterCalls.Add(1)), len(tc.deadLetterResponses))-1])
 			}))
 			defer deadLetterServer.Close()
 
@@ -109,13 +125,14 @@ func TestDispatchAttemptsCounter(t *testing.T) {
 			subscriberURL, _ := apis.ParseURL(subscriberServer.URL)
 			deadLetterURL, _ := apis.ParseURL(deadLetterServer.URL)
 			noRetryConfig := kncloudevents.NoRetries()
+			noRetryConfig.RequestTimeout = 50 * time.Millisecond
 			if err := cm.SubscribeTrigger(
 				trigger,
 				broker,
 				duckv1.Addressable{URL: subscriberURL},
 				nil,
 				&duckv1.Addressable{URL: deadLetterURL},
-				&kncloudevents.RetryConfig{RetryMax: len(tc.subscriberResponses) - 1},
+				&kncloudevents.RetryConfig{RetryMax: len(tc.subscriberResponses) - 1, RequestTimeout: noRetryConfig.RequestTimeout},
 				&noRetryConfig,
 			); err != nil {
 				t.Fatalf("SubscribeTrigger: %v", err)
@@ -126,6 +143,8 @@ func TestDispatchAttemptsCounter(t *testing.T) {
 			require.EventuallyWithT(t, func(c *assert.CollectT) {
 				assert.Equal(c, tc.want, collectDispatchAttempts(c, reader, namespace, triggerName))
 			}, 10*time.Second, 50*time.Millisecond)
+			require.EqualValues(t, len(tc.subscriberResponses), subscriberCalls.Load())
+			require.EqualValues(t, len(tc.deadLetterResponses), deadLetterCalls.Load())
 		})
 	}
 }

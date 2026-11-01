@@ -358,6 +358,12 @@ func (h *TriggerHandler) dispatchEvent(ctx context.Context, event *cloudevents.E
 	}
 	lastTry := retryNumber > maxRetries
 
+	var requestTimeout time.Duration
+	if config.noRetryConfig != nil {
+		requestTimeout = config.noRetryConfig.RequestTimeout
+	}
+	ctx = jsutils.WithDeliveryContext(ctx, brokerutils.ConsumerAckWait(requestTimeout))
+
 	// Dispatch the message to trigger's destination
 	dispatchInfo, err := h.dispatcher.SendEvent(ctx, *event, config.subscriber,
 		kncloudevents.WithHeader(additionalHeaders),

@@ -40,7 +40,6 @@ import (
 	"knative.dev/eventing/pkg/kncloudevents"
 
 	brokerutils "knative.dev/eventing-natss/pkg/broker/utils"
-	jsutils "knative.dev/eventing-natss/pkg/channel/jetstream/utils"
 )
 
 // otelScope is the OTel instrumentation scope used for the broker filter's
@@ -157,7 +156,6 @@ type TriggerSubscription struct {
 	handler        *TriggerHandler
 	streamName     string
 	consumerName   string
-	ackWait        time.Duration
 	fetchBatchSize int
 	fetchTimeout   time.Duration
 	maxConcurrency int
@@ -470,7 +468,6 @@ func (m *ConsumerManager) SubscribeTrigger(
 		handler:        handler,
 		streamName:     streamName,
 		consumerName:   consumerName,
-		ackWait:        consumerInfo.Config.AckWait,
 		fetchBatchSize: fetchBatchSize,
 		fetchTimeout:   fetchTimeout,
 		maxConcurrency: maxConcurrency,
@@ -605,8 +602,7 @@ func (m *ConsumerManager) fetchLoop(fetchCtx context.Context, ts *TriggerSubscri
 					ts.inflight.Done()
 				}()
 
-				deliveryCtx := jsutils.WithDeliveryContext(ts.dispatchCtx, ts.ackWait)
-				ts.handler.HandleMessage(deliveryCtx, msg)
+				ts.handler.HandleMessage(ts.dispatchCtx, msg)
 			}()
 		}
 	}

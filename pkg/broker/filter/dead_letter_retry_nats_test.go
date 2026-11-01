@@ -17,6 +17,7 @@ limitations under the License.
 package filter
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -26,6 +27,7 @@ import (
 	"github.com/stretchr/testify/require"
 	brokerutils "knative.dev/eventing-natss/pkg/broker/utils"
 	natsTesting "knative.dev/eventing-natss/pkg/channel/jetstream/dispatcher/testing"
+	jsutils "knative.dev/eventing-natss/pkg/channel/jetstream/utils"
 	deliveryv1 "knative.dev/eventing/pkg/apis/duck/v1"
 	"knative.dev/eventing/pkg/kncloudevents"
 	"knative.dev/pkg/apis"
@@ -67,7 +69,6 @@ func TestDeadLetterRetries(t *testing.T) {
 				t.Fatal(err)
 			}
 			cfg := info.Config
-			cfg.AckWait = 100 * time.Millisecond
 			cfg.MaxDeliver = tc.retries + 1
 			if _, err := js.UpdateConsumer(stream, &cfg); err != nil {
 				t.Fatal(err)
@@ -103,6 +104,11 @@ func TestDeadLetterRetries(t *testing.T) {
 			defer dls.Close()
 			cm := newConsumerManagerForTest(t, conn, js, &ConsumerManagerConfig{FetchBatchSize: 1, FetchTimeout: 20 * time.Millisecond, MaxConcurrency: 1})
 			defer cm.Close() //nolint:errcheck
+			// Accelerate the DLS shutdown grace without bypassing the initial
+			// consumer AckWait compatibility check.
+			lifecycle, cancel := context.WithCancel(cm.ctx)
+			defer cancel()
+			cm.ctx = jsutils.WithDeliveryContext(lifecycle, 100*time.Millisecond)
 			subscriberURL, _ := apis.ParseURL(subscriber.URL)
 			dlsURL, _ := apis.ParseURL(dls.URL)
 			var retryConfig *kncloudevents.RetryConfig
@@ -128,6 +134,8 @@ func TestDeadLetterRetries(t *testing.T) {
 			if err := cm.SubscribeTrigger(makeTriggerWithUID(namespace, "retry", brokerName, uid), makeTestBrokerForNats(namespace, brokerName), duckv1.Addressable{URL: subscriberURL}, nil, &duckv1.Addressable{URL: dlsURL}, retryConfig, &noRetry); err != nil {
 				t.Fatal(err)
 			}
+			// Shorten AckWait only after the valid subscription is active.
+			updateAckWaitForTest(t, js, stream, consumer, 100*time.Millisecond)
 			publishStructuredCE(t, js, brokerutils.BrokerPublishSubjectName(namespace, brokerName), "retry-event")
 			if tc.cancelDLS {
 				select {
@@ -135,6 +143,7 @@ func TestDeadLetterRetries(t *testing.T) {
 				case <-time.After(5 * time.Second):
 					t.Fatal("DLS never started")
 				}
+				cancel()
 				if err := cm.Close(); err != nil {
 					t.Fatal(err)
 				}

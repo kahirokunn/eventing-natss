@@ -37,6 +37,7 @@ import (
 	duckv1 "knative.dev/pkg/apis/duck/v1"
 	"knative.dev/pkg/logging"
 
+	brokerutils "knative.dev/eventing-natss/pkg/broker/utils"
 	eventingv1 "knative.dev/eventing/pkg/apis/eventing/v1"
 	"knative.dev/eventing/pkg/eventfilter"
 	"knative.dev/eventing/pkg/eventingtls"
@@ -484,18 +485,9 @@ func TestHandleMessage_LastRequestTimeoutSendsToDeadLetter(t *testing.T) {
 	}))
 	defer dls.Close()
 
-	ctx := logCtx()
-	handler := newTestHandler(t, ctx, subscriber.URL, "")
-	defer handler.Cleanup()
-	dlsURL, err := apis.ParseURL(dls.URL)
-	require.NoError(t, err)
-	handler.Update(makeTrigger("default", "test-trigger", ""),
-		snapshotHandlerConfig(t, handler).subscriber, nil,
-		&duckv1.Addressable{URL: dlsURL}, &kncloudevents.RetryConfig{},
-		&kncloudevents.RetryConfig{
-			RequestTimeout: 50 * time.Millisecond,
-			CheckRetry:     func(context.Context, *http.Response, error) (bool, error) { return false, nil },
-		})
-	handler.HandleMessage(ctx, makeStructuredCEMsg("test.type", "test/source", "last-timeout"))
+	const timeout = 50 * time.Millisecond
+	_, js, _, _ := subscribeTimeoutTest(t, subscriber.URL, "", dls.URL,
+		&kncloudevents.RetryConfig{}, timeout, brokerutils.ConsumerAckWait(timeout))
+	publishStructuredCE(t, js, brokerutils.BrokerPublishSubjectName("default", "timeout-broker"), "last-timeout")
 	require.Equal(t, "last-timeout", receiveWithin(t, deliveries, "timed-out final try did not reach dead letter sink"))
 }

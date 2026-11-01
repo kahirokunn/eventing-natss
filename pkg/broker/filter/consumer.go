@@ -406,7 +406,6 @@ func (m *ConsumerManager) SubscribeTrigger(
 		}
 		return fmt.Errorf("failed to get consumer info: %w", err)
 	}
-	ackWait := consumerInfo.Config.AckWait
 
 	// Resolve per-trigger fetch parameters.
 	// Trigger annotations take precedence; absent or invalid values fall back
@@ -445,7 +444,7 @@ func (m *ConsumerManager) SubscribeTrigger(
 		handler:        handler,
 		streamName:     streamName,
 		consumerName:   consumerName,
-		ackWait:        ackWait,
+		ackWait:        consumerInfo.Config.AckWait,
 		fetchBatchSize: fetchBatchSize,
 		fetchTimeout:   fetchTimeout,
 		maxConcurrency: maxConcurrency,
@@ -484,9 +483,9 @@ func (m *ConsumerManager) startFetchLoopLocked(ts *TriggerSubscription, logger *
 // message acquires its slot within microseconds — no message sits fetched-but-
 // unprocessed with JetStream's AckWait clock already running. When all slots
 // are occupied the loop waits one fetchTimeout before re-checking, leaving
-// messages safely in the stream. Each dispatch goroutine carries a context
-// deadline equal to the consumer's AckWait so that the outbound HTTP call is
-// cancelled before JetStream redelivers the message.
+// messages safely in the stream. Each dispatch runs in ts.dispatchCtx, which
+// is cancelled only when the subscription stops. The handler bounds each
+// request with the delivery timeout, which is shorter than AckWait.
 //
 // Two contexts govern lifetime:
 //   - fetchCtx interrupts the current Fetch and stops its loop.
@@ -521,9 +520,9 @@ func (m *ConsumerManager) fetchLoop(fetchCtx context.Context, ts *TriggerSubscri
 
 		// Determine how many messages to request this round.
 		// Cap the request to the number of free semaphore slots so every
-		// returned message can acquire its slot immediately — keeping our
-		// AckWait context aligned with JetStream's delivery clock. fetchLoop
-		// is the only goroutine that acquires slots, so cap(sem)-len(sem) is a
+		// returned message can acquire its slot immediately — keeping the time
+		// between delivery and dispatch, which counts against AckWait, short.
+		// fetchLoop is the only goroutine that acquires slots, so cap(sem)-len(sem) is a
 		// stable lower bound: in-flight goroutines can only release slots
 		// between here and the acquire, never consume new ones.
 		available := cap(sem) - len(sem)
@@ -581,16 +580,7 @@ func (m *ConsumerManager) fetchLoop(fetchCtx context.Context, ts *TriggerSubscri
 				}()
 
 				deliveryCtx := jsutils.WithDeliveryContext(ts.dispatchCtx, ts.ackWait)
-				var msgCtx context.Context
-				var cancel context.CancelFunc
-				if ts.ackWait > 0 {
-					msgCtx, cancel = context.WithTimeout(deliveryCtx, ts.ackWait)
-				} else {
-					msgCtx, cancel = context.WithCancel(deliveryCtx)
-				}
-				defer cancel()
-
-				ts.handler.HandleMessage(msgCtx, msg)
+				ts.handler.HandleMessage(deliveryCtx, msg)
 			}()
 		}
 	}
@@ -642,8 +632,9 @@ func (m *ConsumerManager) unsubscribeLocked(triggerUID string) error {
 	// to exit before tearing down the NATS subscription and trigger handler.
 	// Without this wait, in-flight goroutines could race with Unsubscribe
 	// (msg.Ack on a closed subscription) and with handler.Cleanup (concurrent
-	// filter evaluation and cleanup). Bounded by ackWait via msgCtx;
-	// resolves in milliseconds when the HTTP client respects ctx cancellation.
+	// filter evaluation and cleanup). Canceling dispatchCtx interrupts subscriber
+	// requests; reply forwarding, dead letter delivery and message settlement
+	// have a separate deadline of one AckWait.
 	sub.inflight.Wait()
 
 	// Unsubscribe from the pull consumer

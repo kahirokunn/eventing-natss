@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nats-io/nats.go"
 	corev1 "k8s.io/api/core/v1"
@@ -350,10 +351,11 @@ func TestReconcileTrigger_SkipReasons(t *testing.T) {
 type fakeJetStream struct {
 	nats.JetStreamContext
 	consumerInfoErr error
+	consumerInfo    *nats.ConsumerInfo
 }
 
 func (f *fakeJetStream) ConsumerInfo(stream, name string, opts ...nats.JSOpt) (*nats.ConsumerInfo, error) {
-	return nil, f.consumerInfoErr
+	return f.consumerInfo, f.consumerInfoErr
 }
 
 func int32Ptr(v int32) *int32 { return &v }
@@ -495,7 +497,7 @@ func TestReconcileTrigger_ExistingSubscription(t *testing.T) {
 	cm := &ConsumerManager{
 		logger: logging.FromContext(ctx),
 		ctx:    ctx,
-		js:     &fakeJetStream{consumerInfoErr: fmt.Errorf("should not be called")},
+		js:     &fakeJetStream{consumerInfo: &nats.ConsumerInfo{Config: nats.ConsumerConfig{AckWait: 40 * time.Second}}},
 		subscriptions: map[string]*TriggerSubscription{
 			triggerUID: {
 				trigger: trigger,

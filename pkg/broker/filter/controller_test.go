@@ -18,6 +18,14 @@ package filter
 
 import (
 	"testing"
+
+	"github.com/stretchr/testify/require"
+	"k8s.io/client-go/tools/cache"
+
+	"knative.dev/pkg/logging"
+
+	eventingduckv1 "knative.dev/eventing/pkg/apis/duck/v1"
+	eventingv1 "knative.dev/eventing/pkg/apis/eventing/v1"
 )
 
 func TestEnvConfig_MaxConcurrency(t *testing.T) {
@@ -54,6 +62,43 @@ func TestEnvConfig_MaxConcurrency(t *testing.T) {
 			if maxConcurrency != tt.wantMaxConcurrency {
 				t.Errorf("maxConcurrency = %v, want %v", maxConcurrency, tt.wantMaxConcurrency)
 			}
+		})
+	}
+}
+
+func TestEnqueueBrokerTriggers(t *testing.T) {
+	lister := newFakeTriggerLister()
+	inherited := newTestTrigger("owned", "inherits", "broker")
+	overridden := newTestTrigger("owned", "overrides", "broker")
+	timeout := "PT5S"
+	overridden.Spec.Delivery = &eventingduckv1.DeliverySpec{Timeout: &timeout}
+	for _, trigger := range []*eventingv1.Trigger{inherited, overridden,
+		newTestTrigger("owned", "other-broker", "other"),
+		newTestTrigger("elsewhere", "other-namespace", "broker")} {
+		lister.addTrigger(trigger)
+	}
+	r := &FilterReconciler{
+		logger: logging.FromContext(logCtx()), triggerLister: lister,
+		brokerScope: &BrokerScope{Namespace: "owned", Name: "broker"},
+	}
+	broker := newTestBroker("owned", "broker", "")
+	for _, tc := range []struct {
+		name   string
+		object interface{}
+		want   []string
+	}{
+		{name: "Broker delivery changes", object: broker, want: []string{"inherits", "overrides"}},
+		{name: "Broker deletion", object: cache.DeletedFinalStateUnknown{Obj: broker}, want: []string{"inherits", "overrides"}},
+		{name: "other Broker", object: newTestBroker("owned", "other", "")},
+		{name: "other namespace", object: newTestBroker("elsewhere", "broker", "")},
+		{name: "other resource", object: inherited},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var enqueued []string
+			r.enqueueBrokerTriggers(tc.object, func(obj interface{}) {
+				enqueued = append(enqueued, obj.(*eventingv1.Trigger).Name)
+			})
+			require.ElementsMatch(t, tc.want, enqueued)
 		})
 	}
 }

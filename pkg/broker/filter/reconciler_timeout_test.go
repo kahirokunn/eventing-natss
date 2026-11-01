@@ -18,9 +18,10 @@ package filter
 
 import (
 	"context"
-	"fmt"
 	"testing"
 	"time"
+
+	"github.com/nats-io/nats.go"
 
 	"knative.dev/pkg/logging"
 
@@ -68,7 +69,7 @@ func TestReconcileTrigger_RequestTimeout(t *testing.T) {
 			cm := &ConsumerManager{
 				logger: logging.FromContext(ctx),
 				ctx:    ctx,
-				js:     &fakeJetStream{consumerInfoErr: fmt.Errorf("should not be called")},
+				js:     &fakeJetStream{consumerInfo: &nats.ConsumerInfo{Config: nats.ConsumerConfig{AckWait: 40 * time.Second}}},
 				subscriptions: map[string]*TriggerSubscription{
 					triggerUID: {trigger: trigger, handler: existingHandler},
 				},

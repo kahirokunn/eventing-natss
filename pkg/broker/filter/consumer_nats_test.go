@@ -79,7 +79,7 @@ func setupStreamAndConsumer(t *testing.T, js nats.JetStreamContext, namespace, b
 		Durable:       consumerName,
 		AckPolicy:     nats.AckExplicitPolicy,
 		FilterSubject: filterSubject,
-		AckWait:       30 * time.Second,
+		AckWait:       brokerutils.ConsumerAckWait(0),
 	})
 	if err != nil {
 		t.Fatalf("AddConsumer(%q, %q): %v", streamName, consumerName, err)
@@ -1158,7 +1158,7 @@ func TestFetchLoopNaksInterruptedFetch(t *testing.T) {
 	conn, js := natsTesting.JsClient(t, server)
 	defer conn.Close()
 	ctx := logCtx()
-	// setupStreamAndConsumer uses a 30s AckWait, far beyond the waits below.
+	// setupStreamAndConsumer uses a long AckWait, far beyond the waits below.
 	stream, consumer := setupStreamAndConsumer(t, js, "namespace-a", "broker-a", "nak-trigger-uid")
 	filterSubject := brokerutils.BrokerPublishSubjectName("namespace-a", "broker-a") + ".>"
 	publishStructuredCE(t, js, brokerutils.BrokerPublishSubjectName("namespace-a", "broker-a"), "interrupted-event")

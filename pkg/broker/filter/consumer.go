@@ -31,6 +31,7 @@ import (
 	"go.uber.org/zap"
 
 	duckv1 "knative.dev/pkg/apis/duck/v1"
+	"knative.dev/pkg/controller"
 	"knative.dev/pkg/logging"
 
 	eventingv1 "knative.dev/eventing/pkg/apis/eventing/v1"
@@ -329,6 +330,29 @@ func (m *ConsumerManager) SubscribeTrigger(
 		zap.String("trigger_uid", triggerUID),
 	)
 
+	streamName := brokerutils.BrokerStreamName(broker)
+	consumerName := brokerutils.TriggerConsumerName(triggerUID)
+	consumerInfo, err := m.js.ConsumerInfo(streamName, consumerName)
+	if err != nil {
+		if errors.Is(err, nats.ErrConsumerNotFound) {
+			return fmt.Errorf("consumer %s not found in stream %s: trigger controller may not have reconciled yet", consumerName, streamName)
+		}
+		return fmt.Errorf("failed to get consumer info: %w", err)
+	}
+
+	var requestTimeout time.Duration
+	if noRetryConfig != nil {
+		requestTimeout = noRetryConfig.RequestTimeout
+	}
+	requiredAckWait := brokerutils.ConsumerAckWait(requestTimeout)
+	if consumerInfo.Config.AckWait < requiredAckWait {
+		logger.Debugw("waiting for the consumer AckWait to cover the request timeout",
+			zap.Duration("ack_wait", consumerInfo.Config.AckWait),
+			zap.Duration("required_ack_wait", requiredAckWait),
+		)
+		return controller.NewRequeueAfter(time.Second)
+	}
+
 	// Check if we already have a subscription for this trigger.
 	// The handler's configuration can be swapped in place — the NATS pull
 	// subscription is bound to (stream, consumer) which are derived from
@@ -391,20 +415,6 @@ func (m *ConsumerManager) SubscribeTrigger(
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create trigger handler: %w", err)
-	}
-
-	// Derive stream and consumer names
-	streamName := brokerutils.BrokerStreamName(broker)
-	consumerName := brokerutils.TriggerConsumerName(triggerUID)
-
-	// Get consumer info (also verifies consumer exists)
-	consumerInfo, err := m.js.ConsumerInfo(streamName, consumerName)
-	if err != nil {
-		handler.Cleanup()
-		if errors.Is(err, nats.ErrConsumerNotFound) {
-			return fmt.Errorf("consumer %s not found in stream %s: trigger controller may not have reconciled yet", consumerName, streamName)
-		}
-		return fmt.Errorf("failed to get consumer info: %w", err)
 	}
 
 	// Resolve per-trigger fetch parameters.

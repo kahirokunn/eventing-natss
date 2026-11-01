@@ -160,7 +160,14 @@ func TestDeliveryTimeout_ExtendsAckWaitForReply(t *testing.T) {
 	}))
 	t.Cleanup(ingress.Close)
 	_, js, stream, consumer := subscribeTimeoutTest(t, subscriber.URL, ingress.URL, "",
-		&kncloudevents.RetryConfig{RetryMax: 2}, 2*time.Second, 1500*time.Millisecond)
+		&kncloudevents.RetryConfig{RetryMax: 2}, 2*time.Second, brokerutils.ConsumerAckWait(2*time.Second))
+	// Shorten the lease after subscription to exercise the immediate extension
+	// before a reply, independently of the subscription's configuration check.
+	info, err := js.ConsumerInfo(stream, consumer)
+	require.NoError(t, err)
+	info.Config.AckWait = 1500 * time.Millisecond
+	_, err = js.UpdateConsumer(stream, &info.Config)
+	require.NoError(t, err)
 	publishStructuredCE(t, js, brokerutils.BrokerPublishSubjectName("default", "timeout-broker"), "reply-original")
 	waitTimeoutMessageSettled(t, js, stream, consumer)
 	require.Equal(t, "reply-event", receiveWithin(t, replies, "reply did not reach ingress"))

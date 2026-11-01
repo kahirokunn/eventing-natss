@@ -420,7 +420,9 @@ spec:
 
 The filter dispatches messages concurrently using a per-trigger counting semaphore controlled by `max-concurrency`. The semaphore is acquired **before** fetching each message's dispatch goroutine, so when all slots are occupied the fetch loop stalls and new messages remain in the JetStream stream with their AckWait clocks not yet running. This prevents unbounded goroutine growth and avoids the AckWait expiry / duplicate-delivery problem that arises when messages are fetched faster than they can be processed.
 
-Each subscriber request uses `spec.delivery.timeout`, or 30 seconds when unset. A request that times out counts as a retriable failure. The consumer's `AckWait` is the request timeout plus 10 seconds, leaving time to settle the message before JetStream redelivers it. AckWait provides a fallback when the filter stops before acknowledging or rejecting a message. Before forwarding a reply or sending to a dead letter sink, the filter extends AckWait to allow that request to finish.
+Each subscriber request uses `spec.delivery.timeout`, or 30 seconds when unset. A request that times out counts as a retriable failure. The consumer's `AckWait` is the request timeout plus 10 seconds: a 30-second request timeout produces a 40-second AckWait. Before starting a subscription or activating changed delivery settings, the filter waits for the consumer's AckWait to cover that timeout and margin. An existing subscription keeps its previous settings while it waits.
+
+While processing a message, the filter sends `InProgress` every 5 seconds to reset the redelivery timer. This protects requests already in flight when a timeout change shortens AckWait, including reply forwarding and dead letter delivery. Progress stops before ACK, NAK or TERM so it cannot override a retry's backoff. Requests already in flight keep their original timeout; later requests use the newly activated settings. If the filter stops processing a message, progress ends and AckWait provides the redelivery fallback.
 
 Slow triggers affect only their own semaphore — they cannot starve or delay other triggers sharing the same filter pod.
 

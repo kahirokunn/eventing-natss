@@ -22,11 +22,14 @@ import (
 
 	"github.com/kelseyhightower/envconfig"
 	"go.uber.org/zap"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/client-go/tools/cache"
 
 	"knative.dev/pkg/configmap"
 	"knative.dev/pkg/controller"
 	"knative.dev/pkg/logging"
 
+	eventingv1 "knative.dev/eventing/pkg/apis/eventing/v1"
 	brokerinformer "knative.dev/eventing/pkg/client/injection/informers/eventing/v1/broker"
 	triggerinformer "knative.dev/eventing/pkg/client/injection/informers/eventing/v1/trigger"
 
@@ -99,7 +102,35 @@ func (r *Runtime) NewController(ctx context.Context, _ configmap.Watcher) *contr
 	// Reconcile same-name replacements even when they reference another Broker,
 	// so the previous subscription is removed.
 	triggerInformer.Informer().AddEventHandler(controller.HandleAll(impl.Enqueue))
+	brokerInformer.Informer().AddEventHandler(controller.HandleAll(func(obj interface{}) {
+		reconciler.enqueueBrokerTriggers(obj, impl.Enqueue)
+	}))
 
 	logger.Info("Filter controller initialized")
 	return impl
+}
+
+// enqueueBrokerTriggers also refreshes inherited delivery settings when the
+// Broker changes without changing any Trigger's status.
+func (r *FilterReconciler) enqueueBrokerTriggers(obj interface{}, enqueue func(interface{})) {
+	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+		obj = tombstone.Obj
+	}
+	broker, ok := obj.(*eventingv1.Broker)
+	if !ok {
+		return
+	}
+	if r.brokerScope != nil && (broker.Namespace != r.brokerScope.Namespace || broker.Name != r.brokerScope.Name) {
+		return
+	}
+	triggers, err := r.triggerLister.Triggers(broker.Namespace).List(labels.Everything())
+	if err != nil {
+		r.logger.Warnw("failed to list triggers after Broker update", zap.Error(err))
+		return
+	}
+	for _, trigger := range triggers {
+		if trigger.Spec.Broker == broker.Name {
+			enqueue(trigger)
+		}
+	}
 }

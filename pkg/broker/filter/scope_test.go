@@ -130,6 +130,7 @@ func TestScopedReconcileSubscriptions(t *testing.T) {
 		// A new UID shares the existing stream but has its own durable consumer.
 		_, err := js.AddConsumer(brokerutils.BrokerStreamName(brokers.brokers["namespace-a"]["broker-a"]), &nats.ConsumerConfig{
 			Durable: brokerutils.TriggerConsumerName(string(replacement.UID)), AckPolicy: nats.AckExplicitPolicy,
+			AckWait:       brokerutils.ConsumerAckWait(0),
 			FilterSubject: brokerutils.BrokerPublishSubjectName("namespace-a", "broker-a") + ".>",
 		})
 		if err != nil {

@@ -216,11 +216,13 @@ func (h *TriggerHandler) HandleMessage(ctx context.Context, msg *nats.Msg) {
 	logger := h.logger.With(zap.String("msg_id", msg.Header.Get(nats.MsgIdHdr)))
 	ctx = logging.WithLogger(ctx, logger)
 
-	h.doHandle(ctx, msg)
+	delivery := newPendingDelivery(msg, logger)
+	defer delivery.stopProgress()
+	h.doHandle(ctx, delivery)
 }
 
 // doHandle processes the message synchronously
-func (h *TriggerHandler) doHandle(ctx context.Context, msg *nats.Msg) {
+func (h *TriggerHandler) doHandle(ctx context.Context, msg *pendingDelivery) {
 	logger := logging.FromContext(ctx)
 
 	// Record the pre-dispatch processing time (message decode + filter eval).
@@ -241,7 +243,7 @@ func (h *TriggerHandler) doHandle(ctx context.Context, msg *nats.Msg) {
 	defer recordProcess()
 
 	// Convert NATS message to CloudEvents message
-	message := cejs.NewMessage(msg)
+	message := cejs.NewMessage(msg.Msg)
 	if message.ReadEncoding() == binding.EncodingUnknown {
 		logger.Errorw("received a message with unknown encoding")
 		if err := msg.Term(); err != nil {
@@ -332,7 +334,7 @@ func (h *TriggerHandler) doHandle(ctx context.Context, msg *nats.Msg) {
 }
 
 // dispatchEvent sends the event to the subscriber and handles ack/nack
-func (h *TriggerHandler) dispatchEvent(ctx context.Context, event *cloudevents.Event, msg *nats.Msg, config *handlerConfig) (*kncloudevents.DispatchInfo, error) {
+func (h *TriggerHandler) dispatchEvent(ctx context.Context, event *cloudevents.Event, msg *pendingDelivery, config *handlerConfig) (*kncloudevents.DispatchInfo, error) {
 	logger := logging.FromContext(ctx)
 
 	additionalHeaders := tracing.ConvertEventToHttpHeader(event)
@@ -374,7 +376,8 @@ func (h *TriggerHandler) dispatchEvent(ctx context.Context, event *cloudevents.E
 	result := determineNatsResult(dispatchInfo.ResponseCode, err)
 
 	// Give a following reply or dead letter request a fresh AckWait window.
-	// Ordinary acknowledgements and retries do not need this extra write.
+	// Periodic progress also protects requests that outlive a later reduction
+	// of the consumer's AckWait.
 	if (protocol.IsACK(result) && config.brokerIngressURL != nil && len(dispatchInfo.ResponseBody) > 0) ||
 		(!protocol.IsACK(result) && lastTry && config.deadLetterSink != nil) {
 		if err := msg.InProgress(); err != nil {
@@ -464,9 +467,9 @@ func (h *TriggerHandler) dispatchEvent(ctx context.Context, event *cloudevents.E
 
 // deadLetter retries only the dead letter request before settling the original
 // message. An interrupted request leaves the message available for redelivery.
-func (h *TriggerHandler) deadLetter(ctx context.Context, event *cloudevents.Event, msg *nats.Msg, config *handlerConfig, headers http.Header, settle func(...nats.AckOpt) error, result string) {
+func (h *TriggerHandler) deadLetter(ctx context.Context, event *cloudevents.Event, msg *pendingDelivery, config *handlerConfig, headers http.Header, settle func(...nats.AckOpt) error, result string) {
 	logger := logging.FromContext(ctx)
-	dlsCtx, stop, err := jsutils.StartDeadLetter(ctx, msg)
+	dlsCtx, stop, err := jsutils.StartDeadLetter(ctx, msg.Msg)
 	if err != nil {
 		logger.Errorw("failed to start dead letter delivery", zap.Error(err))
 		return

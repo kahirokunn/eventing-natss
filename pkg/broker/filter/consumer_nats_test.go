@@ -50,8 +50,9 @@ import (
 )
 
 // setupStreamAndConsumer creates a JetStream stream and durable pull consumer for testing.
+// opts adjust the consumer config before it is created.
 // Returns (streamName, consumerName).
-func setupStreamAndConsumer(t *testing.T, js nats.JetStreamContext, namespace, brokerName, triggerUID string) (string, string) {
+func setupStreamAndConsumer(t *testing.T, js nats.JetStreamContext, namespace, brokerName, triggerUID string, opts ...func(*nats.ConsumerConfig)) (string, string) {
 	t.Helper()
 
 	broker := &eventingv1.Broker{
@@ -75,12 +76,16 @@ func setupStreamAndConsumer(t *testing.T, js nats.JetStreamContext, namespace, b
 		t.Fatalf("AddStream(%q): %v", streamName, err)
 	}
 
-	_, err = js.AddConsumer(streamName, &nats.ConsumerConfig{
+	consumerConfig := &nats.ConsumerConfig{
 		Durable:       consumerName,
 		AckPolicy:     nats.AckExplicitPolicy,
 		FilterSubject: filterSubject,
 		AckWait:       30 * time.Second,
-	})
+	}
+	for _, opt := range opts {
+		opt(consumerConfig)
+	}
+	_, err = js.AddConsumer(streamName, consumerConfig)
 	if err != nil {
 		t.Fatalf("AddConsumer(%q, %q): %v", streamName, consumerName, err)
 	}

@@ -83,6 +83,13 @@ var defaultRetry, _ = kncloudevents.RetryConfigFromDeliverySpec(eventingduckv1.D
 	BackoffDelay:  &retryBackoffDelay,
 })
 
+// lastTryFinishTimeout bounds the work after the subscriber dispatch on the
+// last try (reply forwarding, dead letter send, ack/term). Once the retry
+// budget is spent the handler must finish the message itself, so that work
+// runs detached from ctx's AckWait deadline and teardown cancellation, under
+// this timeout instead.
+const lastTryFinishTimeout = 30 * time.Second
+
 // TriggerHandler handles message dispatch for a single trigger
 type TriggerHandler struct {
 	logger *zap.SugaredLogger
@@ -210,6 +217,9 @@ func (h *TriggerHandler) filterEvent(ctx context.Context, event *cloudevents.Eve
 // HandleMessage processes a NATS message, applies filter, and dispatches to subscriber.
 // ctx should carry an AckWait deadline so that the outbound HTTP call is cancelled
 // before JetStream redelivers the message; use context.WithTimeout(parent, ackWait).
+// Cancel ctx only on teardown: a cancelled dispatch is left un-acked even on the
+// last try, while a last try that hits the deadline is finished here (dead
+// letter sink, ack/term).
 func (h *TriggerHandler) HandleMessage(ctx context.Context, msg *nats.Msg) {
 	logger := h.logger.With(zap.String("msg_id", msg.Header.Get(nats.MsgIdHdr)))
 	ctx = logging.WithLogger(ctx, logger)
@@ -312,7 +322,7 @@ func (h *TriggerHandler) doHandle(ctx context.Context, msg *nats.Msg) {
 	}
 	if eventProcessingDeadlineExceeded(err) {
 		span.SetStatus(codes.Error, "dispatch deadline exceeded")
-		logger.Warnw("dispatch context expired before subscriber response, message will be redelivered by JetStream", zap.Error(err))
+		logger.Warnw("dispatch context expired before subscriber response", zap.Error(err))
 		return
 	} else if err != nil {
 		span.RecordError(err)
@@ -363,11 +373,19 @@ func (h *TriggerHandler) dispatchEvent(ctx context.Context, event *cloudevents.E
 		h.dispatchDuration.Record(ctx, dispatchInfo.Duration.Seconds(), h.metricAttrs)
 	}
 
-	// Context deadline/cancellation means the AckWait guard fired before we got
-	// a subscriber response. Don't ack/nack/term the message — JetStream will
-	// redeliver it automatically once its own AckWait timer expires.
-	if eventProcessingDeadlineExceeded(err) {
+	// The dispatch timed out or was cancelled. Before the last try, leave the
+	// message un-acked for JetStream to redeliver after AckWait; on the last try
+	// a timeout falls through as a failed try. Teardown cancellation always returns.
+	shuttingDown := errors.Is(ctx.Err(), context.Canceled)
+	if eventProcessingDeadlineExceeded(err) && (!lastTry || shuttingDown) {
 		return dispatchInfo, err
+	}
+
+	// Drop ctx's deadline and cancellation but keep its values (logger, span).
+	if lastTry {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), lastTryFinishTimeout)
+		defer cancel()
 	}
 
 	result := determineNatsResult(dispatchInfo.ResponseCode, err)

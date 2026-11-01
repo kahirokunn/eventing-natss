@@ -640,8 +640,10 @@ func (m *ConsumerManager) unsubscribeLocked(triggerUID string) error {
 	// to exit before tearing down the NATS subscription and trigger handler.
 	// Without this wait, in-flight goroutines could race with Unsubscribe
 	// (msg.Ack on a closed subscription) and with handler.Cleanup (concurrent
-	// filter evaluation and cleanup). Bounded by ackWait via msgCtx;
-	// resolves in milliseconds when the HTTP client respects ctx cancellation.
+	// filter evaluation and cleanup). Bounded by ackWait via msgCtx; resolves
+	// in milliseconds when the HTTP client respects ctx cancellation, except
+	// that a last try already past its dispatch ignores cancellation and can
+	// take up to lastTryFinishTimeout.
 	sub.inflight.Wait()
 
 	// Unsubscribe from the pull consumer

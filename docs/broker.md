@@ -471,6 +471,8 @@ When a subscriber returns an error or times out:
 
 After all retries are exhausted, if a dead letter sink is configured, the event is sent there before being acknowledged.
 
+The dead letter sink has its own retry budget, using the same retry count, backoff, and request timeout as the subscriber. With `retry: 3`, each destination can receive up to four attempts. Once dead letter delivery starts, the subscriber is not called again during that delivery. The filter keeps the message pending until the dead letter sink accepts it, returns a non-retriable response, or uses up its retries. If the filter stops before completing this work, JetStream can redeliver the original event.
+
 ## Troubleshooting
 
 ### Events not being delivered

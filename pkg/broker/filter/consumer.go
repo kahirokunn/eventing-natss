@@ -39,6 +39,7 @@ import (
 	"knative.dev/eventing/pkg/kncloudevents"
 
 	brokerutils "knative.dev/eventing-natss/pkg/broker/utils"
+	jsutils "knative.dev/eventing-natss/pkg/channel/jetstream/utils"
 )
 
 // otelScope is the OTel instrumentation scope used for the broker filter's
@@ -579,12 +580,13 @@ func (m *ConsumerManager) fetchLoop(fetchCtx context.Context, ts *TriggerSubscri
 					ts.inflight.Done()
 				}()
 
+				deliveryCtx := jsutils.WithDeliveryContext(ts.dispatchCtx, ts.ackWait)
 				var msgCtx context.Context
 				var cancel context.CancelFunc
 				if ts.ackWait > 0 {
-					msgCtx, cancel = context.WithTimeout(ts.dispatchCtx, ts.ackWait)
+					msgCtx, cancel = context.WithTimeout(deliveryCtx, ts.ackWait)
 				} else {
-					msgCtx, cancel = context.WithCancel(ts.dispatchCtx)
+					msgCtx, cancel = context.WithCancel(deliveryCtx)
 				}
 				defer cancel()
 

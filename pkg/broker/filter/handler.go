@@ -412,19 +412,8 @@ func (h *TriggerHandler) dispatchEvent(ctx context.Context, event *cloudevents.E
 	case protocol.IsNACK(result):
 		if lastTry {
 			if config.deadLetterSink != nil {
-				// Send to dead letter sink
-				dlsDispatchInfo, dlsErr := h.dispatcher.SendEvent(ctx, *event, *config.deadLetterSink,
-					kncloudevents.WithRetryConfig(&defaultRetry),
-					kncloudevents.WithHeader(additionalHeaders),
-					kncloudevents.WithTransformers(&te),
-				)
-				if dlsErr != nil {
-					logger.Errorw("failed to send to dead letter sink",
-						zap.Error(dlsErr),
-						zap.Int("response_code", dlsDispatchInfo.ResponseCode),
-					)
-				}
-				span.SetAttributes(attribute.String("nats.result", "ack_after_dls"))
+				h.deadLetter(ctx, event, msg, config, additionalHeaders, msg.Ack, "ack_after_dls")
+				return dispatchInfo, err
 			} else {
 				span.SetAttributes(attribute.String("nats.result", "ack_retries_exhausted"))
 			}
@@ -449,29 +438,47 @@ func (h *TriggerHandler) dispatchEvent(ctx context.Context, event *cloudevents.E
 		// Non-retriable response: retrying cannot succeed, so dead-letter the
 		// event right away (if configured) and terminate the message.
 		if config.deadLetterSink != nil {
-			// Send to dead letter sink
-			dlsDispatchInfo, dlsErr := h.dispatcher.SendEvent(ctx, *event, *config.deadLetterSink,
-				kncloudevents.WithRetryConfig(&defaultRetry),
-				kncloudevents.WithHeader(additionalHeaders),
-				kncloudevents.WithTransformers(&te),
-			)
-			if dlsErr != nil {
-				logger.Errorw("failed to send to dead letter sink",
-					zap.Error(dlsErr),
-					zap.Int("response_code", dlsDispatchInfo.ResponseCode),
-				)
-			}
-			span.SetAttributes(attribute.String("nats.result", "term_after_dls"))
+			h.deadLetter(ctx, event, msg, config, additionalHeaders, msg.Term, "term_after_dls")
 		} else {
 			span.SetAttributes(attribute.String("nats.result", "term"))
-		}
-
-		if err := msg.Term(nats.Context(ctx)); err != nil {
-			logger.Errorw("failed to term message", zap.Error(err))
+			if err := msg.Term(nats.Context(ctx)); err != nil {
+				logger.Errorw("failed to term message", zap.Error(err))
+			}
 		}
 	}
 
 	return dispatchInfo, err
+}
+
+// deadLetter retries only the dead letter request before settling the original
+// message. An interrupted request leaves the message available for redelivery.
+func (h *TriggerHandler) deadLetter(ctx context.Context, event *cloudevents.Event, msg *nats.Msg, config *handlerConfig, headers http.Header, settle func(...nats.AckOpt) error, result string) {
+	logger := logging.FromContext(ctx)
+	dlsCtx, stop, err := jsutils.StartDeadLetter(ctx, msg)
+	if err != nil {
+		logger.Errorw("failed to start dead letter delivery", zap.Error(err))
+		return
+	}
+	defer stop()
+
+	retryConfig := jsutils.DeadLetterRetryConfig(config.retryConfig)
+	te := TypeExtractorTransformer("")
+	dispatchInfo, err := h.dispatcher.SendEvent(dlsCtx, *event, *config.deadLetterSink,
+		kncloudevents.WithRetryConfig(&retryConfig),
+		kncloudevents.WithHeader(headers),
+		kncloudevents.WithTransformers(&te),
+	)
+	if cause := context.Cause(dlsCtx); cause != nil {
+		logger.Errorw("dead letter delivery interrupted; message remains pending", zap.Error(cause))
+		return
+	}
+	if err != nil {
+		logger.Errorw("failed to send to dead letter sink", zap.Error(err), zap.Int("response_code", dispatchInfo.ResponseCode))
+	}
+	trace.SpanFromContext(ctx).SetAttributes(attribute.String("nats.result", result))
+	if err := settle(nats.Context(dlsCtx)); err != nil {
+		logger.Errorw("failed to settle message after dead letter delivery", zap.Error(err))
+	}
 }
 
 func eventProcessingDeadlineExceeded(err error) bool {

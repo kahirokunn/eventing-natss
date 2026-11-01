@@ -265,17 +265,20 @@ func (d *Dispatcher) subscribe(ctx context.Context, config ChannelConfig, sub Su
 
 	var consumer Consumer
 	if isPushConsumer(info) {
+		consumerCtx, cancel := context.WithCancel(ctx)
 		pushConsumer := &PushConsumer{
 			sub:              sub,
 			dispatcher:       d.dispatcher,
 			channelNamespace: config.Namespace,
 			logger:           logger,
-			ctx:              ctx,
+			ctx:              consumerCtx,
+			cancel:           cancel,
 			natsConsumerInfo: info,
 		}
 		jsSub, err := d.js.QueueSubscribe(info.Config.DeliverSubject, info.Config.DeliverGroup, pushConsumer.MsgHandler,
 			nats.Bind(info.Stream, info.Name), nats.ManualAck())
 		if err != nil {
+			cancel()
 			logger.Errorw("failed to create queue subscription for consumer")
 			return SubscriberStatusTypeError, err
 		}
@@ -293,6 +296,8 @@ func (d *Dispatcher) subscribe(ctx context.Context, config ChannelConfig, sub Su
 			metric.WithExplicitBucketBoundaries(latencyBounds...),
 		)
 		if err != nil {
+			cancel()
+			_ = jsSub.Unsubscribe()
 			logger.Errorw("failed to set up dispatch duration metric", zap.Error(err))
 			return SubscriberStatusTypeError, err
 		}

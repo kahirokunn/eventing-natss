@@ -154,19 +154,7 @@ func testSendMessageDeadLetterSettlement(t *testing.T, subscriberStatus, deadLet
 	if err != nil {
 		t.Fatalf("ConsumerInfo: %v", err)
 	}
-	if deadLetterStatus != http.StatusAccepted {
-		if info.NumAckPending != 1 {
-			t.Fatalf("NumAckPending after failed dead letter delivery = %d, want 1", info.NumAckPending)
-		}
-		redelivered, err := sub.Fetch(1, nats.MaxWait(time.Second))
-		if err != nil || len(redelivered) != 1 {
-			t.Fatalf("Fetch after failed dead letter delivery: got %d messages, err %v", len(redelivered), err)
-		}
-		if err := redelivered[0].Term(); err != nil {
-			t.Errorf("Term: %v", err)
-		}
-		return
-	}
+
 	if info.NumAckPending != 0 {
 		t.Errorf("NumAckPending after successful dead letter delivery = %d, want 0", info.NumAckPending)
 	}

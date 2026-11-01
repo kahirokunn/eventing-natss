@@ -60,9 +60,11 @@ type PushConsumer struct {
 
 	logger *zap.SugaredLogger
 	ctx    context.Context
+	cancel context.CancelFunc
 
-	mu     sync.Mutex
-	closed bool
+	inflight sync.WaitGroup
+	mu       sync.Mutex
+	closed   bool
 }
 
 func (c *PushConsumer) ConsumerType() ConsumerType {
@@ -78,22 +80,30 @@ func (c *PushConsumer) UpdateSubscription(_ *ChannelConfig, sub Subscription) {
 
 func (c *PushConsumer) Close() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.closed {
+		c.mu.Unlock()
 		return ErrConsumerClosed
 	}
-
 	c.closed = true
-
-	// TODO: should we wait for messages to finish and c.jsSub.IsValid() to return false?
-	return c.jsSub.Drain()
+	c.mu.Unlock()
+	c.cancel()
+	err := c.jsSub.Drain()
+	c.inflight.Wait()
+	return err
 }
 
 func (c *PushConsumer) MsgHandler(msg *nats.Msg) {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	c.inflight.Add(1)
+	c.mu.Unlock()
 	go func() {
+		defer c.inflight.Done()
 		logger := c.logger.With(zap.String("msg_id", msg.Header.Get(nats.MsgIdHdr)))
 		ctx := logging.WithLogger(c.ctx, logger)
-
 		c.doHandle(ctx, msg)
 	}()
 }

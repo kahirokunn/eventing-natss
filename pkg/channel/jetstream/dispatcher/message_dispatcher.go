@@ -118,6 +118,7 @@ func SendMessage(dispatcher *kncloudevents.Dispatcher, ctx context.Context, mess
 		}
 	}
 
+	ctx = jsutils.WithDeliveryContext(ctx, ackWait)
 	return send(dispatcher, ctx, message, destination, ackWait, msg, config)
 }
 
@@ -172,12 +173,18 @@ func send(dispatcher *kncloudevents.Dispatcher, ctx context.Context, message bin
 	ctx, responseMessage, dispatchExecutionInfo, err := executeRequest(dispatcher, ctx, destination, message, additionalHeadersForDestination, &noRetires, config.oidcServiceAccount, config.transformers)
 	retriable := err != nil && jsutils.IsRetriableStatusCode(dispatchExecutionInfo.ResponseCode)
 
-	// Keep the message pending until its dead letter delivery succeeds.
+	// Finish the dead letter retries before settling the original message.
 	if err != nil && (lastTry || !retriable) && config.deadLetterSink != nil {
+		dlsCtx, stop, startErr := jsutils.StartDeadLetter(ctx, msg)
+		if startErr != nil {
+			return dispatchExecutionInfo, fmt.Errorf("unable to start dead letter delivery: %w", startErr)
+		}
+		defer stop()
+		retryConfig := jsutils.DeadLetterRetryConfig(config.retryConfig)
 		dispatchTransformers := dispatchExecutionInfoTransformers(destination.URL, dispatchExecutionInfo)
-		_, deadLetterResponse, deadLetterInfo, deadLetterErr := executeRequest(dispatcher, ctx, *config.deadLetterSink, message, config.additionalHeaders, config.retryConfig, config.oidcServiceAccount, append(config.transformers, dispatchTransformers))
-		if deadLetterErr != nil {
-			return deadLetterInfo, fmt.Errorf("unable to complete request to either %s (%v) or %s (%v)", destination.URL, err, config.deadLetterSink.URL, deadLetterErr)
+		_, deadLetterResponse, deadLetterInfo, deadLetterErr := executeRequest(dispatcher, dlsCtx, *config.deadLetterSink, message, config.additionalHeaders, &retryConfig, config.oidcServiceAccount, append(config.transformers, dispatchTransformers))
+		if cause := context.Cause(dlsCtx); cause != nil {
+			return deadLetterInfo, fmt.Errorf("dead letter delivery interrupted; message remains pending: %w", cause)
 		}
 		if deadLetterResponse != nil {
 			messagesToFinish = append(messagesToFinish, deadLetterResponse)
@@ -187,7 +194,10 @@ func send(dispatcher *kncloudevents.Dispatcher, ctx context.Context, message bin
 		if retriable {
 			settleErr = nil
 		}
-		processDispatchResult(ctx, msg, config.retryConfig, retryNumber, dispatchExecutionInfo, false, settleErr)
+		processDispatchResult(dlsCtx, msg, config.retryConfig, retryNumber, dispatchExecutionInfo, false, settleErr)
+		if deadLetterErr != nil {
+			return deadLetterInfo, fmt.Errorf("unable to complete request to either %s (%v) or %s (%v)", destination.URL, err, config.deadLetterSink.URL, deadLetterErr)
+		}
 		return deadLetterInfo, nil
 	}
 

@@ -197,6 +197,8 @@ or 429, or cannot be reached, as the
 defines. Other non-2xx responses are not retried; if a dead letter sink is
 configured, the event is sent there right away.
 
+The dead letter sink uses the same retry count, backoff, and request timeout as the subscriber, with an independent retry budget. With `retry: 3`, the subscriber and the dead letter sink each get up to four attempts. Once dead letter delivery starts, only the dead letter sink is retried during that delivery. The message remains pending until the dead letter sink accepts it, returns a non-retriable response, or uses up its retries. If the dispatcher stops before completing this work, JetStream can redeliver the original event.
+
 ## `NatsJetStreamChannel` CRD
 
 ```yaml

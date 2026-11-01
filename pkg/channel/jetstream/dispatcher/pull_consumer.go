@@ -35,6 +35,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"k8s.io/apimachinery/pkg/types"
 
+	jsutils "knative.dev/eventing-natss/pkg/channel/jetstream/utils"
 	"knative.dev/eventing-natss/pkg/tracing"
 
 	"github.com/nats-io/nats.go"
@@ -235,6 +236,7 @@ func (c *PullConsumer) handleMessage(ctx context.Context, msg *nats.Msg) (err er
 	c.subMu.RLock()
 	defer c.subMu.RUnlock()
 
+	ctx = jsutils.WithDeliveryContext(ctx, c.natsConsumerInfo.Config.AckWait)
 	ctx, finish := context.WithTimeout(ctx, c.natsConsumerInfo.Config.AckWait)
 	defer finish()
 
@@ -312,8 +314,7 @@ func (c *PullConsumer) handleMessage(ctx context.Context, msg *nats.Msg) (err er
 			zap.Error(err),
 			zap.Any("dispatch_resp_code", dispatchExecutionInfo.ResponseCode))
 
-		// let knative decide what to do with the message, if it wraps an Ack/Nack then that is what will happen,
-		// otherwise we will Terminate the message
+		// send handles settlement; an interrupted dead letter delivery stays pending.
 		return err
 	}
 
